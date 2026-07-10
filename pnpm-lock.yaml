@@ -74,6 +74,15 @@ importers:
         specifier: ^3.0.0
         version: 3.2.7(@types/node@26.1.1)(tsx@4.23.0)
 
+  apps/tg-ingest:
+    devDependencies:
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.7(@types/node@26.1.1)(tsx@4.23.0)
+
 packages:
 
   '@borewit/text-codec@0.2.2':
