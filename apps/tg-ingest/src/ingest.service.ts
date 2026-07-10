@@ -26,7 +26,7 @@ import {
 import { withDownloadRetry } from './retry.js'
 import { MediaRepairService, type MediaFetcher, type DownloadedMediaResult } from './media-repair.js'
 import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
-import type { MessageNewPayload } from 'shared/ws-events.js'
+import type { MessageNewPayload, MessageUpdatedPayload } from 'shared/ws-events.js'
 import { mediaUrl } from 'shared/media.js'
 import { DEFAULT_CHANNEL_SETTINGS } from 'shared/channel-settings.js'
 
@@ -378,20 +378,28 @@ export class IngestService {
     // строки domain_events атомарно, одной транзакцией (см. repository.ts) — либо весь альбом
     // целиком закоммичен вместе с событием, либо ничего (при сбое курсор не продвинется, и
     // backfill переподхватит те же tg_message_id при следующем проходе).
-    const { anyInserted } = await saveAlbumWithEvent(
+    // buildEvent строит payload ОДИН раз для обоих видов события (DRY) — 'kind' от
+    // saveAlbumWithEvent влияет только на строку `type`: 'new', если хоть один член альбома
+    // реально вставлен, иначе 'updated', если хоть один реально поправлен этой доставкой
+    // (правки в реальном времени — автор форума правит сообщения почти всегда, LOOP_STATE.md).
+    const { anyInserted, anyUpdated } = await saveAlbumWithEvent(
       this.db,
       prepared.map((p) => p.member),
-      (anchorMessageId) => {
+      (anchorMessageId, kind) => {
         // payload задачи 9: готовый MessageDto (якорь + вся подпись/медиа группы) + channelId
         // (см. packages/shared/src/ws-events.ts). aiSummary/actions/method — Ф0-заглушки.
-        const payload: MessageNewPayload = {
+        // Форма payload одинакова у MessageNewPayload и MessageUpdatedPayload — различается
+        // только имя события, поэтому один и тот же литерал годится под оба типа.
+        const payload: MessageNewPayload | MessageUpdatedPayload = {
           channelId,
           message: {
             id: anchorMessageId,
             tgMessageId: anchor.tgMessageId,
             time: anchor.msgTs.toISOString(),
             // Подпись Telegram лежит ровно на одном элементе альбома (иногда её нет вовсе) —
-            // берём первую непустую по порядку id, а не только якоря.
+            // берём первую непустую по порядку id, а не только якоря. При правке одиночного
+            // сообщения (или члена альбома) prepared уже несёт свежий текст — этот же код
+            // подхватывает его без отдельной ветки.
             text: prepared.map((p) => p.text).find((t) => t.trim().length > 0) ?? '',
             media: prepared.flatMap((p) => (p.mediaEntry ? [p.mediaEntry] : [])),
             aiSummary: null,
@@ -399,7 +407,7 @@ export class IngestService {
             method: null,
           },
         }
-        return { type: 'message.new', aggregate: 'message', payload }
+        return { type: kind === 'new' ? 'message.new' : 'message.updated', aggregate: 'message', payload }
       },
     )
 
@@ -409,10 +417,11 @@ export class IngestService {
       await advanceCursor(this.db, p.member.channelId, p.tgMessageId)
     }
 
-    if (anyInserted) {
+    if (anyInserted || anyUpdated) {
       // NOTIFY строго после коммита транзакции (await выше уже дождался commit) — иначе
       // слушатель на стороне api рискует получить уведомление раньше, чем строка станет видна
-      // его собственному SELECT (task-9-brief §2/§3).
+      // его собственному SELECT (task-9-brief §2/§3). Без anyUpdated здесь outbox не проснулся
+      // бы до периодического опроса (5с задержки) — правки почти всегда не несут вставок.
       await sql`SELECT pg_notify('domain_events', '')`.execute(this.db)
     }
   }

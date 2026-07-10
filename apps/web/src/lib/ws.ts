@@ -3,7 +3,12 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { io, type Socket } from 'socket.io-client'
 import type { MessageDto } from 'shared/dto.js'
-import type { ClientToServerEvents, MessageNewPayload, ServerToClientEvents } from 'shared/ws-events.js'
+import type {
+  ClientToServerEvents,
+  MessageNewPayload,
+  MessageUpdatedPayload,
+  ServerToClientEvents,
+} from 'shared/ws-events.js'
 import { messagesQueryKey } from '../components/MessageTimeline.js'
 
 let socket: Socket<ServerToClientEvents, ClientToServerEvents> | null = null
@@ -40,10 +45,34 @@ export function useChannelStream(channelId: number): void {
       })
     }
 
+    // Правка Telegram-сообщения (текст/медиа/aiSummary) — заменяет узел с тем же message.id
+    // НА МЕСТЕ, не создавая новый и не трогая порядок таймлайна. Если узел ещё не подгружен в
+    // кэш (например, лежит на следующей ненагруженной странице useInfiniteQuery) — событие
+    // безопасно игнорируется: подтянется актуальным текстом, когда страница загрузится обычным
+    // GET-запросом.
+    function onMessageUpdated(payload: MessageUpdatedPayload): void {
+      if (payload.channelId !== channelId) return
+
+      queryClient.setQueryData<InfiniteData<MessageDto[]>>(messagesQueryKey(channelId), (old) => {
+        if (!old) return old
+        const known = old.pages.some((page) => page.some((m) => m.id === payload.message.id))
+        if (!known) return old
+
+        return {
+          ...old,
+          pages: old.pages.map((page) =>
+            page.map((m) => (m.id === payload.message.id ? payload.message : m)),
+          ),
+        }
+      })
+    }
+
     s.on('message.new', onMessageNew)
+    s.on('message.updated', onMessageUpdated)
 
     return () => {
       s.off('message.new', onMessageNew)
+      s.off('message.updated', onMessageUpdated)
       s.emit('channel.unsubscribe', channelId)
     }
   }, [channelId, queryClient])

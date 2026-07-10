@@ -28,7 +28,7 @@ export interface IngestMessage {
 export async function saveMessage(
   db: Kysely<DB>,
   input: IngestMessage,
-): Promise<{ id: string; inserted: boolean }> {
+): Promise<{ id: string; inserted: boolean; updated: boolean }> {
   const editedTs = input.editedTs ?? null
   const isEdit = editedTs != null
 
@@ -52,11 +52,25 @@ export async function saveMessage(
     })
     .onConflict((oc) =>
       isEdit
-        ? oc.columns(['channel_id', 'tg_message_id']).doUpdateSet((eb) => ({
-            text: input.text,
-            edited_ts: editedTs,
-            edit_count: eb('messages.edit_count', '+', 1),
-          }))
+        ? oc
+            .columns(['channel_id', 'tg_message_id'])
+            .doUpdateSet((eb) => ({
+              text: input.text,
+              edited_ts: editedTs,
+              edit_count: eb('messages.edit_count', '+', 1),
+            }))
+            // Условие на само действие DO UPDATE (не WHERE после него) — стандартный приём
+            // Postgres "conditional upsert": если ни text, ни edited_ts фактически не
+            // отличаются от уже сохранённых, DO UPDATE не выполняется вовсе (строка ведёт
+            // себя как при DO NOTHING — RETURNING её не отдаёт, xmax не трогается). Без этого
+            // условия повторная доставка ОДНОЙ и той же правки (пересечение бэкфилла и live —
+            // §4/§5 research) каждый раз двигала бы edit_count и давала бы updated=true, хотя
+            // реального изменения контента не было — таймлайн ловил бы "обновление" вхолостую.
+            // IS DISTINCT FROM — null-safe сравнение (важно для edited_ts: у строки, которую
+            // редактируют впервые, старое значение edited_ts ещё NULL).
+            .where(
+              sql<boolean>`(messages.text is distinct from ${input.text} or messages.edited_ts is distinct from ${editedTs})`,
+            )
         : // Повторная доставка — не ошибка: catchUp() в GramJS ничего не делает,
           // сообщение может продиспатчиться дважды, а бэкфилл на границе
           // перекрывается с live-потоком (см. docs/superpowers/research/telegram-ingestion.md §5).
@@ -68,11 +82,17 @@ export async function saveMessage(
     // вставки ошибочно давали бы inserted=false и молча теряли бы outbox-событие (задача 9).
     // xmax=0 — стандартный приём Postgres: у строки, вставленной ИМЕННО этой командой (а не
     // задетой веткой ON CONFLICT DO UPDATE), xmax остаётся нулевым независимо от значения isEdit.
-    .returning(['id', sql<boolean>`(xmax = 0)`.as('inserted')])
+    // updated=(xmax != 0) — раз строка вообще попала в RETURNING не через чистый INSERT (см.
+    // выше), значит её задела именно наша ветка ON CONFLICT DO UPDATE, прошедшая WHERE-условие
+    // выше, то есть контент реально изменился этой правкой.
+    .returning(['id', sql<boolean>`(xmax = 0)`.as('inserted'), sql<boolean>`(xmax != 0)`.as('updated')])
     .executeTakeFirst()
 
-  if (row) return { id: row.id, inserted: row.inserted }
+  if (row) return { id: row.id, inserted: row.inserted, updated: row.updated }
 
+  // Сюда попадаем и при чистой повторной доставке (doNothing сработал), и при правке без
+  // реального изменения контента (WHERE выше не пропустил DO UPDATE) — в обоих случаях
+  // строка этим вызовом не менялась: inserted=false, updated=false.
   const existing = await db
     .selectFrom('messages')
     .select('id')
@@ -80,7 +100,7 @@ export async function saveMessage(
     .where('tg_message_id', '=', input.tgMessageId)
     .executeTakeFirstOrThrow()
 
-  return { id: existing.id, inserted: false }
+  return { id: existing.id, inserted: false, updated: false }
 }
 
 export interface IngestMediaInput {
@@ -228,15 +248,23 @@ export interface AlbumMemberInput extends IngestMessage {
 }
 
 /**
- * Транзакционно сохраняет ВСЕ сообщения альбома (+ их строки медиа) и, если хотя бы одно
- * из них оказалось НОВЫМ (saveMessage().inserted === true хотя бы у одного члена), пишет
- * РОВНО ОДНУ строку в domain_events — на весь альбом, а не по одной на сообщение (задача 12c:
- * Telegram доставляет альбом N отдельными сообщениями с общим grouped_id, а таймлайн обязан
- * рисовать его одним узлом, поэтому и событие 'message.new' должно уйти один раз).
+ * Транзакционно сохраняет ВСЕ сообщения альбома (+ их строки медиа) и пишет РОВНО ОДНУ строку
+ * в domain_events — на весь альбом, а не по одной на сообщение (задача 12c: Telegram доставляет
+ * альбом N отдельными сообщениями с общим grouped_id, а таймлайн обязан рисовать его одним
+ * узлом, поэтому и событие должно уйти один раз). Приоритет у вставки: если хотя бы один член
+ * альбома НОВЫЙ (saveMessage().inserted === true) — событие 'message.new', как и раньше.
+ * Иначе, если хотя бы один член реально ИЗМЕНИЛСЯ этой правкой (saveMessage().updated === true) —
+ * событие 'message.updated' (правки в реальном времени: автор форума правит сообщения почти
+ * всегда, см. LOOP_STATE.md). Если нет ни вставок, ни изменений — событий нет вовсе (чистая
+ * повторная доставка).
  * `members` обязаны быть отсортированы по возрастанию tgMessageId (album-buffer.ts release()
  * уже так сортирует) — первый элемент становится якорем события (aggregate_id), его id идёт
  * в payload, который строит `buildEvent`. Одиночное сообщение — вырожденный случай альбома
- * из одного элемента, тот же код путь.
+ * из одного элемента, тот же код путь (в т.ч. и для правки одиночного сообщения).
+ * `buildEvent` получает `kind` ('new'|'updated') и сам решает, каким типом события это
+ * записать — так сборка payload (весь MessageDto узла: текст, медиа, aiSummary) не дублируется
+ * между 'message.new' и 'message.updated' (DRY): вызывающий код (ingest.service.ts) строит
+ * DTO один раз и лишь выбирает строку `type` по `kind`.
  * Тот же outbox-паттерн задачи 9, что и у saveMessageWithEvent ниже: событие коммитится в
  * ОДНОЙ транзакции с данными всех сообщений альбома — либо весь альбом целиком (данные +
  * событие) закоммичен, либо ничего (NOTIFY шлётся вызывающим кодом отдельно, после коммита).
@@ -244,12 +272,12 @@ export interface AlbumMemberInput extends IngestMessage {
 export async function saveAlbumWithEvent(
   db: Kysely<DB>,
   members: readonly AlbumMemberInput[],
-  buildEvent: (anchorMessageId: string) => DomainEventInput,
-): Promise<{ anchorId: string; anyInserted: boolean }> {
+  buildEvent: (anchorMessageId: string, kind: 'new' | 'updated') => DomainEventInput,
+): Promise<{ anchorId: string; anyInserted: boolean; anyUpdated: boolean }> {
   if (members.length === 0) throw new Error('saveAlbumWithEvent: пустой альбом')
 
   return db.transaction().execute(async (trx) => {
-    const results: { id: string; inserted: boolean }[] = []
+    const results: { id: string; inserted: boolean; updated: boolean }[] = []
     for (const member of members) {
       const saved = await saveMessage(trx, member)
       if (member.media) await insertMediaRow(trx, saved.id, member.media)
@@ -258,9 +286,10 @@ export async function saveAlbumWithEvent(
 
     const anchor = results[0]! // members гарантированно непусты (проверка выше)
     const anyInserted = results.some((r) => r.inserted)
+    const anyUpdated = results.some((r) => r.updated)
 
-    if (anyInserted) {
-      const event = buildEvent(anchor.id)
+    if (anyInserted || anyUpdated) {
+      const event = buildEvent(anchor.id, anyInserted ? 'new' : 'updated')
       await trx
         .insertInto('domain_events')
         .values({
@@ -272,7 +301,7 @@ export async function saveAlbumWithEvent(
         .execute()
     }
 
-    return { anchorId: anchor.id, anyInserted }
+    return { anchorId: anchor.id, anyInserted, anyUpdated }
   })
 }
 

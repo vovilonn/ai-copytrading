@@ -8,6 +8,14 @@ export interface MessageNewPayload {
   message: MessageDto
 }
 
+// Правка Telegram-сообщения (задача "правки в реальном времени"): та же форма, что и
+// MessageNewPayload (channelId + собранный целиком MessageDto узла), — payload у обоих
+// событий строится одним и тем же кодом на стороне ingest, различается только имя события.
+export interface MessageUpdatedPayload {
+  channelId: number
+  message: MessageDto
+}
+
 export interface ChannelStatsPayload {
   channelId: number
   messageCount: number
@@ -16,6 +24,7 @@ export interface ChannelStatsPayload {
 
 export interface ServerToClientEvents {
   'message.new': (payload: MessageNewPayload) => void
+  'message.updated': (payload: MessageUpdatedPayload) => void
   'channel.stats': (payload: ChannelStatsPayload) => void
 }
 

@@ -53,6 +53,61 @@ describe('saveMessage', () => {
     expect(row.edit_count).toBe(1)
   })
 
+  it('правка существующего сообщения с новым текстом → updated=true, inserted=false', async () => {
+    const at = new Date()
+    await saveMessage(db, { channelId: 1, tgMessageId: 558, text: 'исходный текст', msgTs: at, raw: {} })
+
+    const edited = await saveMessage(db, {
+      channelId: 1,
+      tgMessageId: 558,
+      text: 'исходный текст [EDITED]',
+      msgTs: at,
+      raw: {},
+      editedTs: at,
+    })
+
+    expect(edited.inserted).toBe(false)
+    expect(edited.updated).toBe(true)
+  })
+
+  it('повторная доставка ИДЕНТИЧНОЙ правки (тот же text и edited_ts) не считается новым изменением', async () => {
+    const at = new Date()
+    await saveMessage(db, { channelId: 1, tgMessageId: 559, text: 'база', msgTs: at, raw: {} })
+
+    const first = await saveMessage(db, {
+      channelId: 1,
+      tgMessageId: 559,
+      text: 'база [EDITED]',
+      msgTs: at,
+      raw: {},
+      editedTs: at,
+    })
+    expect(first.inserted).toBe(false)
+    expect(first.updated).toBe(true)
+
+    // Пересечение бэкфилла и live-потока (§4/§5 research) может доставить ОДНУ и ту же правку
+    // дважды — идемпотентность обязана держать updated=false на повторе, иначе таймлайн ловил
+    // бы "обновление" вхолостую при каждой повторной доставке.
+    const second = await saveMessage(db, {
+      channelId: 1,
+      tgMessageId: 559,
+      text: 'база [EDITED]',
+      msgTs: at,
+      raw: {},
+      editedTs: at,
+    })
+    expect(second.inserted).toBe(false)
+    expect(second.updated).toBe(false)
+  })
+
+  it('чистая повторная доставка без editDate — inserted=false, updated=false', async () => {
+    const input = { channelId: 1, tgMessageId: 560, text: 'x', msgTs: new Date(), raw: {} }
+    const first = await saveMessage(db, input)
+    const second = await saveMessage(db, input)
+    expect(first).toMatchObject({ inserted: true, updated: false })
+    expect(second).toMatchObject({ inserted: false, updated: false })
+  })
+
   it('первая вставка сообщения с уже проставленным editedTs — это НЕ конфликт, inserted=true', async () => {
     // Регрессия: Telegram-сообщение может нести editDate ещё до того, как мы впервые его увидели
     // (канал правил его сам до нашего бэкфилла) — сама по себе editedTs≠null не означает, что
@@ -272,6 +327,55 @@ describe('saveAlbumWithEvent', () => {
 
     const { rows } = await sql<{ count: number }>`
       SELECT count(*) FROM domain_events WHERE aggregate_id = ${first.anchorId}
+    `.execute(db)
+    expect(rows[0]?.count).toBe(1)
+  })
+
+  // Дефект "правки не обновляются в реальном времени": правка члена уже сохранённого
+  // альбома (в т.ч. вырожденного альбома из одного сообщения) обязана породить ОДНУ строку
+  // domain_events с type='message.updated' — buildEvent получает kind от saveAlbumWithEvent
+  // и сам решает, каким типом события это записать (тот же приём, что и в ingest.service.ts).
+  function buildEventByKind(anchorMessageId: string, kind: 'new' | 'updated') {
+    return {
+      type: kind === 'new' ? 'message.new' : 'message.updated',
+      aggregate: 'message',
+      payload: { channelId: 1, message: { id: anchorMessageId } },
+    }
+  }
+
+  it('правка ранее сохранённого сообщения пишет ровно одну строку domain_events с type=message.updated', async () => {
+    const original = albumMembers([820], 'g-evt-820')
+    const created = await saveAlbumWithEvent(db, original, buildEventByKind)
+    expect(created.anyInserted).toBe(true)
+    expect(created.anyUpdated).toBe(false)
+
+    const at = new Date()
+    const edited = albumMembers([820], 'g-evt-820').map((m) => ({
+      ...m,
+      text: 'подпись альбома [EDITED]',
+      editedTs: at,
+    }))
+
+    const editResult = await saveAlbumWithEvent(db, edited, buildEventByKind)
+    expect(editResult.anyInserted).toBe(false)
+    expect(editResult.anyUpdated).toBe(true)
+    expect(editResult.anchorId).toBe(created.anchorId)
+
+    const updatedEvents = await db
+      .selectFrom('domain_events')
+      .selectAll()
+      .where('aggregate_id', '=', created.anchorId)
+      .where('type', '=', 'message.updated')
+      .execute()
+    expect(updatedEvents).toHaveLength(1)
+
+    // Повторная доставка ТОЙ ЖЕ правки (пересечение бэкфилла/live) — событий больше не прибавляет.
+    const redelivered = await saveAlbumWithEvent(db, edited, buildEventByKind)
+    expect(redelivered.anyInserted).toBe(false)
+    expect(redelivered.anyUpdated).toBe(false)
+
+    const { rows } = await sql<{ count: number }>`
+      SELECT count(*) FROM domain_events WHERE aggregate_id = ${created.anchorId} AND type = 'message.updated'
     `.execute(db)
     expect(rows[0]?.count).toBe(1)
   })

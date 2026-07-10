@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
 import type { MessageDto } from 'shared/dto.js'
-import type { MessageNewPayload } from 'shared/ws-events.js'
+import type { MessageNewPayload, MessageUpdatedPayload } from 'shared/ws-events.js'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { MessageTimeline } from '../src/components/MessageTimeline.js'
 import { apiFetch } from '../src/lib/api.js'
@@ -52,6 +52,15 @@ function getMessageNewHandler(): (payload: MessageNewPayload) => void {
     | [string, (payload: MessageNewPayload) => void]
     | undefined
   if (!call) throw new Error("обработчик 'message.new' не зарегистрирован")
+  return call[1]
+}
+
+// Обработчик 'message.updated' — правки Telegram-сообщений (задача "правки в реальном времени").
+function getMessageUpdatedHandler(): (payload: MessageUpdatedPayload) => void {
+  const call = mockSocket.on.mock.calls.findLast(([event]) => event === 'message.updated') as
+    | [string, (payload: MessageUpdatedPayload) => void]
+    | undefined
+  if (!call) throw new Error("обработчик 'message.updated' не зарегистрирован")
   return call[1]
 }
 
@@ -128,5 +137,48 @@ describe('MessageTimeline', () => {
     await waitFor(() => {
       expect(screen.getAllByTestId('message-row')).toHaveLength(2)
     })
+  })
+
+  it('событие message.updated заменяет текст существующего узла на месте, без нового узла и смены порядка', async () => {
+    renderTimeline([
+      messageFixture({ id: 'm-1', text: 'первое сообщение' }),
+      messageFixture({ id: 'm-2', text: 'второе сообщение' }),
+    ])
+    await screen.findByText('первое сообщение')
+    expect(screen.getAllByTestId('message-row')).toHaveLength(2)
+
+    const handler = getMessageUpdatedHandler()
+    handler({
+      channelId: CHANNEL_ID,
+      message: messageFixture({ id: 'm-1', text: 'первое сообщение [EDITED-CHECK]' }),
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('первое сообщение [EDITED-CHECK]')).toBeInTheDocument()
+    })
+    // Ровно два узла (не три — правка заменяет, а не добавляет) и порядок не сдвинулся:
+    // отредактированное сообщение по-прежнему первое.
+    const rows = screen.getAllByTestId('message-row')
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toHaveTextContent('первое сообщение [EDITED-CHECK]')
+    expect(rows[1]).toHaveTextContent('второе сообщение')
+  })
+
+  it('message.updated для id, отсутствующего в кэше, ничего не ломает', async () => {
+    renderTimeline([messageFixture({ id: 'm-1', text: 'старое сообщение' })])
+    await screen.findByText('старое сообщение')
+
+    const handler = getMessageUpdatedHandler()
+    handler({
+      channelId: CHANNEL_ID,
+      message: messageFixture({ id: 'm-не-в-кэше', text: 'узел, которого нет в таймлайне' }),
+    })
+
+    // Ни новый узел не появился, ни существующий не пострадал.
+    await waitFor(() => {
+      expect(screen.getAllByTestId('message-row')).toHaveLength(1)
+    })
+    expect(screen.getByText('старое сообщение')).toBeInTheDocument()
+    expect(screen.queryByText('узел, которого нет в таймлайне')).toBeNull()
   })
 })
