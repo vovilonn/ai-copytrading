@@ -114,9 +114,26 @@ export interface DB {
     limit_ttl_sec: number
     updated_at: Date
   }
+  instruments: {
+    symbol: string
+    // net_t — тот же enum, что и остальная схема (001_initial.ts): 'testnet' | 'mainnet'.
+    network: 'testnet' | 'mainnet'
+    base_coin: string
+    status: string
+    // NUMERIC-колонки — string (см. комментарий выше про точность).
+    qty_step: string
+    min_qty: string
+    tick_size: string
+    min_notional: string
+    max_leverage: string
+    leverage_step: string
+    // Задача 1 (003_instruments_mmr): MMR tier1 из risk-limit, nullable — см. миграцию.
+    mmr: string | null
+    refreshed_at: Generated<Date>
+  }
   // остальные таблицы схемы (processed_messages, parse_results, ai_calls,
   // ai_cache, actions, trades, trade_legs, orders, executions, symbol_ownership, positions,
-  // instruments, audit_log, app_state) объявляются здесь же по мере использования в Ф1–Ф4.
+  // audit_log, app_state) объявляются здесь же по мере использования в Ф1–Ф4.
   // Пока созданы миграцией, но не типизированы — тесты, которым нужен сырой SQL, используют sql`...`.
 }
 

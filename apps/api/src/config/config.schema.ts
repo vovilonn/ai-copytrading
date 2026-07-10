@@ -9,6 +9,9 @@ const schema = z.object({
   TG_APP_API_ID: z.coerce.number().int().positive(),
   TG_APP_API_HASH: z.string().min(1),
   TG_SESSION: z.string().min(1),
+  // Активная сеть Bybit (задача 1, Ф1): выбирает хост testnet/mainnet для публичных
+  // market-эндпоинтов (instruments-info, risk-limit) — см. instruments.service.ts.
+  BYBIT_NETWORK: z.enum(['testnet', 'mainnet']).default('testnet'),
 })
 
 export type AppConfig = {
@@ -16,6 +19,7 @@ export type AppConfig = {
   adminUsername: string; adminPassword: string
   executionMode: 'dry_run' | 'live'
   tgApiId: number; tgApiHash: string; tgSession: string
+  bybitNetwork: 'testnet' | 'mainnet'
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
@@ -30,5 +34,6 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     adminUsername: e.ADMIN_USERNAME, adminPassword: e.ADMIN_PASSWORD,
     executionMode: e.EXECUTION_MODE,
     tgApiId: e.TG_APP_API_ID, tgApiHash: e.TG_APP_API_HASH, tgSession: e.TG_SESSION,
+    bybitNetwork: e.BYBIT_NETWORK,
   }
 }
