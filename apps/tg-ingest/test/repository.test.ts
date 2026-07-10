@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { Kysely, sql } from 'kysely'
+import { resetTestSchema } from 'test-db'
 import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
 import { saveMessage, advanceCursor, getCursor } from '../src/repository.js'
@@ -9,14 +10,11 @@ let db: Kysely<DB>
 beforeAll(async () => {
   db = createDb(process.env.DATABASE_URL!)
   await migrateToLatest(db)
-  // Тесты идемпотентны: гоняются повторно против той же живой БД,
+  // Тесты идемпотентны: гоняются повторно против той же тестовой БД (copytrade_test),
   // поэтому чистим фикстуры перед каждым прогоном (аналогично apps/api/test/migration.test.ts).
-  await sql`TRUNCATE messages, channel_settings, channels RESTART IDENTITY CASCADE`.execute(db)
-  // ord=101 — заведомо вне диапазона реальных источников (SOURCES использует ord=1,2 —
-  // см. apps/tg-ingest/src/sources.ts и ingest.service.ts.seedChannel), иначе UNIQUE(ord)
-  // конфликтует с сидом ingest.smoke.test.ts на одной живой БД.
+  await resetTestSchema(db)
   await sql`INSERT INTO channels (id, ord, key, source_kind, adapter_id)
-            VALUES (1, 101, 'test', 'channel', 'x')`.execute(db)
+            VALUES (1, 1, 'test', 'channel', 'x')`.execute(db)
 })
 
 afterAll(async () => {

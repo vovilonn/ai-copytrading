@@ -64,6 +64,9 @@ importers:
       dotenv:
         specifier: ^16.4.0
         version: 16.6.1
+      test-db:
+        specifier: workspace:*
+        version: link:../../packages/test-db
       tsx:
         specifier: ^4.19.0
         version: 4.23.0
@@ -92,6 +95,9 @@ importers:
       dotenv:
         specifier: ^16.4.0
         version: 16.6.1
+      test-db:
+        specifier: workspace:*
+        version: link:../../packages/test-db
       tsx:
         specifier: ^4.19.0
         version: 4.23.0
@@ -101,6 +107,25 @@ importers:
       vitest:
         specifier: ^3.0.0
         version: 3.2.7(@types/node@26.1.1)(tsx@4.23.0)
+
+  packages/test-db:
+    dependencies:
+      kysely:
+        specifier: ^0.28.0
+        version: 0.28.17
+      pg:
+        specifier: ^8.13.0
+        version: 8.22.0
+    devDependencies:
+      '@types/pg':
+        specifier: ^8.11.0
+        version: 8.20.0
+      dotenv:
+        specifier: ^16.4.0
+        version: 16.6.1
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
 
 packages:
 

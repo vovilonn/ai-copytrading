@@ -1,4 +1,5 @@
 import { it, expect } from 'vitest'
+import { resetTestSchema } from 'test-db'
 import { createDb } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
 import { loadConfig } from 'api/config/config.schema.js'
@@ -20,6 +21,10 @@ it.skipIf(!hasSession)(
     const config = loadConfig(process.env)
     const db = createDb(config.databaseUrl)
     await migrateToLatest(db)
+    // Чистим тестовую БД до сида: connect() ниже засевает реальные каналы с ord=1,2, а
+    // repository.test.ts в том же прогоне (одна БД, fileParallelism:false) оставляет свой
+    // канал с ord=1 — без сброса UNIQUE(ord) конфликтует в зависимости от порядка файлов.
+    await resetTestSchema(db)
 
     const service = new IngestService(config, db)
     try {
