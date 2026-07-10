@@ -67,6 +67,10 @@ export interface DB {
     correlation_id: Generated<string>
     received_at: Generated<Date>
     updated_at: Generated<Date>
+    // Задача 12b (002_media_repair): счётчик попыток ремонтного прохода и метка окончательного
+    // отказа (сообщение удалено в Telegram / медиа объективно недоступно) — см. миграцию.
+    media_repair_attempts: Generated<number>
+    media_repair_failed_at: Date | null
   }
   message_media: {
     id: string

@@ -17,6 +17,8 @@ import { topicOf } from './topic-filter.js'
 import { AlbumBuffer, type AlbumMessage } from './album-buffer.js'
 import { pickMedia, type DownloadHint } from './media.js'
 import { saveMessageWithEvent, advanceCursor, getCursor, type IngestMediaInput } from './repository.js'
+import { withDownloadRetry } from './retry.js'
+import { MediaRepairService, type MediaFetcher, type DownloadedMediaResult } from './media-repair.js'
 import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
 import type { MessageNewPayload } from 'shared/ws-events.js'
 
@@ -95,6 +97,7 @@ export class IngestService {
   private readonly albumBuffer: AlbumBuffer<BufferedMessage>
   private readonly resolved = new Map<string, ResolvedSource>() // key: channelId.toString()
   private readonly inFlight = new Set<Promise<void>>()
+  private readonly mediaRepair: MediaRepairService
   private backfillTimer: NodeJS.Timeout | null = null
 
   constructor(
@@ -111,6 +114,9 @@ export class IngestService {
       floodSleepThreshold: 60,
     })
     this.albumBuffer = new AlbumBuffer<BufferedMessage>(ALBUM_WINDOW_MS, (batch) => this.trackAlbum(batch))
+    // Ремонтный проход (задача 12b) — MediaFetcher реализован ниже (mediaFetcher()) поверх
+    // this.client, но MediaRepairService о GramJS ничего не знает (тестируется фейком).
+    this.mediaRepair = new MediaRepairService(this.db, this.mediaFetcher(), CHANNEL_SOURCES)
   }
 
   /** Подключение, авторизация, прогрев access_hash, резолв источников и сид channels/channel_settings. */
@@ -160,8 +166,22 @@ export class IngestService {
     }
   }
 
+  /** Ремонтный проход (задача 12b): добирает медиа для сообщений, у которых has_media=true,
+   *  но строки message_media нет (сбой сети/FloodWait на исходной вставке — см.
+   *  task-12b-report.md). Запускается на старте после бэкфилла и затем периодически (§ниже). */
+  async repairMissingMedia(): Promise<void> {
+    const summary = await this.mediaRepair.run()
+    if (summary.scanned > 0) {
+      console.warn(
+        `[tg-ingest] ремонт медиа: просканировано ${summary.scanned}, ` +
+          `восстановлено ${summary.repaired}, не удалось ${summary.failed}`,
+      )
+    }
+  }
+
   async start(): Promise<void> {
     await this.backfillAll()
+    await this.repairMissingMedia().catch((err) => this.logError('repairMissingMedia (старт)', err))
 
     const chats = CHANNEL_SOURCES.map((s) => Number(s.channelId))
 
@@ -187,7 +207,9 @@ export class IngestService {
     )
 
     this.backfillTimer = setInterval(() => {
-      this.backfillAll().catch((err) => this.logError('backfillAll (periodic)', err))
+      this.backfillAll()
+        .then(() => this.repairMissingMedia())
+        .catch((err) => this.logError('backfillAll/repairMissingMedia (periodic)', err))
     }, PERIODIC_BACKFILL_MS)
   }
 
@@ -400,7 +422,16 @@ export class IngestService {
         replyToTopId: msg.replyTo?.replyToTopId ?? null,
         isTopicMessage: Boolean(msg.replyTo?.forumTopic),
         text,
-        hasMedia: downloaded != null,
+        // has_media отражает факт наличия СКАЧИВАЕМОГО медиа (pickMedia() нашёл фото или
+        // видео-превью), а не успех самого скачивания. Осознанно НЕ downloaded != null:
+        // если скачивание уронила сетевая флуктуация/необработанный FloodWait, медиа всё равно
+        // объективно существует — has_media=true остаётся честным сигналом и превращает
+        // сообщение в кандидата ремонтного прохода (repairMissingMedia). Обратное (has_media
+        // = downloaded != null) тихо прятало бы потерю: сообщение с реальным фото навсегда
+        // выглядело бы как не имеющее медиа, и чинить было бы нечего — ровно дефект задачи 12b
+        // (см. .superpowers/sdd/task-12b-report.md, §"Причина"). Стикеры и видео без PhotoSize
+        // (pickMedia() вернул null) законно остаются has_media=false — это не потеря.
+        hasMedia: hint != null,
         mediaKind: msg.media?.className ?? null,
         msgTs,
         editedTs,
@@ -423,14 +454,17 @@ export class IngestService {
   }
 
   /** Скачивает медиа-файл и кладёт его на диск. Только сетевой I/O + fs — без обращений к БД,
-   *  чтобы сбой скачивания не держал открытую транзакцию и не откатывал вставку сообщения. */
+   *  чтобы сбой скачивания не держал открытую транзакцию и не откатывал вставку сообщения.
+   *  Ретраится withDownloadRetry (1с/3с/9с, FloodWaitError — err.seconds+1) — это единственное
+   *  место в коде, где реально теряются фотографии (задача 12b), поэтому именно здесь, а не в
+   *  общем withFloodRetry (тот ретраит только FloodWaitError для лёгких вызовов). */
   private async downloadMediaFile(
     source: ChannelSource,
     msg: Api.Message,
     hint: DownloadHint,
     orderIndex: number,
   ): Promise<DownloadedMedia | null> {
-    const buffer = await this.withFloodRetry(`downloadMedia ${source.key}#${msg.id}`, () =>
+    const buffer = await withDownloadRetry(`downloadMedia ${source.key}#${msg.id}`, () =>
       this.client.downloadMedia(msg, hint.options),
     )
     if (!buffer || typeof buffer === 'string' || buffer.length === 0) return null
@@ -442,6 +476,35 @@ export class IngestService {
 
     const sha256 = crypto.createHash('sha256').update(buffer).digest('hex')
     return { relPath, buffer, sha256, kind: hint.kind }
+  }
+
+  /** Реализация MediaFetcher (media-repair.ts) поверх this.client — единственное место, где
+   *  MediaRepairService соприкасается с GramJS. Сам сервис от Telegram не зависит и тестируется
+   *  фейком этого интерфейса (test/media-repair.test.ts), без реальной MTProto-сессии. */
+  private mediaFetcher(): MediaFetcher {
+    return {
+      fetchMessages: async (source, tgMessageIds) => {
+        const resolvedSource = this.resolved.get(source.channelId.toString())
+        const entity = resolvedSource?.entity ?? (await this.resolveEntity(source.channelId))
+        // getMessages({ids}) отдаёт ровно один элемент на каждый id, СТРОГО в том же порядке
+        // (см. node_modules/telegram/client/messages.js _IDsIter._loadNextChunk — на месте
+        // удалённого/недоступного сообщения в буфер пушится undefined, позиция не съезжает).
+        const messages = await this.withFloodRetry(`repair getMessages ${source.key}`, () =>
+          this.client.getMessages(entity, { ids: [...tgMessageIds] }),
+        )
+        return tgMessageIds.map((_, i) => messages[i])
+      },
+      downloadMedia: async (source, msg, hint, orderIndex): Promise<DownloadedMediaResult | null> => {
+        const downloaded = await this.downloadMediaFile(source, msg, hint, orderIndex)
+        if (!downloaded) return null
+        return {
+          storagePath: downloaded.relPath,
+          bytes: downloaded.buffer.length,
+          sha256: downloaded.sha256,
+          mediaType: 'image/jpeg',
+        }
+      },
+    }
   }
 
   private async onDeleted(event: DeletedMessageEvent): Promise<void> {

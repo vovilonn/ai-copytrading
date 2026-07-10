@@ -101,6 +101,129 @@ export interface DomainEventInput {
 }
 
 /**
+ * Вставляет строку message_media, если такой (message_id, order_index) ещё нет —
+ * дедуп на пересечении бэкфилла/live-потока/ремонтного прохода (§4/§5 research, задача 12b).
+ * Опирается на UNIQUE(message_id, order_index) из 002_media_repair.ts: гонка исключена на
+ * уровне БД, а не только приложения (в отличие от прежнего select-затем-insert).
+ * Возвращает true, если строка реально вставлена этим вызовом (а не пропущена как дубль).
+ */
+export async function insertMediaRow(
+  db: Kysely<DB>,
+  messageId: string,
+  media: IngestMediaInput,
+): Promise<boolean> {
+  const result = await db
+    .insertInto('message_media')
+    .values({
+      id: media.id,
+      message_id: messageId,
+      tg_message_id: media.tgMessageId,
+      grouped_id: media.groupedId,
+      order_index: media.orderIndex,
+      storage_path: media.storagePath,
+      media_type: media.mediaType,
+      width: null,
+      height: null,
+      bytes: media.bytes,
+      sha256: media.sha256,
+      created_at: new Date(),
+    })
+    .onConflict((oc) => oc.columns(['message_id', 'order_index']).doNothing())
+    .executeTakeFirst()
+  return Number(result.numInsertedOrUpdatedRows ?? 0) > 0
+}
+
+export interface MediaRepairCandidate {
+  messageDbId: string
+  channelId: number
+  tgMessageId: number
+  groupedId: string | null
+}
+
+/**
+ * Кандидаты ремонтного прохода (задача 12b): has_media=true (по честной семантике —
+ * pickMedia() на вставке вернул скачиваемый hint, см. ingest.service.ts persistMessage),
+ * но строки message_media нет, и предыдущие попытки ремонта ещё не исчерпаны.
+ */
+export async function findMediaRepairCandidates(
+  db: Kysely<DB>,
+  limit: number,
+): Promise<MediaRepairCandidate[]> {
+  const rows = await db
+    .selectFrom('messages as m')
+    .select([
+      'm.id as messageDbId',
+      'm.channel_id as channelId',
+      'm.tg_message_id as tgMessageId',
+      'm.grouped_id as groupedId',
+    ])
+    .where('m.has_media', '=', true)
+    .where('m.media_repair_failed_at', 'is', null)
+    .where((eb) =>
+      eb.not(
+        eb.exists(
+          eb.selectFrom('message_media as mm').select('mm.id').whereRef('mm.message_id', '=', 'm.id'),
+        ),
+      ),
+    )
+    .orderBy('m.received_at', 'asc')
+    .limit(limit)
+    .execute()
+  return rows
+}
+
+/**
+ * order_index у альбома — позиция сообщения среди всех его "братьев" (тот же grouped_id),
+ * отсортированных по возрастанию tg_message_id (album-buffer.ts release() сортирует так же
+ * перед вызовом handleAlbum — см. task-12b-report.md). Считается по ВСЕМ сообщениям группы
+ * (не только по ремонтируемым), иначе позиция разойдётся с уже вставленными строками.
+ */
+export async function computeAlbumOrderIndex(
+  db: Kysely<DB>,
+  channelId: number,
+  groupedIds: readonly string[],
+): Promise<Map<string, Map<number, number>>> {
+  const result = new Map<string, Map<number, number>>()
+  if (groupedIds.length === 0) return result
+
+  const { rows } = await sql<{ grouped_id: string; tg_message_id: number; order_index: number }>`
+    SELECT grouped_id, tg_message_id,
+           (row_number() OVER (PARTITION BY grouped_id ORDER BY tg_message_id) - 1)::int AS order_index
+    FROM messages
+    WHERE channel_id = ${channelId} AND grouped_id = ANY(${groupedIds})
+  `.execute(db)
+
+  for (const row of rows) {
+    const perGroup = result.get(row.grouped_id) ?? new Map<number, number>()
+    perGroup.set(row.tg_message_id, row.order_index)
+    result.set(row.grouped_id, perGroup)
+  }
+  return result
+}
+
+/**
+ * Фиксирует неудачную попытку ремонта: инкрементирует счётчик и, только исчерпав maxAttempts,
+ * проставляет media_repair_failed_at — навсегда исключая сообщение из будущих сканирований
+ * (удалено в Telegram / медиа объективно недоступно). Разовая сетевая флуктуация не должна
+ * закрывать ремонт после первой же неудачи — отсюда порог, а не немедленная пометка.
+ */
+export async function recordMediaRepairAttempt(
+  db: Kysely<DB>,
+  messageDbId: string,
+  maxAttempts: number,
+): Promise<void> {
+  await sql`
+    UPDATE messages
+    SET media_repair_attempts = media_repair_attempts + 1,
+        media_repair_failed_at = CASE
+          WHEN media_repair_attempts + 1 >= ${maxAttempts} THEN now()
+          ELSE media_repair_failed_at
+        END
+    WHERE id = ${messageDbId}
+  `.execute(db)
+}
+
+/**
  * Транзакционно сохраняет сообщение (+ строку медиа, если она есть) и, если сообщение
  * НОВОЕ (saveMessage().inserted === true — не правка и не повторная доставка), пишет строку
  * в domain_events. Outbox-паттерн задачи 9: событие коммитится в ОДНОЙ транзакции с самими
@@ -120,31 +243,7 @@ export async function saveMessageWithEvent(
       // Дедуп на пересечении бэкфилла и live-потока (§4/§5 research) — не плодим повторную
       // строку медиа для уже обработанного (message_id, order_index). Не зависит от
       // result.inserted: правка теоретически тоже может донести новое медиа.
-      const existing = await trx
-        .selectFrom('message_media')
-        .select('id')
-        .where('message_id', '=', result.id)
-        .where('order_index', '=', media.orderIndex)
-        .executeTakeFirst()
-      if (!existing) {
-        await trx
-          .insertInto('message_media')
-          .values({
-            id: media.id,
-            message_id: result.id,
-            tg_message_id: media.tgMessageId,
-            grouped_id: media.groupedId,
-            order_index: media.orderIndex,
-            storage_path: media.storagePath,
-            media_type: media.mediaType,
-            width: null,
-            height: null,
-            bytes: media.bytes,
-            sha256: media.sha256,
-            created_at: new Date(),
-          })
-          .execute()
-      }
+      await insertMediaRow(trx, result.id, media)
     }
 
     if (result.inserted) {
