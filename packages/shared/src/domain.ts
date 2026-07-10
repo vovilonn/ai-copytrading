@@ -26,3 +26,66 @@ export interface Instrument {
   mmr: string | null
   refreshedAt: string // ISO
 }
+
+// Типы адаптера канала (задача 3, research §10 «Интерфейс адаптера»). Перенесены
+// дословно из docs/superpowers/research/channel-adapters.md §10 — единственный
+// контракт между ядром и адаптером конкретного Telegram-канала: ядро передаёт
+// ParseContext, адаптер возвращает ParsedResult, ничего не зная про Bybit/БД/сеть.
+
+export type Side = 'long' | 'short'
+
+/** execute = детерминированно исполняем; ai = нужен LLM+state (Ф2); skip/noise — не исполняем. */
+export type Route = 'execute' | 'ai' | 'skip' | 'noise'
+
+export interface ParseContext {
+  channelId: string
+  message: {
+    id: number
+    text: string
+    date: string
+    replyToMsgId: number | null
+    groupedId: string | null
+    media: string | null
+    mediaFile: string | null
+  }
+  // разрешение символа + reply/state, ядро передаёт, адаптер не знает про Bybit:
+  resolveSymbol(raw: string): string | null // алиас → BYBITSYMBOL (или null)
+  isListed(symbol: string): boolean // instruments-info кэш активной сети
+  getMessage(id: number): ParseContext['message'] | null // для транзитивного reply-подъёма
+  // state «один символ — один канал»:
+  openPositions: ReadonlyMap<string, { tradeId: string; side: Side; openedByChannel: string }>
+  lastTouchedSymbol: string | null // для символ-less дельт CH2
+}
+
+export type ParsedIntent =
+  | {
+      kind: 'entry_signal'
+      symbol: string
+      side: Side
+      entry: [number, number] | number
+      tps: number[]
+      sl: number
+      riskPct?: number
+    } // R1 / A
+  | { kind: 'limit_entry'; symbol: string; side: Side; price: number } // B
+  | { kind: 'market_entry'; symbol: string; side: Side } // C
+  | { kind: 'add'; symbol: string; price?: number } // доливка (реш. #6)
+  | { kind: 'delta'; symbol: string | null; ops: DeltaOp[]; targetTradeId?: string } // R3/R4/D/E
+
+export type DeltaOp =
+  | { op: 'tp_hit'; index?: number }
+  | { op: 'partial_close'; fraction?: number }
+  | { op: 'close_remainder' }
+  | { op: 'sl_breakeven' }
+  | { op: 'sl_hit' }
+  | { op: 'sl_set'; price: number }
+  | { op: 'sl_cancel' }
+  | { op: 'hold' }
+
+export interface ParsedResult {
+  route: Route
+  confidence: number // [0,1]
+  intents: ParsedIntent[] // >1 при мульти-ордер/мульти-mgmt (E2/E4)
+  reason?: string // 'no_SL' | 'symbol_not_listed' | 'symbol_unknown_needs_vision'
+  needsVision?: boolean // CH2: символ только в mediaFile
+}
