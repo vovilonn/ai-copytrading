@@ -350,3 +350,70 @@ describe('GET /media/:id', () => {
     await agent.get(`/api/media/${row.id}`).expect(404)
   })
 })
+
+// Задача 8: actions пайплайна (задача 7) теперь заполняют MessageDto.actions — раньше был [].
+// Блок намеренно в конце файла: tg_message_id фикстуры выше остальных фикстур этого файла
+// (1001-1005, альбом 2000-2002) — если вставить его раньше, он "всплывёт" самым свежим узлом
+// в предыдущих describe-блоках и сломает их проверки точного порядка/лимита узлов.
+describe('MessageDto.actions — заполняется из таблицы actions (задача 8)', () => {
+  const SIGNAL_TG_ID = 9000
+
+  beforeAll(async () => {
+    const message = await db
+      .insertInto('messages')
+      .values({
+        channel_id: CHANNEL_1_ID,
+        tg_message_id: SIGNAL_TG_ID,
+        is_topic_message: false,
+        text: '#BTC/USDT Long\nEntry 62400\nTP 64000\nSL 61500',
+        has_media: false,
+        msg_ts: new Date(Date.UTC(2026, 0, 3, 12, 0, 0)),
+        raw: JSON.stringify({}),
+      })
+      .returning('id')
+      .executeTakeFirstOrThrow()
+
+    const trade = await db
+      .insertInto('trades')
+      .values({ human_ref: 'TR-9201', seq: 9201, channel_id: CHANNEL_1_ID, symbol: 'BTCUSDT', side: 'long', status: 'open' })
+      .returning('id')
+      .executeTakeFirstOrThrow()
+
+    await db
+      .insertInto('actions')
+      .values({
+        message_id: message.id,
+        channel_id: CHANNEL_1_ID,
+        action_index: 0,
+        type: 'open',
+        side: 'long',
+        symbol: 'BTCUSDT',
+        pair: 'BTCUSDT',
+        method: 'auto',
+        status: 'executed',
+        trade_id: trade.id,
+      })
+      .execute()
+  })
+
+  it('сообщение с распознанным сигналом отдаёт actions с иконкой/типом/pair/tradeRef', async () => {
+    const res = await agent.get(`/api/channels/${CHANNEL_1_ID}/messages?limit=50`).expect(200)
+    const messages = res.body as MessageDto[]
+    const signal = messages.find((m) => m.tgMessageId === SIGNAL_TG_ID)!
+    expect(signal.actions).toHaveLength(1)
+    const action = signal.actions[0]!
+    expect(action.type).toBe('open')
+    expect(action.side).toBe('long')
+    expect(action.pair).toBe('BTCUSDT')
+    expect(action.tradeRef).toBe('#TR-9201')
+    expect(action.skipReason).toBeNull()
+    expect(action.icon).toBe('trending-up')
+  })
+
+  it('сообщение без сигнала по-прежнему отдаёт actions: []', async () => {
+    const res = await agent.get(`/api/channels/${CHANNEL_1_ID}/messages?limit=50`).expect(200)
+    const messages = res.body as MessageDto[]
+    const noSignal = messages.find((m) => m.tgMessageId === 1005)!
+    expect(noSignal.actions).toEqual([])
+  })
+})

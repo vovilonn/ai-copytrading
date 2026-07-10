@@ -18,6 +18,17 @@ export function parseNumbers(text: string): number[] {
 }
 
 /**
+ * NUMERIC из Postgres приходит строкой вида '500.00000000' — обрезает незначащие нули для
+ * отображения (design/project/Admin.dc.html показывает '$500'/'10x', а не '$500.00000000').
+ * Тот же приём, что и локальный formatNumeric в apps/api/src/channels/channels.service.ts
+ * (не обобщался туда сознательно — минимальный риск диффа в уже протестированном файле);
+ * здесь — общий хелпер для actions/positions (задача 8, apps/api/src/positions/positions.service.ts).
+ */
+export function formatDecimal(value: string): string {
+  return String(Number(value))
+}
+
+/**
  * Разбивает "лесенку" целей, размеченную keycap-эмодзи (1️⃣, 2️⃣, 3️⃣…), на числа.
  * Keycap — это цифра + необязательный variation selector (U+FE0F) + enclosing
  * keycap (U+20E3); сплитим по этой последовательности, а не по самой цифре, чтобы

@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common'
 import { sql } from 'kysely'
-import type { ChannelDto, MessageDto } from 'shared/dto.js'
+import { actionIcon } from 'shared/action-meta.js'
+import type { ChannelDto, MessageActionDto, MessageDto } from 'shared/dto.js'
 import { mediaUrl } from 'shared/media.js'
 import { DatabaseService } from '../db/database.service.js'
 
@@ -167,6 +168,36 @@ export class ChannelsService {
       mediaByMessage.set(row.message_id, list)
     }
 
+    // Задача 8: actions пайплайна (задача 7) для показанных сообщений — один батч-запрос на
+    // все узлы страницы (тот же приём, что и с message_media выше, не N+1). LEFT JOIN trades —
+    // tradeRef (у skipped-actions trade_id всегда null).
+    const actionRows = await this.database.db
+      .selectFrom('actions as a')
+      .leftJoin('trades as t', 't.id', 'a.trade_id')
+      .select(['a.message_id as message_id', 'a.action_index as action_index', 'a.type as type', 'a.side as side', 'a.pair as pair', 'a.skip_reason as skip_reason', 't.human_ref as human_ref'])
+      .where(
+        'a.message_id',
+        'in',
+        messageRows.map((m) => m.id),
+      )
+      .orderBy('a.action_index', 'asc')
+      .execute()
+
+    const actionsByMessage = new Map<string, MessageActionDto[]>()
+    for (const row of actionRows) {
+      const dto: MessageActionDto = {
+        type: row.type,
+        side: row.side,
+        pair: row.pair,
+        tradeRef: row.human_ref ? `#${row.human_ref}` : null,
+        skipReason: row.skip_reason,
+        icon: actionIcon(row.type, row.side),
+      }
+      const list = actionsByMessage.get(row.message_id) ?? []
+      list.push(dto)
+      actionsByMessage.set(row.message_id, list)
+    }
+
     // Строки, сгруппированные по узлу таймлайна (сохраняют порядок возрастания tg_message_id
     // из запроса выше — важно: первый элемент группы и есть её якорь).
     const rowsByNode = new Map<string, typeof messageRows>()
@@ -193,7 +224,7 @@ export class ChannelsService {
         text,
         media: groupRows.flatMap((r) => mediaByMessage.get(r.id) ?? []),
         aiSummary: anchor.ai_summary,
-        actions: [], // Ф0: пайплайн actions ещё не реализован
+        actions: groupRows.flatMap((r) => actionsByMessage.get(r.id) ?? []),
         method: anchor.method as MessageDto['method'],
       })
     }
