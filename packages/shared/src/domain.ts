@@ -113,3 +113,25 @@ export type OrderStatus =
   | 'rejected'
   | 'cancelled'
   | 'expired'
+
+// Типы плоского слоя actions (задача 7: reconciler/pipeline, apps/engine/src/reconciler.ts +
+// pipeline.ts) — дословно enum'ы action_type/action_status из миграции 001_initial.ts. Тот же
+// приём DRY, что и у Order*/Trade*-типов выше: apps/api/src/db/database.ts (actions.type/status)
+// и engine делят один источник правды вместо дублирования строковых union'ов.
+export type ActionType =
+  | 'open'
+  | 'add'
+  | 'close'
+  | 'partial_tp'
+  | 'partial_close'
+  | 'modify_sl'
+  | 'modify_tp'
+  | 'cancel_order'
+  | 'tp_hit'
+  | 'sl_hit'
+  | 'close_all'
+  | 'hold'
+export type ActionStatus = 'pending' | 'executing' | 'executed' | 'skipped' | 'needs_review' | 'failed'
+
+/** `parser_kind` из миграции — кто произвёл `parse_results` (в Ф1 всегда 'deterministic'). */
+export type ParserKind = 'deterministic' | 'ai'

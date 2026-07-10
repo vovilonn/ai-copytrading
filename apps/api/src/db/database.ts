@@ -1,6 +1,18 @@
 import { Kysely, PostgresDialect, type Generated } from 'kysely'
 import pg from 'pg'
-import type { Side, TradeStatus, LegKind, LegStatus, OrderPurpose, OrderType, OrderStatus } from 'shared/domain.js'
+import type {
+  Side,
+  TradeStatus,
+  LegKind,
+  LegStatus,
+  OrderPurpose,
+  OrderType,
+  OrderStatus,
+  ActionType,
+  ActionStatus,
+  ParserKind,
+  Route,
+} from 'shared/domain.js'
 
 // node-postgres по умолчанию отдаёт int8 строкой, чтобы не потерять точность.
 // Все наши BIGINT (id каналов и сообщений Telegram, счётчик событий) заведомо
@@ -182,15 +194,17 @@ export interface DB {
     acquired_at: Generated<Date>
     released_at: Date | null
   }
-  // actions: плоский слой действий (задача 6 использует только как FK-якорь orders.action_id —
-  // type/method/status оставлены свободной строкой, как messages.status/method выше: их полные
-  // enum'ы — забота парсера/оркестратора действий (более поздняя задача Ф1), не исполнения.
+  // actions: плоский слой действий. Задача 6 использовала только как FK-якорь orders.action_id
+  // (type/status оставались свободной строкой); задача 7 (reconciler/pipeline — парсер/оркестратор
+  // действий) типизирует их ActionType/ActionStatus (shared/domain.ts), тот же DRY-приём, что и
+  // у Side/TradeStatus/OrderPurpose выше. `method` оставлен строкой (как messages.method) —
+  // полный parse_method вне фокуса этой задачи.
   actions: {
     id: Generated<string>
     message_id: string
     channel_id: number
     action_index: number
-    type: string
+    type: ActionType
     side: Side | null
     symbol: string | null
     pair: string | null
@@ -199,7 +213,7 @@ export interface DB {
     pct: string | null
     params: Generated<unknown>
     detail: string | null
-    status: Generated<string>
+    status: Generated<ActionStatus>
     skip_reason: string | null
     created_at: Generated<Date>
     updated_at: Generated<Date>
@@ -279,9 +293,26 @@ export interface DB {
     bybit_seq: number | null
     updated_at: Generated<Date>
   }
-  // остальные таблицы схемы (processed_messages, parse_results, ai_calls, ai_cache,
-  // audit_log, app_state) объявляются здесь же по мере использования в Ф1–Ф4.
-  // Пока созданы миграцией, но не типизированы — тесты, которым нужен сырой SQL, используют sql`...`.
+  // Задача 7 (Ф1): parse_results — один ряд на каждый прогон adapter.parse() (apps/engine/src/
+  // pipeline.ts), в т.ч. повторные при переобработке (история разборов, не UNIQUE по message_id —
+  // см. комментарий в pipeline.ts). route/parser переиспользуют Route/ParserKind из shared/domain.ts
+  // (тот же DRY-приём, что и Action*/Order*-типы выше). confidence — NUMERIC(4,3), строка, не number.
+  parse_results: {
+    id: Generated<string>
+    message_id: string
+    parser: ParserKind
+    adapter_id: string | null
+    route: Route
+    confidence: string
+    intents: Generated<unknown>
+    reason: string | null
+    needs_vision: Generated<boolean>
+    prompt_version: string | null
+    created_at: Generated<Date>
+  }
+  // остальные таблицы схемы (processed_messages, ai_calls, ai_cache, audit_log, app_state)
+  // объявляются здесь же по мере использования в Ф1–Ф4. Пока созданы миграцией, но не
+  // типизированы — тесты, которым нужен сырой SQL, используют sql`...`.
 }
 
 export function createDb(url: string): Kysely<DB> {

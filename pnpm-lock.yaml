@@ -109,10 +109,16 @@ importers:
       kysely:
         specifier: ^0.28.0
         version: 0.28.17
+      pg:
+        specifier: ^8.13.0
+        version: 8.22.0
       shared:
         specifier: workspace:*
         version: link:../../packages/shared
     devDependencies:
+      '@types/pg':
+        specifier: ^8.11.0
+        version: 8.20.0
       dotenv:
         specifier: ^16.4.0
         version: 16.6.1
@@ -122,6 +128,9 @@ importers:
       test-db:
         specifier: workspace:*
         version: link:../../packages/test-db
+      tsx:
+        specifier: ^4.19.0
+        version: 4.23.0
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
