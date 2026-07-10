@@ -16,7 +16,13 @@ import type { AppConfig } from 'api/config/config.schema.js'
 import { topicOf } from './topic-filter.js'
 import { AlbumBuffer, type AlbumMessage } from './album-buffer.js'
 import { pickMedia, type DownloadHint } from './media.js'
-import { saveMessageWithEvent, advanceCursor, getCursor, type IngestMediaInput } from './repository.js'
+import {
+  saveAlbumWithEvent,
+  advanceCursor,
+  getCursor,
+  type AlbumMemberInput,
+  type IngestMediaInput,
+} from './repository.js'
 import { withDownloadRetry } from './retry.js'
 import { MediaRepairService, type MediaFetcher, type DownloadedMediaResult } from './media-repair.js'
 import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
@@ -58,6 +64,18 @@ interface DownloadedMedia {
   buffer: Buffer
   sha256: string
   kind: DownloadHint['kind']
+}
+
+/** Результат prepareMessage — готовые к сохранению данные ОДНОГО сообщения (участника
+ *  альбома или одиночного сообщения, вырожденного альбома из одного элемента). Скачивание
+ *  медиа (сетевой I/O) уже отработало здесь, до похода в БД (см. handleAlbum). */
+interface PreparedMember {
+  source: ChannelSource
+  tgMessageId: number
+  text: string
+  msgTs: Date
+  member: AlbumMemberInput
+  mediaEntry: { url: string; kind: DownloadHint['kind'] } | null
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -343,33 +361,84 @@ export class IngestService {
     task.finally(() => this.inFlight.delete(task))
   }
 
+  /** Задача 12c: альбом Telegram (N сообщений с общим grouped_id) должен породить РОВНО ОДНО
+   *  domain_events-событие и один узел таймлайна, а не N — иначе websocket 'message.new'
+   *  уходит на каждый элемент альбома и API рисует N плиток с одной фотографией вместо одной
+   *  плитки с несколькими. messages уже отсортированы по id (album-buffer.ts release()) —
+   *  порядок внутри группы соответствует порядку отправки, становится order_index в
+   *  message_media, а первый элемент — якорь события (минимальный tg_message_id группы). */
   private async handleAlbum(messages: BufferedMessage[]): Promise<void> {
-    // messages уже отсортированы по id (album-buffer.ts release()) — порядок внутри группы
-    // соответствует порядку отправки и становится order_index в message_media.
+    const prepared: PreparedMember[] = []
     for (let i = 0; i < messages.length; i++) {
       const bm = messages[i]!
       try {
-        await this.persistMessage(bm, i)
+        prepared.push(await this.prepareMessage(bm, i))
       } catch (err) {
         this.logError(`persistMessage ${bm.source.key}#${bm.raw.id}`, err)
       }
     }
+    if (prepared.length === 0) return // все участники альбома не смогли подготовиться — нечего сохранять
+
+    const anchor = prepared[0]! // messages отсортированы по id — первый выживший и есть якорь (min tg_message_id)
+    const channelId = anchor.member.channelId
+
+    // saveAlbumWithEvent сохраняет ВСЕ строки messages/message_media альбома и не более одной
+    // строки domain_events атомарно, одной транзакцией (см. repository.ts) — либо весь альбом
+    // целиком закоммичен вместе с событием, либо ничего (при сбое курсор не продвинется, и
+    // backfill переподхватит те же tg_message_id при следующем проходе).
+    const { anyInserted } = await saveAlbumWithEvent(
+      this.db,
+      prepared.map((p) => p.member),
+      (anchorMessageId) => {
+        // payload задачи 9: готовый MessageDto (якорь + вся подпись/медиа группы) + channelId
+        // (см. packages/shared/src/ws-events.ts). aiSummary/actions/method — Ф0-заглушки.
+        const payload: MessageNewPayload = {
+          channelId,
+          message: {
+            id: anchorMessageId,
+            tgMessageId: anchor.tgMessageId,
+            time: anchor.msgTs.toISOString(),
+            // Подпись Telegram лежит ровно на одном элементе альбома (иногда её нет вовсе) —
+            // берём первую непустую по порядку id, а не только якоря.
+            text: prepared.map((p) => p.text).find((t) => t.trim().length > 0) ?? '',
+            media: prepared.flatMap((p) => (p.mediaEntry ? [p.mediaEntry] : [])),
+            aiSummary: null,
+            actions: [],
+            method: null,
+          },
+        }
+        return { type: 'message.new', aggregate: 'message', payload }
+      },
+    )
+
+    // Курсор двигаем для каждого участника (и для правок, и для отфильтрованных повторов) —
+    // GREATEST внутри advanceCursor делает это безопасным независимо от порядка вызовов (§4).
+    for (const p of prepared) {
+      await advanceCursor(this.db, p.member.channelId, p.tgMessageId)
+    }
+
+    if (anyInserted) {
+      // NOTIFY строго после коммита транзакции (await выше уже дождался commit) — иначе
+      // слушатель на стороне api рискует получить уведомление раньше, чем строка станет видна
+      // его собственному SELECT (task-9-brief §2/§3).
+      await sql`SELECT pg_notify('domain_events', '')`.execute(this.db)
+    }
   }
 
-  private async persistMessage(bm: BufferedMessage, orderIndex: number): Promise<void> {
+  /** Готовит одно сообщение (участника альбома или одиночное) к сохранению: скачивает медиа
+   *  (сетевой I/O к Telegram, вне транзакции с БД — сбой не должен ни блокировать, ни
+   *  откатывать вставку самого сообщения) и собирает данные для repository.ts. Сама вставка
+   *  в БД происходит позже, одной транзакцией на весь альбом (см. handleAlbum). */
+  private async prepareMessage(bm: BufferedMessage, orderIndex: number): Promise<PreparedMember> {
     const { raw: msg, source } = bm
-    const channelId = Number(source.channelId)
     const hint = pickMedia(msg.media)
     const editedTs = msg.editDate ? new Date(msg.editDate * 1000) : null
     const text = msg.message ?? ''
     const msgTs = new Date(msg.date * 1000)
-    // Генерируется здесь, а не в saveMessage — так payload события domain_events (ниже)
-    // знает итоговый id сообщения ещё до открытия транзакции.
+    // Генерируется здесь, а не в saveMessage — так payload события domain_events (в
+    // handleAlbum) знает итоговый id сообщения ещё до открытия транзакции.
     const messageId = crypto.randomUUID()
 
-    // Скачивание — сетевой I/O к Telegram, вне транзакции с БД: сбой (флаки сети, недоступный
-    // DC) не должен ни блокировать, ни откатывать вставку самого сообщения — тот же принцип
-    // best-effort изоляции медиа, что и раньше (курсор не должен упираться в упрямый файл).
     let downloaded: DownloadedMedia | null = null
     if (hint) {
       try {
@@ -394,62 +463,40 @@ export class IngestService {
           }
         : null
 
-    // payload задачи 9: готовый MessageDto + channelId (см. packages/shared/src/ws-events.ts).
-    // aiSummary/actions/method — Ф0-заглушки (пайплайн разбора появится в Ф1+, см. shared/dto.ts).
-    const payload: MessageNewPayload = {
-      channelId,
-      message: {
-        id: messageId,
-        tgMessageId: msg.id,
-        time: msgTs.toISOString(),
-        text,
-        media: downloaded && mediaRowId ? [{ url: `/media/${mediaRowId}`, kind: downloaded.kind }] : [],
-        aiSummary: null,
-        actions: [],
-        method: null,
-      },
+    const member: AlbumMemberInput = {
+      id: messageId,
+      channelId: Number(source.channelId),
+      tgMessageId: msg.id,
+      topicId: source.topicId,
+      groupedId: msg.groupedId ? msg.groupedId.toString() : null,
+      replyToMsgId: msg.replyTo?.replyToMsgId ?? null,
+      replyToTopId: msg.replyTo?.replyToTopId ?? null,
+      isTopicMessage: Boolean(msg.replyTo?.forumTopic),
+      text,
+      // has_media отражает факт наличия СКАЧИВАЕМОГО медиа (pickMedia() нашёл фото или
+      // видео-превью), а не успех самого скачивания. Осознанно НЕ downloaded != null:
+      // если скачивание уронила сетевая флуктуация/необработанный FloodWait, медиа всё равно
+      // объективно существует — has_media=true остаётся честным сигналом и превращает
+      // сообщение в кандидата ремонтного прохода (repairMissingMedia). Обратное (has_media
+      // = downloaded != null) тихо прятало бы потерю: сообщение с реальным фото навсегда
+      // выглядело бы как не имеющее медиа, и чинить было бы нечего — ровно дефект задачи 12b
+      // (см. .superpowers/sdd/task-12b-report.md, §"Причина"). Стикеры и видео без PhotoSize
+      // (pickMedia() вернул null) законно остаются has_media=false — это не потеря.
+      hasMedia: hint != null,
+      mediaKind: msg.media?.className ?? null,
+      msgTs,
+      editedTs,
+      raw: snapshotMessage(msg),
+      media,
     }
 
-    const saved = await saveMessageWithEvent(
-      this.db,
-      {
-        id: messageId,
-        channelId,
-        tgMessageId: msg.id,
-        topicId: source.topicId,
-        groupedId: msg.groupedId ? msg.groupedId.toString() : null,
-        replyToMsgId: msg.replyTo?.replyToMsgId ?? null,
-        replyToTopId: msg.replyTo?.replyToTopId ?? null,
-        isTopicMessage: Boolean(msg.replyTo?.forumTopic),
-        text,
-        // has_media отражает факт наличия СКАЧИВАЕМОГО медиа (pickMedia() нашёл фото или
-        // видео-превью), а не успех самого скачивания. Осознанно НЕ downloaded != null:
-        // если скачивание уронила сетевая флуктуация/необработанный FloodWait, медиа всё равно
-        // объективно существует — has_media=true остаётся честным сигналом и превращает
-        // сообщение в кандидата ремонтного прохода (repairMissingMedia). Обратное (has_media
-        // = downloaded != null) тихо прятало бы потерю: сообщение с реальным фото навсегда
-        // выглядело бы как не имеющее медиа, и чинить было бы нечего — ровно дефект задачи 12b
-        // (см. .superpowers/sdd/task-12b-report.md, §"Причина"). Стикеры и видео без PhotoSize
-        // (pickMedia() вернул null) законно остаются has_media=false — это не потеря.
-        hasMedia: hint != null,
-        mediaKind: msg.media?.className ?? null,
-        msgTs,
-        editedTs,
-        raw: snapshotMessage(msg),
-      },
-      media,
-      { type: 'message.new', aggregate: 'message', payload },
-    )
-
-    // Курсор двигаем и для правок, и для отфильтрованных повторов — GREATEST внутри
-    // advanceCursor делает это безопасным независимо от порядка вызовов (§4).
-    await advanceCursor(this.db, channelId, msg.id)
-
-    if (saved.inserted) {
-      // NOTIFY строго после коммита транзакции (await выше уже дождался commit) — иначе
-      // слушатель на стороне api рискует получить уведомление раньше, чем строка станет видна
-      // его собственному SELECT (task-9-brief §2/§3).
-      await sql`SELECT pg_notify('domain_events', '')`.execute(this.db)
+    return {
+      source,
+      tgMessageId: msg.id,
+      text,
+      msgTs,
+      member,
+      mediaEntry: downloaded && mediaRowId ? { url: `/media/${mediaRowId}`, kind: downloaded.kind } : null,
     }
   }
 

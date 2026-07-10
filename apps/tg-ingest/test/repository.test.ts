@@ -4,7 +4,14 @@ import { Kysely, sql } from 'kysely'
 import { resetTestSchema } from 'test-db'
 import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
-import { saveMessage, saveMessageWithEvent, advanceCursor, getCursor } from '../src/repository.js'
+import {
+  saveMessage,
+  saveMessageWithEvent,
+  saveAlbumWithEvent,
+  advanceCursor,
+  getCursor,
+  type AlbumMemberInput,
+} from '../src/repository.js'
 
 let db: Kysely<DB>
 
@@ -193,5 +200,79 @@ describe('saveMessageWithEvent', () => {
       .execute()
     expect(rows).toHaveLength(1)
     expect(rows[0]?.storage_path).toBe(media.storagePath)
+  })
+})
+
+describe('saveAlbumWithEvent', () => {
+  // Дефект Ф0 (task-12c): Telegram доставляет альбом N отдельными сообщениями с общим
+  // grouped_id — ingest продолжает писать N строк messages (нужно для дедупа/резолва reply),
+  // но domain_events должен получить РОВНО ОДНУ строку на весь альбом (иначе websocket
+  // 'message.new' уходит N раз и таймлайн рисует N узлов вместо одного).
+  function albumMembers(tgMessageIds: number[], groupedId: string): AlbumMemberInput[] {
+    return tgMessageIds.map((tgMessageId, i) => ({
+      channelId: 1,
+      tgMessageId,
+      groupedId,
+      // Подпись Telegram лежит ровно на одном элементе группы — здесь на среднем.
+      text: i === 1 ? 'подпись альбома' : '',
+      msgTs: new Date(),
+      raw: {},
+      media: null,
+    }))
+  }
+
+  it('альбом из N сообщений порождает ровно одну строку в domain_events', async () => {
+    const members = albumMembers([800, 801, 802], 'g-evt-800')
+    const buildEvent = (anchorMessageId: string) => ({
+      type: 'message.new',
+      aggregate: 'message',
+      payload: { channelId: 1, message: { id: anchorMessageId, tgMessageId: 800 } },
+    })
+
+    const { anchorId, anyInserted } = await saveAlbumWithEvent(db, members, buildEvent)
+    expect(anyInserted).toBe(true)
+
+    // Все 3 строки messages реально вставлены (дедуп/reply не сломан).
+    const messageRows = await db
+      .selectFrom('messages')
+      .select('id')
+      .where('channel_id', '=', 1)
+      .where('grouped_id', '=', 'g-evt-800')
+      .execute()
+    expect(messageRows).toHaveLength(3)
+
+    // Ровно ОДНА строка domain_events на весь альбом — не по одной на сообщение.
+    const events = await db
+      .selectFrom('domain_events')
+      .selectAll()
+      .where('aggregate_id', '=', anchorId)
+      .execute()
+    expect(events).toHaveLength(1)
+    expect(events[0]?.type).toBe('message.new')
+
+    const { rows } = await sql<{ count: number }>`
+      SELECT count(*) FROM domain_events WHERE aggregate_id = ANY(${messageRows.map((r) => r.id)})
+    `.execute(db)
+    expect(rows[0]?.count).toBe(1)
+
+    // Якорь — сообщение с МИНИМАЛЬНЫМ tg_message_id группы (монотонная пагинация по before=).
+    const anchorRow = await db.selectFrom('messages').select('tg_message_id').where('id', '=', anchorId).executeTakeFirstOrThrow()
+    expect(anchorRow.tg_message_id).toBe(800)
+  })
+
+  it('повторная доставка всего альбома (все сообщения уже существуют) не создаёт второе событие', async () => {
+    const members = albumMembers([810, 811], 'g-evt-810')
+    const buildEvent = () => ({ type: 'message.new', aggregate: 'message', payload: { channelId: 1 } })
+
+    const first = await saveAlbumWithEvent(db, members, buildEvent)
+    expect(first.anyInserted).toBe(true)
+
+    const second = await saveAlbumWithEvent(db, members, buildEvent)
+    expect(second.anyInserted).toBe(false)
+
+    const { rows } = await sql<{ count: number }>`
+      SELECT count(*) FROM domain_events WHERE aggregate_id = ${first.anchorId}
+    `.execute(db)
+    expect(rows[0]?.count).toBe(1)
   })
 })

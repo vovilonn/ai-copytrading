@@ -104,26 +104,56 @@ export class ChannelsService {
   async listMessages(channelId: number, limit: number, before?: number): Promise<MessageDto[]> {
     const clampedLimit = Math.max(1, Math.min(limit, MAX_MESSAGE_LIMIT))
 
-    let query = this.database.db
-      .selectFrom('messages')
-      .select(['id', 'tg_message_id', 'msg_ts', 'text', 'ai_summary', 'method', 'media_kind'])
-      .where('channel_id', '=', channelId)
+    // Telegram доставляет альбом N отдельными строками messages с общим grouped_id (задача
+    // 12c) — таймлайн должен рисовать альбом ОДНИМ узлом с несколькими фото, а не N плитками
+    // по одной фотографии. Узел таймлайна = coalesce(grouped_id, id::text): для одиночного
+    // сообщения это его собственный id (группа из одной строки), для альбома — общий grouped_id.
+    // Якорь узла — сообщение с МИНИМАЛЬНЫМ tg_message_id в группе: Telegram выдаёт участникам
+    // одного альбома подряд идущие id одним пакетом, поэтому диапазоны id разных узлов никогда
+    // не перемешиваются — фильтр `tg_message_id < before` по минимуму группы остаётся
+    // монотонной пагинацией, как и для одиночных сообщений.
+    // `limit` — количество УЗЛОВ таймлайна (альбомов), а не строк messages, поэтому лимитируем
+    // именно на этом шаге, до разворачивания групп в строки.
+    const beforeClause = before !== undefined ? sql`AND tg_message_id < ${before}` : sql``
+    const { rows: nodes } = await sql<{ node_key: string; anchor_tg_message_id: number }>`
+      SELECT coalesce(grouped_id, id::text) AS node_key, min(tg_message_id) AS anchor_tg_message_id
+      FROM messages
+      WHERE channel_id = ${channelId}
+      ${beforeClause}
+      GROUP BY coalesce(grouped_id, id::text)
+      ORDER BY anchor_tg_message_id DESC
+      LIMIT ${clampedLimit}
+    `.execute(this.database.db)
+    if (nodes.length === 0) return []
 
-    if (before !== undefined) {
-      query = query.where('tg_message_id', '<', before)
-    }
+    // Строки messages, входящие в отобранные узлы (для альбома — несколько строк с одним
+    // grouped_id: нужны все подписи группы, для одиночного — ровно одна строка).
+    const nodeKeys = nodes.map((n) => n.node_key)
+    const { rows: messageRows } = await sql<{
+      id: string
+      tg_message_id: number
+      msg_ts: Date
+      text: string
+      ai_summary: string | null
+      method: string | null
+      media_kind: string | null
+      grouped_id: string | null
+    }>`
+      SELECT id, tg_message_id, msg_ts, text, ai_summary, method, media_kind, grouped_id
+      FROM messages
+      WHERE channel_id = ${channelId}
+        AND coalesce(grouped_id, id::text) = ANY(${nodeKeys})
+      ORDER BY tg_message_id ASC
+    `.execute(this.database.db)
 
-    const messages = await query.orderBy('tg_message_id', 'desc').limit(clampedLimit).execute()
-    if (messages.length === 0) return []
-
-    const mediaKindByMessageId = new Map(messages.map((m) => [m.id, m.media_kind]))
+    const mediaKindByMessageId = new Map(messageRows.map((m) => [m.id, m.media_kind]))
     const media = await this.database.db
       .selectFrom('message_media')
       .select(['id', 'message_id', 'media_type'])
       .where(
         'message_id',
         'in',
-        messages.map((m) => m.id),
+        messageRows.map((m) => m.id),
       )
       .orderBy('order_index', 'asc')
       .execute()
@@ -136,16 +166,37 @@ export class ChannelsService {
       mediaByMessage.set(row.message_id, list)
     }
 
-    return messages.map((m) => ({
-      id: m.id,
-      tgMessageId: m.tg_message_id,
-      time: m.msg_ts.toISOString(),
-      text: m.text,
-      media: mediaByMessage.get(m.id) ?? [],
-      aiSummary: m.ai_summary,
-      actions: [], // Ф0: пайплайн actions ещё не реализован
-      method: m.method as MessageDto['method'],
-    }))
+    // Строки, сгруппированные по узлу таймлайна (сохраняют порядок возрастания tg_message_id
+    // из запроса выше — важно: первый элемент группы и есть её якорь).
+    const rowsByNode = new Map<string, typeof messageRows>()
+    for (const row of messageRows) {
+      const key = row.grouped_id ?? row.id
+      const list = rowsByNode.get(key) ?? []
+      list.push(row)
+      rowsByNode.set(key, list)
+    }
+
+    const result: MessageDto[] = []
+    for (const node of nodes) {
+      const groupRows = rowsByNode.get(node.node_key)
+      if (!groupRows || groupRows.length === 0) continue // гонка между двумя запросами — пропускаем узел, а не 500
+      const anchor = groupRows[0]! // отсортированы по возрастанию tg_message_id — первый и есть якорь (min)
+      // Подпись Telegram лежит ровно на одном элементе альбома (иногда её нет вовсе) —
+      // берём первую непустую по порядку id, а не только якоря.
+      const text = groupRows.map((r) => r.text).find((t) => t.trim().length > 0) ?? ''
+
+      result.push({
+        id: anchor.id,
+        tgMessageId: anchor.tg_message_id,
+        time: anchor.msg_ts.toISOString(),
+        text,
+        media: groupRows.flatMap((r) => mediaByMessage.get(r.id) ?? []),
+        aiSummary: anchor.ai_summary,
+        actions: [], // Ф0: пайплайн actions ещё не реализован
+        method: anchor.method as MessageDto['method'],
+      })
+    }
+    return result
   }
 
   async getMedia(id: string): Promise<{ storagePath: string; mediaType: string } | null> {

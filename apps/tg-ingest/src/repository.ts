@@ -223,6 +223,59 @@ export async function recordMediaRepairAttempt(
   `.execute(db)
 }
 
+export interface AlbumMemberInput extends IngestMessage {
+  media: IngestMediaInput | null
+}
+
+/**
+ * Транзакционно сохраняет ВСЕ сообщения альбома (+ их строки медиа) и, если хотя бы одно
+ * из них оказалось НОВЫМ (saveMessage().inserted === true хотя бы у одного члена), пишет
+ * РОВНО ОДНУ строку в domain_events — на весь альбом, а не по одной на сообщение (задача 12c:
+ * Telegram доставляет альбом N отдельными сообщениями с общим grouped_id, а таймлайн обязан
+ * рисовать его одним узлом, поэтому и событие 'message.new' должно уйти один раз).
+ * `members` обязаны быть отсортированы по возрастанию tgMessageId (album-buffer.ts release()
+ * уже так сортирует) — первый элемент становится якорем события (aggregate_id), его id идёт
+ * в payload, который строит `buildEvent`. Одиночное сообщение — вырожденный случай альбома
+ * из одного элемента, тот же код путь.
+ * Тот же outbox-паттерн задачи 9, что и у saveMessageWithEvent ниже: событие коммитится в
+ * ОДНОЙ транзакции с данными всех сообщений альбома — либо весь альбом целиком (данные +
+ * событие) закоммичен, либо ничего (NOTIFY шлётся вызывающим кодом отдельно, после коммита).
+ */
+export async function saveAlbumWithEvent(
+  db: Kysely<DB>,
+  members: readonly AlbumMemberInput[],
+  buildEvent: (anchorMessageId: string) => DomainEventInput,
+): Promise<{ anchorId: string; anyInserted: boolean }> {
+  if (members.length === 0) throw new Error('saveAlbumWithEvent: пустой альбом')
+
+  return db.transaction().execute(async (trx) => {
+    const results: { id: string; inserted: boolean }[] = []
+    for (const member of members) {
+      const saved = await saveMessage(trx, member)
+      if (member.media) await insertMediaRow(trx, saved.id, member.media)
+      results.push(saved)
+    }
+
+    const anchor = results[0]! // members гарантированно непусты (проверка выше)
+    const anyInserted = results.some((r) => r.inserted)
+
+    if (anyInserted) {
+      const event = buildEvent(anchor.id)
+      await trx
+        .insertInto('domain_events')
+        .values({
+          type: event.type,
+          aggregate: event.aggregate,
+          aggregate_id: anchor.id,
+          payload: JSON.stringify(event.payload),
+        })
+        .execute()
+    }
+
+    return { anchorId: anchor.id, anyInserted }
+  })
+}
+
 /**
  * Транзакционно сохраняет сообщение (+ строку медиа, если она есть) и, если сообщение
  * НОВОЕ (saveMessage().inserted === true — не правка и не повторная доставка), пишет строку

@@ -133,6 +133,99 @@ it('GET /channels/:id/messages с некорректными limit/before отк
   expect(messages.map((m) => m.tgMessageId)).toEqual([1005, 1004, 1003, 1002, 1001])
 })
 
+// Дефект Ф0 (task-12c): Telegram доставляет альбом N отдельными строками messages с общим
+// grouped_id — API обязан склеивать их в один узел таймлайна (один MessageDto, N media),
+// а не отдавать N плиток с одной фотографией на каждой. Якорь узла — сообщение с МИНИМАЛЬНЫМ
+// tg_message_id в группе (на его id/tgMessageId держится монотонная пагинация по before=).
+describe('альбом (grouped_id) — один узел таймлайна с несколькими фото', () => {
+  const ALBUM_GROUPED_ID = '999888777666555'
+  // Выше одиночных фикстур (1001..1005) — альбом становится самым новым узлом ленты.
+  const ALBUM_BASE_TG_ID = 2000
+
+  beforeAll(async () => {
+    // 3 сообщения одного альбома: подпись Telegram кладёт ровно на ОДНО сообщение группы
+    // (здесь — среднее по tg_message_id), у остальных text = ''.
+    for (let i = 0; i < 3; i++) {
+      await db
+        .insertInto('messages')
+        .values({
+          channel_id: CHANNEL_1_ID,
+          tg_message_id: ALBUM_BASE_TG_ID + i,
+          grouped_id: ALBUM_GROUPED_ID,
+          is_topic_message: false,
+          text: i === 1 ? 'подпись альбома' : '',
+          has_media: true,
+          msg_ts: new Date(Date.UTC(2026, 0, 2, 12, i, 0)),
+          raw: JSON.stringify({}),
+        })
+        .execute()
+    }
+
+    const albumMessages = await db
+      .selectFrom('messages')
+      .select(['id', 'tg_message_id'])
+      .where('channel_id', '=', CHANNEL_1_ID)
+      .where('grouped_id', '=', ALBUM_GROUPED_ID)
+      .orderBy('tg_message_id', 'asc')
+      .execute()
+
+    // Строка message_media лежит на КОНКРЕТНОМ сообщении-члене группы (order_index — позиция
+    // внутри альбома) — раздача самого файла тут не проверяется, поэтому storage_path условный.
+    for (const [i, m] of albumMessages.entries()) {
+      await db
+        .insertInto('message_media')
+        .values({
+          id: crypto.randomUUID(),
+          message_id: m.id,
+          tg_message_id: m.tg_message_id,
+          grouped_id: ALBUM_GROUPED_ID,
+          order_index: i,
+          storage_path: `var/media/test-fixture/album_${i}.jpg`,
+          media_type: 'image/jpeg',
+          width: null,
+          height: null,
+          bytes: 10 + i,
+          sha256: null,
+          created_at: new Date(),
+        })
+        .execute()
+    }
+  })
+
+  it('альбом из трёх сообщений отдаётся одним MessageDto с тремя media, tgMessageId = min группы, text = единственная подпись', async () => {
+    const res = await agent.get(`/channels/${CHANNEL_1_ID}/messages?limit=50`).expect(200)
+    const messages = res.body as MessageDto[]
+
+    const albumNode = messages.find((m) => m.tgMessageId === ALBUM_BASE_TG_ID)
+    expect(albumNode).toBeDefined()
+    expect(albumNode!.media).toHaveLength(3)
+    expect(albumNode!.text).toBe('подпись альбома')
+
+    // Остальные tg_message_id группы НЕ порождают собственных узлов — иначе альбом
+    // по-прежнему рисовался бы тремя плитками вместо одной.
+    expect(messages.some((m) => m.tgMessageId === ALBUM_BASE_TG_ID + 1)).toBe(false)
+    expect(messages.some((m) => m.tgMessageId === ALBUM_BASE_TG_ID + 2)).toBe(false)
+  })
+
+  it('limit=2 при данных «альбом(3) + одиночное» отдаёт ровно 2 узла таймлайна (лимит по узлам, не по строкам messages)', async () => {
+    const res = await agent.get(`/channels/${CHANNEL_1_ID}/messages?limit=2`).expect(200)
+    const messages = res.body as MessageDto[]
+    expect(messages).toHaveLength(2)
+    expect(messages[0]!.tgMessageId).toBe(ALBUM_BASE_TG_ID) // самый новый узел — альбом (3 строки, 1 узел)
+    expect(messages[1]!.tgMessageId).toBe(1005) // следующий узел — одиночное сообщение
+  })
+
+  it('одиночные сообщения не изменились: у них ровно один узел на строку messages, media не смешивается с чужими', async () => {
+    const res = await agent.get(`/channels/${CHANNEL_1_ID}/messages?limit=50`).expect(200)
+    const messages = res.body as MessageDto[]
+    for (const tgId of [1001, 1002, 1003, 1004, 1005]) {
+      const node = messages.find((m) => m.tgMessageId === tgId)
+      expect(node).toBeDefined()
+      expect(node!.media).toEqual([])
+    }
+  })
+})
+
 describe('GET /media/:id', () => {
   let mediaId: string
   const fixtureBytes = Buffer.from('fake-jpeg-bytes')
