@@ -44,15 +44,50 @@ it('разрешает двум каналам владеть одним сим�
   // субаккаунт на канал ⇒ владение уникально по (channel_id, symbol)
   await sql`INSERT INTO channels (id, ord, key, source_kind, adapter_id)
             VALUES (2, 2, 'test2', 'channel', 'x') ON CONFLICT DO NOTHING`.execute(db)
+  // nextval вызывается один раз (через CTE) и это же значение идёт и в human_ref, и в seq —
+  // два отдельных вызова nextval() дали бы разные числа (human_ref='TR-1058' при seq=1059).
   const trade = async (ch: number) => {
-    const { rows } = await sql<{ id: string }>`
+    const { rows } = await sql<{ id: string; human_ref: string; seq: number }>`
+      WITH s AS (SELECT nextval('trade_ref_seq') AS n)
       INSERT INTO trades (human_ref, seq, channel_id, symbol, side)
-      VALUES ('TR-' || nextval('trade_ref_seq'), nextval('trade_ref_seq'), ${ch}, 'SOLUSDT', 'long')
-      RETURNING id`.execute(db)
-    return rows[0]!.id
+      SELECT 'TR-' || s.n, s.n, ${ch}, 'SOLUSDT', 'long' FROM s
+      RETURNING id, human_ref, seq`.execute(db)
+    return rows[0]!
   }
   const own = (ch: number, tid: string) => sql`
     INSERT INTO symbol_ownership (symbol, channel_id, trade_id) VALUES ('SOLUSDT', ${ch}, ${tid})`.execute(db)
-  await own(1, await trade(1))
-  await expect(own(2, await trade(2))).resolves.toBeDefined()
+  const trade1 = await trade(1)
+  const trade2 = await trade(2)
+  // согласованность: human_ref обязан выводиться из того же значения nextval, что и seq
+  expect(trade1.human_ref).toBe('TR-' + trade1.seq)
+  expect(trade2.human_ref).toBe('TR-' + trade2.seq)
+  await own(1, trade1.id)
+  await expect(own(2, trade2.id)).resolves.toBeDefined()
+})
+
+it('BIGINT читается через Kysely как number, NUMERIC — остаётся string', async () => {
+  // id канала Telegram (~2*10^9) заведомо меньше Number.MAX_SAFE_INTEGER
+  const channelId = 2088626562
+  await sql`INSERT INTO channels (id, ord, key, source_kind, adapter_id)
+            VALUES (${channelId}, 3, 'test-bigint', 'channel', 'x') ON CONFLICT DO NOTHING`.execute(db)
+
+  const channel = await db
+    .selectFrom('channels')
+    .select(['id'])
+    .where('id', '=', channelId)
+    .executeTakeFirstOrThrow()
+  expect(typeof channel.id).toBe('number')
+  expect(channel.id).toBe(channelId)
+
+  // NUMERIC (деньги/размеры) обязан остаться строкой — иначе теряется точность на ценах
+  await sql`INSERT INTO channel_settings (channel_id, trade_size, max_leverage)
+            VALUES (${channelId}, '500', '10') ON CONFLICT DO NOTHING`.execute(db)
+
+  const settings = await db
+    .selectFrom('channel_settings')
+    .select(['trade_size'])
+    .where('channel_id', '=', channelId)
+    .executeTakeFirstOrThrow()
+  expect(typeof settings.trade_size).toBe('string')
+  expect(Number(settings.trade_size)).toBe(500)
 })

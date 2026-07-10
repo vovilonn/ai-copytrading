@@ -1,6 +1,14 @@
 import { Kysely, PostgresDialect } from 'kysely'
 import pg from 'pg'
 
+// node-postgres по умолчанию отдаёт int8 строкой, чтобы не потерять точность.
+// Все наши BIGINT (id каналов и сообщений Telegram, счётчик событий) заведомо
+// меньше Number.MAX_SAFE_INTEGER, поэтому читаем их числом — иначе типы DB лгут,
+// и сравнения вида channel.id === 123 молча ломаются.
+// Регистрируется один раз на уровне модуля (до создания пула), т.к. парсер типов
+// глобален для процесса — pg.types общий для всех pg.Pool в рамках модуля 'pg'.
+pg.types.setTypeParser(pg.types.builtins.INT8, (value) => Number(value))
+
 // NUMERIC приходит из pg строкой — оставляем string и парсим Decimal'ом в домене,
 // иначе теряем точность на ценах/размерах (Ф0 деньги не использует, но типы объявляем сразу правильно).
 export interface DB {
@@ -80,7 +88,23 @@ export interface DB {
     created_at: Date
     published_at: Date | null
   }
-  // остальные таблицы схемы (channel_settings, processed_messages, parse_results, ai_calls,
+  channel_settings: {
+    channel_id: number
+    enabled: boolean
+    // денежные/числовые NUMERIC-колонки — string (см. комментарий выше про точность)
+    trade_size: string
+    max_leverage: string
+    default_leverage: string | null
+    cross_margin: boolean
+    no_sl_policy: string
+    no_sl_buffer_sec: number
+    add_sizing_mode: string
+    max_symbol_notional: string | null
+    mirror_manual_fraction: boolean
+    limit_ttl_sec: number
+    updated_at: Date
+  }
+  // остальные таблицы схемы (processed_messages, parse_results, ai_calls,
   // ai_cache, actions, trades, trade_legs, orders, executions, symbol_ownership, positions,
   // instruments, audit_log, app_state) объявляются здесь же по мере использования в Ф1–Ф4.
   // Пока созданы миграцией, но не типизированы — тесты, которым нужен сырой SQL, используют sql`...`.

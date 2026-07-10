@@ -43,6 +43,10 @@ export async function up(db: Kysely<any>): Promise<void> {
   await sql`CREATE TYPE net_t AS ENUM ('testnet','mainnet')`.execute(db)
 
   await sql`CREATE SEQUENCE trade_ref_seq START 1042`.execute(db) // TR-1042 первый; человекочитаемый id сделки
+  // ВНИМАНИЕ: human_ref ('TR-' || nextval(...)) и seq обязаны выводиться из ОДНОГО и того же
+  // значения nextval('trade_ref_seq'), полученного одним вызовом (например, через `WITH s AS
+  // (SELECT nextval(...) AS n)` и INSERT ... SELECT FROM s). Два отдельных вызова nextval() дадут
+  // разные числа, и human_ref перестанет соответствовать seq (см. .superpowers/sdd/task-2-report.md).
 
   // ============ AUTH ============
   await sql`
