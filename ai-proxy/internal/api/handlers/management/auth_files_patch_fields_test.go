@@ -1,0 +1,420 @@
+package management
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
+	fileauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+)
+
+func TestPatchAuthFileFields_MergeHeadersAndDeleteEmptyValues(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "test.json",
+		FileName: "test.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path":            "/tmp/test.json",
+			"header:X-Old":    "old",
+			"header:X-Remove": "gone",
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+			"headers": map[string]any{
+				"X-Old":    "old",
+				"X-Remove": "gone",
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"test.json","prefix":"p1","proxy_url":"http://proxy.local","headers":{"X-Old":"new","X-New":"v","X-Remove":"  ","X-Nope":""}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("test.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+
+	if updated.Prefix != "p1" {
+		t.Fatalf("prefix = %q, want %q", updated.Prefix, "p1")
+	}
+	if updated.ProxyURL != "http://proxy.local" {
+		t.Fatalf("proxy_url = %q, want %q", updated.ProxyURL, "http://proxy.local")
+	}
+
+	if updated.Metadata == nil {
+		t.Fatalf("expected metadata to be non-nil")
+	}
+	if got, _ := updated.Metadata["prefix"].(string); got != "p1" {
+		t.Fatalf("metadata.prefix = %q, want %q", got, "p1")
+	}
+	if got, _ := updated.Metadata["proxy_url"].(string); got != "http://proxy.local" {
+		t.Fatalf("metadata.proxy_url = %q, want %q", got, "http://proxy.local")
+	}
+
+	headersMeta, ok := updated.Metadata["headers"].(map[string]any)
+	if !ok {
+		raw, _ := json.Marshal(updated.Metadata["headers"])
+		t.Fatalf("metadata.headers = %T (%s), want map[string]any", updated.Metadata["headers"], string(raw))
+	}
+	if got := headersMeta["X-Old"]; got != "new" {
+		t.Fatalf("metadata.headers.X-Old = %#v, want %q", got, "new")
+	}
+	if got := headersMeta["X-New"]; got != "v" {
+		t.Fatalf("metadata.headers.X-New = %#v, want %q", got, "v")
+	}
+	if _, ok := headersMeta["X-Remove"]; ok {
+		t.Fatalf("expected metadata.headers.X-Remove to be deleted")
+	}
+	if _, ok := headersMeta["X-Nope"]; ok {
+		t.Fatalf("expected metadata.headers.X-Nope to be absent")
+	}
+
+	if got := updated.Attributes["header:X-Old"]; got != "new" {
+		t.Fatalf("attrs header:X-Old = %q, want %q", got, "new")
+	}
+	if got := updated.Attributes["header:X-New"]; got != "v" {
+		t.Fatalf("attrs header:X-New = %q, want %q", got, "v")
+	}
+	if _, ok := updated.Attributes["header:X-Remove"]; ok {
+		t.Fatalf("expected attrs header:X-Remove to be deleted")
+	}
+	if _, ok := updated.Attributes["header:X-Nope"]; ok {
+		t.Fatalf("expected attrs header:X-Nope to be absent")
+	}
+}
+
+func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "noop.json",
+		FileName: "noop.json",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"path":         "/tmp/noop.json",
+			"header:X-Kee": "1",
+		},
+		Metadata: map[string]any{
+			"type": "claude",
+			"headers": map[string]any{
+				"X-Kee": "1",
+			},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"noop.json","note":"hello","headers":{}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("noop.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["header:X-Kee"]; got != "1" {
+		t.Fatalf("attrs header:X-Kee = %q, want %q", got, "1")
+	}
+	headersMeta, ok := updated.Metadata["headers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected metadata.headers to remain a map, got %T", updated.Metadata["headers"])
+	}
+	if got := headersMeta["X-Kee"]; got != "1" {
+		t.Fatalf("metadata.headers.X-Kee = %#v, want %q", got, "1")
+	}
+}
+
+func TestPatchAuthFileFields_SyncsExcludedModelsAttributes(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "kiro.json",
+		FileName: "kiro.json",
+		Provider: "kiro",
+		Attributes: map[string]string{
+			"path": "/tmp/kiro.json",
+		},
+		Metadata: map[string]any{
+			"type": "kiro",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"kiro.json","excluded_models":["kiro-auto"," KIRO-AUTO ","custom-undetected"]}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("kiro.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["excluded_models"]; got != "kiro-auto,custom-undetected" {
+		t.Fatalf("attrs excluded_models = %q, want %q", got, "kiro-auto,custom-undetected")
+	}
+	if got, ok := updated.Metadata["excluded_models"].([]string); !ok || len(got) != 2 || got[0] != "kiro-auto" || got[1] != "custom-undetected" {
+		t.Fatalf("metadata excluded_models = %#v, want canonical []string", updated.Metadata["excluded_models"])
+	}
+	if _, ok := updated.Metadata["excluded-models"]; ok {
+		t.Fatalf("expected metadata excluded-models alias to be removed")
+	}
+	wantHash := diff.ComputeExcludedModelsHash([]string{"kiro-auto", "custom-undetected"})
+	if got := updated.Attributes["excluded_models_hash"]; got != wantHash {
+		t.Fatalf("attrs excluded_models_hash = %q, want %q", got, wantHash)
+	}
+}
+
+func TestPatchAuthFileFields_ExcludedModelsAliasReplacesAndClears(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "alias.json",
+		FileName: "alias.json",
+		Provider: "kiro",
+		Attributes: map[string]string{
+			"path":                 "/tmp/alias.json",
+			"excluded_models":      "stale-underscore,stale-hyphen",
+			"excluded_models_hash": "stale",
+		},
+		Metadata: map[string]any{
+			"type":            "kiro",
+			"excluded_models": []any{"stale-underscore"},
+			"excluded-models": []any{"stale-hyphen"},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"alias.json","excluded-models":["new-model"]}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("alias.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["excluded_models"]; got != "new-model" {
+		t.Fatalf("attrs excluded_models = %q, want %q", got, "new-model")
+	}
+	if got, ok := updated.Metadata["excluded_models"].([]string); !ok || len(got) != 1 || got[0] != "new-model" {
+		t.Fatalf("metadata excluded_models = %#v, want [new-model]", updated.Metadata["excluded_models"])
+	}
+	if _, ok := updated.Metadata["excluded-models"]; ok {
+		t.Fatalf("expected metadata excluded-models alias to be removed")
+	}
+
+	body = `{"name":"alias.json","excluded_models":[]}`
+	rec = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(rec)
+	req = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok = manager.GetByID("alias.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after clear")
+	}
+	if _, ok := updated.Attributes["excluded_models"]; ok {
+		t.Fatalf("expected attrs excluded_models to be cleared")
+	}
+	if _, ok := updated.Attributes["excluded_models_hash"]; ok {
+		t.Fatalf("expected attrs excluded_models_hash to be cleared")
+	}
+	if _, ok := updated.Metadata["excluded_models"]; ok {
+		t.Fatalf("expected metadata excluded_models to be cleared")
+	}
+	if _, ok := updated.Metadata["excluded-models"]; ok {
+		t.Fatalf("expected metadata excluded-models alias to be cleared")
+	}
+}
+
+func TestPatchAuthFileFields_WebsocketsFalseIsUpdate(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex.json",
+		FileName: "codex.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":       "/tmp/codex.json",
+			"websockets": "true",
+		},
+		Metadata: map[string]any{
+			"type":       "codex",
+			"websockets": true,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"codex.json","websockets":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("codex.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["websockets"]; got != "false" {
+		t.Fatalf("attrs websockets = %q, want %q", got, "false")
+	}
+	if got, ok := updated.Metadata["websockets"].(bool); !ok || got {
+		t.Fatalf("metadata.websockets = %#v, want false", updated.Metadata["websockets"])
+	}
+}
+
+func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "generic.json"
+	filePath := filepath.Join(authDir, fileName)
+	store := fileauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	body := `{"name":"generic.json","abc":true,"nested.cde":true,"fgh":{"ijk":true}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	raw, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatalf("failed to read updated auth file: %v", errRead)
+	}
+	var data map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &data); errUnmarshal != nil {
+		t.Fatalf("failed to unmarshal updated auth file: %v", errUnmarshal)
+	}
+	if got := data["abc"]; got != true {
+		t.Fatalf("abc = %#v, want true", got)
+	}
+	nested, ok := data["nested"].(map[string]any)
+	if !ok {
+		t.Fatalf("nested = %#v, want object", data["nested"])
+	}
+	if got := nested["cde"]; got != true {
+		t.Fatalf("nested.cde = %#v, want true", got)
+	}
+	fgh, ok := data["fgh"].(map[string]any)
+	if !ok {
+		t.Fatalf("fgh = %#v, want object", data["fgh"])
+	}
+	if got := fgh["ijk"]; got != true {
+		t.Fatalf("fgh.ijk = %#v, want true", got)
+	}
+}

@@ -1,0 +1,28 @@
+services:
+  ai-proxy:
+    build:
+      context: ./ai-proxy
+      dockerfile: Dockerfile
+    image: bybit-copytrade-ai-proxy:local
+    container_name: bybit-copytrade-ai-proxy
+    environment:
+      # Включает callback-forwarder на 0.0.0.0 вместо 127.0.0.1 внутри контейнера.
+      DEPLOY: docker
+      TZ: ${TZ:-Etc/UTC}
+      MANAGEMENT_PASSWORD: ${AI_PROXY_MANAGEMENT_KEY:?not set — скопируйте .env.example в .env}
+    ports:
+      # 8317 менять нельзя: OAuth-редирект жёстко ведёт на 127.0.0.1:<port из конфига>.
+      - "127.0.0.1:8317:8317"
+      # Callback Claude OAuth (redirect_uri=http://localhost:54545/callback).
+      - "127.0.0.1:54545:54545"
+    volumes:
+      - ./ai-proxy.config.yaml:/CLIProxyAPI/config.yaml
+      - ./.ai-proxy/auths:/root/.cli-proxy-api
+      - ./.ai-proxy/logs:/CLIProxyAPI/logs
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8317"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped

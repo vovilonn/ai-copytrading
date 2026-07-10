@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  @font-face{font-family:'Exo 2';src:url('uploads/Exo_2/Exo2-VariableFont_wght.ttf') format('truetype');font-weight:100 900;font-style:normal;font-display:swap}
+  @font-face{font-family:'Exo 2';src:url('uploads/Exo_2/Exo2-Italic-VariableFont_wght.ttf') format('truetype');font-weight:100 900;font-style:italic;font-display:swap}
+  *{box-sizing:border-box}
+  body{margin:0;background:#000000;font-family:'Exo 2',system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased;color:#f5f5f5}
+  a{color:#ff6a1f;text-decoration:none}
+  a:hover{color:#ff8a4d}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:6px;border:2px solid #000}
+  ::selection{background:rgba(255,106,31,.3)}
+  @media (max-width: 820px){
+    [data-m="sidebar"]{display:none !important}
+    [data-m="bottomnav"]{display:flex !important}
+    [data-m="main"]{padding:18px 14px 92px !important}
+    [data-m="topbar"]{padding:0 14px !important;gap:10px !important}
+    [data-m="tablecard"]{overflow-x:auto !important}
+  }
+  @media (max-width: 480px){
+    [data-m="parsertext"]{display:none !important}
+    [data-m="main"]{padding:15px 11px 92px !important}
+  }
+  @media (max-width: 640px){
+    [data-m="filters"] > div{flex-direction:column !important;align-items:stretch !important;gap:11px !important}
+    [data-m="filters"] > div > div{flex-wrap:wrap !important}
+    [data-m="filters"] > div > div > div{flex-wrap:wrap !important}
+    [data-m="searchwrap"]{margin-left:0 !important;width:100% !important}
+    [data-m="searchwrap"] input{width:100% !important}
+  }
+</style>
+</helmet>
+
+<sc-if value="{{ isLogin }}" hint-placeholder-val="{{ true }}">
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#000;padding:24px">
+    <div style="width:100%;max-width:360px;display:flex;flex-direction:column;gap:24px">
+      <div style="display:flex;align-items:center;gap:12px;justify-content:center">
+        <div style="width:34px;height:34px;border-radius:8px;background:#ff6a1f;display:flex;align-items:center;justify-content:center;flex:none"><div style="width:12px;height:12px;border-radius:3px;background:#000"></div></div>
+        <span style="font-size:18px;font-weight:600;letter-spacing:-.01em;color:#fafafa">CopyTrade AI</span>
+      </div>
+      <div style="background:#0d0d0f;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:26px 24px;display:flex;flex-direction:column;gap:16px">
+        <div>
+          <h1 style="font-size:18px;font-weight:600;margin:0 0 4px;color:#fafafa">Sign in</h1>
+          <p style="font-size:13px;color:#6b6b70;margin:0">Access your copy-trading control panel</p>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:7px">
+          <label style="font-size:12px;font-weight:500;color:#8a8a90">Login</label>
+          <input value="{{ loginUser }}" onInput="{{ onLoginUser }}" placeholder="admin" style="height:40px;padding:0 13px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#fafafa;font-size:13.5px;font-family:inherit;outline:none;color-scheme:dark">
+        </div>
+        <div style="display:flex;flex-direction:column;gap:7px">
+          <label style="font-size:12px;font-weight:500;color:#8a8a90">Password</label>
+          <input value="{{ loginPass }}" onInput="{{ onLoginPass }}" onKeyDown="{{ onPassKey }}" type="password" placeholder="••••••••" style="height:40px;padding:0 13px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#fafafa;font-size:13.5px;font-family:inherit;outline:none;color-scheme:dark">
+        </div>
+        <span style="{{ loginErrStyle }}">{{ loginErr }}</span>
+        <button onClick="{{ doLogin }}" style="height:42px;margin-top:2px;border:none;border-radius:8px;background:#ff6a1f;color:#0a0a0a;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer" style-hover="background:#ff8a4d">Sign in</button>
+      </div>
+    </div>
+  </div>
+</sc-if>
+<sc-if value="{{ authed }}">
+<div style="display:flex;height:100vh;overflow:hidden;background:#000000">
+
+  <!-- SIDEBAR -->
+  <aside data-m="sidebar" style="width:246px;flex:none;background:#000000;border-right:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column">
+    <div style="height:60px;display:flex;align-items:center;gap:11px;padding:0 20px;border-bottom:1px solid rgba(255,255,255,.06)">
+      <div style="width:30px;height:30px;border-radius:7px;background:#ff6a1f;display:flex;align-items:center;justify-content:center;flex:none">
+        <div style="width:11px;height:11px;border-radius:2px;background:#000"></div>
+      </div>
+      <div style="display:flex;flex-direction:column;line-height:1.2">
+        <span style="font-size:14.5px;font-weight:600;letter-spacing:-.01em;color:#fafafa">CopyTrade AI</span>
+        <span style="font-size:11px;color:#5a5a60;font-weight:500">Control panel</span>
+      </div>
+    </div>
+
+    <nav style="flex:1;padding:16px 12px;display:flex;flex-direction:column;gap:3px">
+      <div style="font-size:10.5px;font-weight:600;color:#4a4a50;text-transform:uppercase;letter-spacing:.08em;padding:6px 10px 8px">Overview</div>
+      <button onClick="{{ goChannels }}" style="{{ navChannelsStyle }}">
+        <x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="send" size="16" color="{{ navChannelsIcon }}" hint-size="16px,16px" style="display:inline-flex;flex:none"></x-import>
+        <span>Telegram Channels</span>
+      </button>
+      <button onClick="{{ goActions }}" style="{{ navActionsStyle }}">
+        <x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="activity" size="16" color="{{ navActionsIcon }}" hint-size="16px,16px" style="display:inline-flex;flex:none"></x-import>
+        <span>Actions</span>
+      </button>
+      <button onClick="{{ goPositions }}" style="{{ navPositionsStyle }}">
+        <x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="coins" size="16" color="{{ navPositionsIcon }}" hint-size="16px,16px" style="display:inline-flex;flex:none"></x-import>
+        <span>Positions</span>
+      </button>
+    </nav>
+
+    <div style="padding:12px;border-top:1px solid rgba(255,255,255,.06)">
+      <button style="display:flex;align-items:center;gap:11px;width:100%;padding:9px 11px;border:none;border-radius:7px;font-size:13.5px;font-family:inherit;cursor:pointer;text-align:left;background:transparent;color:#8a8a90;font-weight:500" style-hover="background:rgba(255,255,255,.04);color:#fafafa">
+        <x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="settings" size="16" hint-size="16px,16px" style="display:inline-flex;flex:none"></x-import>
+        <span>Settings</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <div style="flex:1;display:flex;flex-direction:column;min-width:0;background:#000">
+
+    <!-- TOPBAR -->
+    <header data-m="topbar" style="height:60px;flex:none;background:#000;border-bottom:1px solid rgba(255,255,255,.07);display:flex;align-items:center;gap:14px;padding:0 26px">
+      <div style="display:flex;align-items:center;gap:8px;min-width:0">
+        <sc-for list="{{ crumbs }}" as="cb" hint-placeholder-count="1">
+          <span style="{{ cb.sepStyle }}">/</span>
+          <span onClick="{{ cb.onClick }}" style="{{ cb.style }}">{{ cb.label }}</span>
+        </sc-for>
+      </div>
+      <button onClick="{{ logout }}" style="margin-left:auto;display:inline-flex;align-items:center;gap:7px;height:34px;padding:0 13px;border:1px solid rgba(255,255,255,.1);background:transparent;border-radius:7px;font-size:12.5px;font-weight:500;font-family:inherit;cursor:pointer;color:#a1a1aa" style-hover="background:rgba(255,255,255,.05);color:#fafafa">
+        <x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="log-out" size="15" hint-size="15px,15px" style="display:inline-flex;flex:none"></x-import>
+        Logout
+      </button>
+    </header>
+
+    <!-- CONTENT -->
+    <main data-m="main" style="flex:1;overflow-y:auto;padding:28px 30px 48px">
+
+      <!-- CHANNELS LIST -->
+      <sc-if value="{{ isChannels }}" hint-placeholder-val="{{ true }}">
+        <div style="display:flex;flex-direction:column;gap:22px;width:100%">
+          <div>
+            <h2 style="font-size:22px;font-weight:600;letter-spacing:-.02em;margin:0 0 5px;color:#fafafa">Telegram Channels</h2>
+            <p style="font-size:13.5px;color:#6b6b70;margin:0">Signal sources — the bot parses messages and extracts trade actions</p>
+          </div>
+
+          <div data-m="tablecard" style="background:#0d0d0f;border:1px solid rgba(255,255,255,.07);border-radius:10px;overflow:hidden">
+            <table style="width:100%;border-collapse:collapse;table-layout:fixed;min-width:820px">
+              <thead>
+                <tr>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;letter-spacing:.02em;padding:13px 22px;width:24%">Channel</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;letter-spacing:.02em;padding:13px 14px;width:12%">Copy</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;letter-spacing:.02em;padding:13px 14px;width:11%">Win Rate</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;letter-spacing:.02em;padding:13px 14px;width:10%">Actions</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;letter-spacing:.02em;padding:13px 14px;width:10%">Active Positions</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;letter-spacing:.02em;padding:13px 14px;width:11%">Messages</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;letter-spacing:.02em;padding:13px 14px;width:12%">Trade size</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;letter-spacing:.02em;padding:13px 22px;width:12%">Max lev</th>
+                  <th style="width:44px;padding:13px 22px"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <sc-for list="{{ channels }}" as="c" hint-placeholder-count="5">
+                  <tr onClick="{{ c.open }}" style="border-top:1px solid rgba(255,255,255,.06);cursor:pointer" style-hover="background:rgba(255,255,255,.025)">
+                    <td style="padding:14px 22px">
+                      <div style="display:flex;align-items:center;gap:13px">
+                        <div style="width:38px;height:38px;border-radius:8px;background:rgba(255,255,255,.05);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600;color:#c9c9cf;flex:none">{{ c.initial }}</div>
+                        <div style="min-width:0"><div style="font-size:13.5px;font-weight:600;color:#fafafa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ c.name }}</div><div style="font-size:12px;color:#5a5a60;font-family:ui-monospace,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ c.handle }}</div></div>
+                      </div>
+                    </td>
+                    <td style="padding:14px 14px"><span style="{{ c.copyStyle }}">{{ c.copyLabel }}</span></td>
+                    <td style="padding:14px 14px;text-align:left;font-size:13px;font-weight:500;color:#a1a1aa;font-variant-numeric:tabular-nums">{{ c.winRate }}</td>
+                    <td style="padding:14px 14px;text-align:left;font-size:13px;font-weight:600;color:#fafafa;font-variant-numeric:tabular-nums">{{ c.actionCount }}</td>
+                    <td style="padding:14px 14px;text-align:left"><span style="{{ c.activePosStyle }}">{{ c.activePos }}</span></td>
+                    <td style="padding:14px 14px;text-align:left;font-size:13px;font-weight:500;color:#a1a1aa;font-variant-numeric:tabular-nums">{{ c.msgCount }}</td>
+                    <td style="padding:14px 14px;text-align:left;font-size:12.5px;color:#c9c9cf;font-family:ui-monospace,Menlo,monospace">{{ c.tradeSize }}</td>
+                    <td style="padding:14px 22px;text-align:left;font-size:12.5px;color:#c9c9cf;font-family:ui-monospace,Menlo,monospace">{{ c.maxLev }}</td>
+                    <td style="padding:14px 22px;text-align:right;color:#4a4a50"><x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="chevron-right" size="16" hint-size="16px,16px" style="display:inline-flex;flex:none"></x-import></td>
+                  </tr>
+                </sc-for>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- CHANNEL DETAIL — messages timeline -->
+      <sc-if value="{{ isChannel }}">
+        <div style="display:flex;flex-direction:column;gap:24px;width:100%">
+
+          <div style="display:flex;align-items:center;gap:15px">
+            <div style="width:50px;height:50px;border-radius:11px;background:rgba(255,255,255,.05);display:flex;align-items:center;justify-content:center;font-size:19px;font-weight:600;color:#c9c9cf;flex:none">{{ sel.initial }}</div>
+            <div style="flex:1;min-width:0">
+              <h2 style="font-size:22px;font-weight:600;letter-spacing:-.02em;margin:0 0 4px;color:#fafafa">{{ sel.name }}</h2>
+              <p style="font-size:13px;color:#5a5a60;margin:0;font-family:ui-monospace,Menlo,monospace">{{ sel.handle }} · {{ sel.msgCount }} messages · {{ sel.actionCount }} actions</p>
+            </div>
+            <span style="display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:#c9c9cf;font-weight:500"><span style="{{ sel.dotStyle }}"></span>{{ sel.status }}</span>
+          </div>
+
+          <div style="display:flex;gap:4px;border-bottom:1px solid rgba(255,255,255,.08)">
+            <button onClick="{{ tabMsgs }}" style="{{ msgTabStyle }}">Messages</button>
+            <button onClick="{{ tabSettings }}" style="{{ settingsTabStyle }}">Settings</button>
+          </div>
+
+          <sc-if value="{{ isMsgTab }}" hint-placeholder-val="{{ true }}">
+          <div style="position:relative;max-width:720px">
+            <div style="position:absolute;left:15px;top:22px;bottom:26px;width:1px;background:rgba(255,255,255,.08)"></div>
+            <sc-for list="{{ messages }}" as="m" hint-placeholder-count="6">
+              <div style="display:flex;gap:18px;position:relative;padding-bottom:26px">
+
+                <div style="{{ m.nodeTileStyle }}">
+                  <span style="{{ m.nodeIconStyle }}"><x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="{{ m.nodeIcon }}" size="16" color="{{ m.nodeIconColor }}" hint-size="16px,16px" style="display:inline-flex;flex:none"></x-import></span>
+                  <span style="{{ m.nodeDotStyle }}"></span>
+                </div>
+
+                <div style="flex:1;min-width:0;padding-top:5px">
+                  <div style="display:flex;align-items:center;gap:9px;margin-bottom:8px">
+                    <span style="font-size:11.5px;color:#5a5a60;font-family:ui-monospace,Menlo,monospace">{{ m.time }}</span>
+                  </div>
+
+                  <div style="font-size:14px;line-height:1.6;color:#e4e4e7;white-space:pre-line">{{ m.text }}</div>
+
+                  <div style="{{ m.photoStyle }}">
+                    {{ m.photoEl }}
+                    <span style="{{ m.photoPhStyle }}">
+                      <x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="image" size="19" color="#5a5a60" hint-size="19px,19px" style="display:inline-flex;flex:none"></x-import>
+                      <span style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:#5a5a60">{{ m.photoLabel }}</span>
+                    </span>
+                  </div>
+
+                  <!-- parsed actions (1..N) + one message-level AI summary -->
+                  <div style="{{ m.resultStyle }}">
+                    <sc-for list="{{ m.actionRows }}" as="ar" hint-placeholder-count="1">
+                      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                        <x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="{{ ar.icon }}" size="15" color="{{ ar.iconColor }}" hint-size="15px,15px" style="display:inline-flex;flex:none"></x-import>
+                        <span style="{{ ar.titleStyle }}">{{ ar.title }}</span>
+                        <span style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1;color:#8a8a90">{{ ar.pair }}</span>
+                        <a onClick="{{ ar.tradeRefOn }}" style="{{ ar.tradeRefStyle }}" style-hover="color:#ff8a4d;background:rgba(255,106,31,.12)">
+                          {{ ar.tradeRefLabel }}
+                          <x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="arrow-up-right" size="13" hint-size="13px,13px" style="display:inline-flex;flex:none"></x-import>
+                        </a>
+                        <span style="{{ ar.skippedStyle }}">Skipped</span>
+                      </div>
+                    </sc-for>
+                    <div style="{{ m.summaryStyle }}">
+                      <span style="display:flex;align-items:center;height:19px;flex:none"><x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="sparkles" size="13" color="#ff8a4d" hint-size="13px,13px" style="display:inline-flex;flex:none"></x-import></span>
+                      <span style="font-size:12.5px;font-weight:300;line-height:1.55;color:#9a9aa0">{{ m.summaryText }}</span>
+                    </div>
+                  </div>
+
+                  <div style="{{ m.noteStyle }}">
+                    <span style="display:flex;align-items:center;height:19px;flex:none"><x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="sparkles" size="13" color="#ff8a4d" hint-size="13px,13px" style="display:inline-flex;flex:none"></x-import></span>
+                    <span style="font-size:12.5px;font-weight:300;line-height:1.55;color:#6b6b70">{{ m.summaryText }}</span>
+                  </div>
+                </div>
+
+              </div>
+            </sc-for>
+          </div>
+          </sc-if>
+
+          <sc-if value="{{ isSettingsTab }}">
+            <div style="max-width:620px;background:#0d0d0f;border:1px solid rgba(255,255,255,.07);border-radius:10px;padding:4px 20px">
+              <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding:18px 0;border-bottom:1px solid rgba(255,255,255,.06)">
+                <div style="min-width:0">
+                  <div style="font-size:13.5px;font-weight:600;color:#fafafa;margin-bottom:3px">Copy trading</div>
+                  <div style="font-size:12.5px;color:#6b6b70;line-height:1.5;max-width:380px">If off, messages are still parsed but every action is marked Skipped — no orders are sent to Bybit.</div>
+                </div>
+                <div style="{{ set.enabledTrack }}" onClick="{{ set.toggleEnabled }}"><span style="{{ set.enabledKnob }}"></span></div>
+              </div>
+              <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding:18px 0;border-bottom:1px solid rgba(255,255,255,.06)">
+                <div style="min-width:0">
+                  <div style="font-size:13.5px;font-weight:600;color:#fafafa;margin-bottom:3px">Trade size</div>
+                  <div style="font-size:12.5px;color:#6b6b70;line-height:1.5;max-width:380px">Fixed notional used for every trade copied from this channel.</div>
+                </div>
+                <div style="display:flex;align-items:center;border:1px solid rgba(255,255,255,.12);border-radius:7px;background:rgba(255,255,255,.04);height:34px;overflow:hidden;flex:none">
+                  <span style="padding:0 3px 0 11px;color:#6b6b70;font-size:13px">$</span>
+                  <input value="{{ set.tradeSize }}" onInput="{{ set.onTradeSize }}" type="number" style="width:88px;height:100%;border:none;background:transparent;color:#fafafa;font-size:13px;font-family:inherit;outline:none;padding:0 11px 0 4px;color-scheme:dark">
+                </div>
+              </div>
+              <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding:18px 0;border-bottom:1px solid rgba(255,255,255,.06)">
+                <div style="min-width:0">
+                  <div style="font-size:13.5px;font-weight:600;color:#fafafa;margin-bottom:3px">Max leverage</div>
+                  <div style="font-size:12.5px;color:#6b6b70;line-height:1.5;max-width:380px">Signals above this leverage are clamped down to the limit.</div>
+                </div>
+                <div style="display:flex;align-items:center;border:1px solid rgba(255,255,255,.12);border-radius:7px;background:rgba(255,255,255,.04);height:34px;overflow:hidden;flex:none">
+                  <input value="{{ set.maxLev }}" onInput="{{ set.onMaxLev }}" type="number" style="width:66px;height:100%;border:none;background:transparent;color:#fafafa;font-size:13px;font-family:inherit;outline:none;padding:0 4px 0 11px;color-scheme:dark">
+                  <span style="padding:0 11px 0 2px;color:#6b6b70;font-size:13px">x</span>
+                </div>
+              </div>
+              <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding:18px 0;border-bottom:1px solid rgba(255,255,255,.06)">
+                <div style="min-width:0">
+                  <div style="font-size:13.5px;font-weight:600;color:#fafafa;margin-bottom:3px">Default leverage <span style="font-weight:500;color:#5a5a60">· optional</span></div>
+                  <div style="font-size:12.5px;color:#6b6b70;line-height:1.5;max-width:380px">Used when a signal doesn't specify leverage. Leave empty to skip.</div>
+                </div>
+                <div style="display:flex;align-items:center;border:1px solid rgba(255,255,255,.12);border-radius:7px;background:rgba(255,255,255,.04);height:34px;overflow:hidden;flex:none">
+                  <input value="{{ set.defLev }}" onInput="{{ set.onDefLev }}" type="number" placeholder="—" style="width:66px;height:100%;border:none;background:transparent;color:#fafafa;font-size:13px;font-family:inherit;outline:none;padding:0 4px 0 11px;color-scheme:dark">
+                  <span style="padding:0 11px 0 2px;color:#6b6b70;font-size:13px">x</span>
+                </div>
+              </div>
+              <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding:18px 0">
+                <div style="min-width:0">
+                  <div style="font-size:13.5px;font-weight:600;color:#fafafa;margin-bottom:3px">Allow cross margin</div>
+                  <div style="font-size:12.5px;color:#6b6b70;line-height:1.5;max-width:380px">If off, positions from this channel are opened in isolated margin only.</div>
+                </div>
+                <div style="{{ set.crossTrack }}" onClick="{{ set.toggleCross }}"><span style="{{ set.crossKnob }}"></span></div>
+              </div>
+              <div style="display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:18px 0 8px;border-top:1px solid rgba(255,255,255,.06)">
+                <span style="{{ set.savedStyle }}"><x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="circle-check" size="14" color="#34d399" hint-size="14px,14px" style="display:inline-flex;flex:none"></x-import>Saved</span>
+                <button onClick="{{ set.onSave }}" style="height:36px;padding:0 18px;border:none;border-radius:7px;background:#ff6a1f;color:#0a0a0a;font-size:13px;font-weight:600;font-family:inherit;cursor:pointer" style-hover="background:#ff8a4d">Save changes</button>
+              </div>
+            </div>
+          </sc-if>
+        </div>
+      </sc-if>
+
+      <!-- GLOBAL ACTIONS -->
+      <sc-if value="{{ isActions }}">
+        <div style="display:flex;flex-direction:column;gap:22px;width:100%">
+          <div>
+            <h2 style="font-size:22px;font-weight:600;letter-spacing:-.02em;margin:0 0 5px;color:#fafafa">Actions</h2>
+            <p style="font-size:13.5px;color:#6b6b70;margin:0">Every trade action extracted across all channels</p>
+          </div>
+
+          <!-- filters -->
+          <div data-m="filters" style="display:flex;flex-direction:column;gap:13px;width:100%">
+            <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap">
+              <span style="font-size:11px;font-weight:600;color:#6b6b70;text-transform:uppercase;letter-spacing:.05em">Channel</span>
+              <div style="display:inline-flex;flex-wrap:wrap;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:3px;gap:2px">
+                <sc-for list="{{ channelOpts }}" as="o" hint-placeholder-count="6"><button onClick="{{ o.on }}" style="{{ o.style }}">{{ o.label }}</button></sc-for>
+              </div>
+            </div>
+            <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap">
+              <div style="display:flex;align-items:center;gap:9px">
+                <span style="font-size:11px;font-weight:600;color:#6b6b70;text-transform:uppercase;letter-spacing:.05em">Period</span>
+                <div style="display:inline-flex;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:3px;gap:2px">
+                  <sc-for list="{{ periodOpts }}" as="o" hint-placeholder-count="4"><button onClick="{{ o.on }}" style="{{ o.style }}">{{ o.label }}</button></sc-for>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:9px">
+                <span style="font-size:11px;font-weight:600;color:#6b6b70;text-transform:uppercase;letter-spacing:.05em">Type</span>
+                <div style="display:inline-flex;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:3px;gap:2px">
+                  <sc-for list="{{ typeOpts }}" as="o" hint-placeholder-count="5"><button onClick="{{ o.on }}" style="{{ o.style }}">{{ o.label }}</button></sc-for>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:9px">
+                <span style="font-size:11px;font-weight:600;color:#6b6b70;text-transform:uppercase;letter-spacing:.05em">Side</span>
+                <div style="display:inline-flex;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:3px;gap:2px">
+                  <sc-for list="{{ dirOpts }}" as="o" hint-placeholder-count="3"><button onClick="{{ o.on }}" style="{{ o.style }}">{{ o.label }}</button></sc-for>
+                </div>
+              </div>
+              <div data-m="searchwrap" style="position:relative;margin-left:auto;display:flex;align-items:center">
+                <span style="position:absolute;left:11px;display:inline-flex;color:#5a5a60"><x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="search" size="15" hint-size="15px,15px" style="display:inline-flex;flex:none"></x-import></span>
+                <input value="{{ fQuery }}" onInput="{{ onQuery }}" placeholder="Search by pair…" style="height:34px;width:230px;padding:0 12px 0 33px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:7px;color:#e4e4e7;font-size:12.5px;font-family:inherit;outline:none">
+              </div>
+            </div>
+          </div>
+
+          <!-- table -->
+          <div data-m="tablecard" style="background:#0d0d0f;border:1px solid rgba(255,255,255,.07);border-radius:10px;overflow:hidden;width:100%">
+            <table style="width:100%;border-collapse:collapse;min-width:860px">
+              <thead>
+                <tr>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 22px">Action</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px">Pair</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px">Summary</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px">Trade</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px">Channel</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px">Time</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 22px">Method</th>
+                </tr>
+              </thead>
+              <tbody>
+                <sc-for list="{{ actions }}" as="a" hint-placeholder-count="8">
+                  <tr style="border-top:1px solid rgba(255,255,255,.06)" style-hover="background:rgba(255,255,255,.02)">
+                    <td style="padding:14px 22px">
+                      <span style="display:inline-flex;align-items:center;gap:10px">
+                        <span style="{{ a.iconTileStyle }}"><x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="{{ a.icon }}" size="15" color="{{ a.iconColor }}" hint-size="15px,15px" style="display:inline-flex;flex:none"></x-import></span>
+                        <span style="{{ a.shortStyle }}">{{ a.short }}</span>
+                        <span style="{{ a.dirTextStyle }}">{{ a.dirLabel }}</span>
+                      </span>
+                    </td>
+                    <td style="padding:14px 14px;font-size:13px;font-weight:600;color:#fafafa;font-family:ui-monospace,Menlo,monospace">{{ a.actionPair }}</td>
+                    <td style="padding:14px 14px;font-size:12.5px;color:#a1a1aa;max-width:300px">{{ a.detail }}</td>
+                    <td style="padding:14px 14px"><a onClick="{{ a.tradeRefOn }}" style="{{ a.tradeRefStyle }}" style-hover="color:#ff8a4d;background:rgba(255,106,31,.12)">{{ a.tradeRefLabel }}</a></td>
+                    <td style="padding:14px 14px">
+                      <span onClick="{{ a.channelOn }}" style="display:inline-flex;align-items:center;gap:9px;cursor:pointer" style-hover="opacity:.72">
+                        <span style="{{ a.chTileStyle }}">{{ a.chInitial }}</span>
+                        <span style="font-size:12.5px;color:#c9c9cf;white-space:nowrap">{{ a.chName }}</span>
+                      </span>
+                    </td>
+                    <td style="padding:14px 14px;font-size:12.5px;color:#5a5a60;font-family:ui-monospace,Menlo,monospace">{{ a.time }}</td>
+                    <td style="padding:14px 22px"><span style="{{ a.parseStyle }}">{{ a.parseLabel }}</span></td>
+                  </tr>
+                </sc-for>
+              </tbody>
+            </table>
+            <div style="{{ emptyStyle }}">
+              <span style="font-size:13px;color:#6b6b70">No actions match the selected filters.</span>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- POSITIONS (Bybit /v5/position/list) -->
+      <sc-if value="{{ isPositions }}">
+        <div style="display:flex;flex-direction:column;gap:22px;width:100%">
+          <div>
+            <h2 style="font-size:22px;font-weight:600;letter-spacing:-.02em;margin:0 0 5px;color:#fafafa">Positions</h2>
+            <p style="font-size:13.5px;color:#6b6b70;margin:0">Open positions on Bybit — synced from /v5/position/list</p>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px">
+            <sc-for list="{{ posStats }}" as="s" hint-placeholder-count="4">
+              <div style="flex:1;min-width:180px;background:#0d0d0f;border:1px solid rgba(255,255,255,.07);border-radius:10px;padding:16px 18px;display:flex;flex-direction:column;gap:7px">
+                <span style="font-size:12px;color:#6b6b70;font-weight:500">{{ s.label }}</span>
+                <span style="{{ s.valueStyle }}">{{ s.value }}</span>
+                <span style="font-size:11.5px;color:#5a5a60">{{ s.sub }}</span>
+              </div>
+            </sc-for>
+          </div>
+
+          <div data-m="filters" style="display:flex;flex-direction:column;gap:13px;width:100%">
+            <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap">
+              <span style="font-size:11px;font-weight:600;color:#6b6b70;text-transform:uppercase;letter-spacing:.05em">Channel</span>
+              <div style="display:inline-flex;flex-wrap:wrap;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:3px;gap:2px">
+                <sc-for list="{{ posChannelOpts }}" as="o" hint-placeholder-count="6"><button onClick="{{ o.on }}" style="{{ o.style }}">{{ o.label }}</button></sc-for>
+              </div>
+            </div>
+            <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap">
+              <div style="display:flex;align-items:center;gap:9px">
+                <span style="font-size:11px;font-weight:600;color:#6b6b70;text-transform:uppercase;letter-spacing:.05em">Side</span>
+                <div style="display:inline-flex;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:3px;gap:2px">
+                  <sc-for list="{{ posSideOpts }}" as="o" hint-placeholder-count="3"><button onClick="{{ o.on }}" style="{{ o.style }}">{{ o.label }}</button></sc-for>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:9px">
+                <span style="font-size:11px;font-weight:600;color:#6b6b70;text-transform:uppercase;letter-spacing:.05em">Margin</span>
+                <div style="display:inline-flex;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:3px;gap:2px">
+                  <sc-for list="{{ posMarginOpts }}" as="o" hint-placeholder-count="3"><button onClick="{{ o.on }}" style="{{ o.style }}">{{ o.label }}</button></sc-for>
+                </div>
+              </div>
+              <div data-m="searchwrap" style="position:relative;margin-left:auto;display:flex;align-items:center">
+                <span style="position:absolute;left:11px;display:inline-flex;color:#5a5a60"><x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="search" size="15" hint-size="15px,15px" style="display:inline-flex;flex:none"></x-import></span>
+                <input value="{{ fPosQuery }}" onInput="{{ onPosQuery }}" placeholder="Symbol, channel or #TR-ID…" style="height:34px;width:230px;padding:0 12px 0 33px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:7px;color:#e4e4e7;font-size:12.5px;font-family:inherit;outline:none">
+              </div>
+            </div>
+          </div>
+
+          <div data-m="tablecard" style="background:#0d0d0f;border:1px solid rgba(255,255,255,.07);border-radius:10px;overflow:hidden;width:100%">
+            <table style="width:100%;border-collapse:collapse;table-layout:fixed;min-width:940px">
+              <thead>
+                <tr>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 22px;width:12%">Symbol</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px;width:10%">Side</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px;width:11%">Size</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px;width:9%">Entry</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px;width:9%">Mark</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px;width:9%">Liq. price</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px;width:11%">Unreal. PnL</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px;width:10%">TP / SL</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 14px;width:11%">Leverage</th>
+                  <th style="text-align:left;font-size:11px;font-weight:500;color:#6b6b70;padding:13px 22px;width:14%">Source</th>
+                </tr>
+              </thead>
+              <tbody>
+                <sc-for list="{{ positions }}" as="p" hint-placeholder-count="7">
+                  <tr style="border-top:1px solid rgba(255,255,255,.06)" style-hover="background:rgba(255,255,255,.02)">
+                    <td style="padding:14px 22px;font-size:13px;font-weight:600;color:#fafafa;font-family:ui-monospace,Menlo,monospace">{{ p.symbol }}</td>
+                    <td style="padding:14px 14px"><span style="{{ p.dirStyle }}"><x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="{{ p.dirIcon }}" size="14" color="{{ p.dirColor }}" hint-size="14px,14px" style="display:inline-flex;flex:none"></x-import>{{ p.dirLabel }}</span></td>
+                    <td style="padding:14px 14px;font-size:12.5px;color:#c9c9cf;font-family:ui-monospace,Menlo,monospace">{{ p.size }}</td>
+                    <td style="padding:14px 14px;font-size:12.5px;color:#c9c9cf;font-family:ui-monospace,Menlo,monospace">{{ p.entry }}</td>
+                    <td style="padding:14px 14px;font-size:12.5px;color:#e4e4e7;font-family:ui-monospace,Menlo,monospace">{{ p.mark }}</td>
+                    <td style="padding:14px 14px;font-size:12.5px;color:#8a8a90;font-family:ui-monospace,Menlo,monospace">{{ p.liq }}</td>
+                    <td style="padding:14px 14px"><span style="display:flex;flex-direction:column;gap:1px"><span style="{{ p.pnlStyle }}">{{ p.pnlStr }}</span><span style="{{ p.roiStyle }}">{{ p.roiStr }}</span></span></td>
+                    <td style="padding:14px 14px"><span style="display:flex;flex-direction:column;gap:1px;font-family:ui-monospace,Menlo,monospace;font-size:11px"><span style="color:#34d399">TP {{ p.tp }}</span><span style="color:#fb7185">SL {{ p.sl }}</span></span></td>
+                    <td style="padding:14px 14px"><span style="display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:#c9c9cf;font-family:ui-monospace,Menlo,monospace">{{ p.lev }}<span style="{{ p.marginChipStyle }}">{{ p.marginMode }}</span></span></td>
+                    <td style="padding:14px 22px"><span style="display:flex;flex-direction:column;gap:1px"><span onClick="{{ p.sourceOn }}" style="font-size:12.5px;color:#c9c9cf;white-space:nowrap;cursor:pointer" style-hover="color:#ff8a4d">{{ p.source }}</span><span style="font-size:11px;color:#5a5a60;font-family:ui-monospace,Menlo,monospace">{{ p.tradeRef }}</span></span></td>
+                  </tr>
+                </sc-for>
+              </tbody>
+            </table>
+            <div style="{{ posEmptyStyle }}"><span style="font-size:13px;color:#6b6b70">No positions match the selected filters.</span></div>
+          </div>
+        </div>
+      </sc-if>
+
+    </main>
+  </div>
+
+  <div data-m="bottomnav" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:50;background:#000;border-top:1px solid rgba(255,255,255,.08);padding:7px 6px;justify-content:space-around;align-items:stretch">
+    <sc-for list="{{ bottomNav }}" as="bn" hint-placeholder-count="3">
+      <button onClick="{{ bn.on }}" style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;background:transparent;border:none;cursor:pointer;padding:6px 0;font-family:inherit">
+        <x-import component-from-global-scope="LucideIcon" from="./lucide-icon.js" name="{{ bn.icon }}" size="20" color="{{ bn.iconColor }}" hint-size="20px,20px" style="display:inline-flex;flex:none"></x-import>
+        <span style="{{ bn.labelStyle }}">{{ bn.label }}</span>
+      </button>
+    </sc-for>
+  </div>
+</div>
+</sc-if>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  state = { view: 'channels', channelId: null, tab: 'messages', fPeriod: 'all', fAction: 'all', fDir: 'all', fQuery: '', fChannel: 'all', fPosSide: 'all', fPosMargin: 'all', fPosQuery: '', fPosChannel: 'all', settings: { c1: { enabled: true, tradeSize: 500, maxLev: 10, cross: true, defLev: '5' }, c2: { enabled: true, tradeSize: 300, maxLev: 5, cross: false, defLev: '' }, c3: { enabled: true, tradeSize: 500, maxLev: 10, cross: true, defLev: '' }, c4: { enabled: false, tradeSize: 100, maxLev: 3, cross: false, defLev: '' }, c5: { enabled: true, tradeSize: 250, maxLev: 8, cross: true, defLev: '' } }, savedFlash: false, authed: false, loginUser: '', loginPass: '', loginErr: '' };
+
+  goChannels() { this.setState({ view: 'channels' }); }
+  goActions() { this.setState({ view: 'actions' }); }
+  open(id) { this.setState({ view: 'channel', channelId: id, tab: 'messages' }); }
+  setTab(t) { this.setState({ tab: t }); }
+  setSetting(id, key, val) { this.setState(s => ({ settings: { ...s.settings, [id]: { ...s.settings[id], [key]: val } } })); }
+  saveSettings() { this.setState({ savedFlash: true }); clearTimeout(this._svt); this._svt = setTimeout(() => this.setState({ savedFlash: false }), 1800); }
+  login() { if (this.state.loginUser.trim() && this.state.loginPass.trim()) this.setState({ authed: true, loginErr: '' }); else this.setState({ loginErr: 'Enter your login and password' }); }
+  logout() { this.setState({ authed: false, view: 'channels', loginPass: '' }); }
+  goPositions() { this.setState({ view: 'positions' }); }
+  goTrade(ref) { this.setState({ view: 'positions', fPosQuery: ref, fPosChannel: 'all', fPosSide: 'all', fPosMargin: 'all' }); }
+
+  renderVals() {
+    const hidden = { display: 'none' };
+    const A = {
+      open:          { short: 'Open',          title: 'Open position',       icon: 'circle-plus' },
+      close:         { short: 'Close',         title: 'Close position',      icon: 'circle-x' },
+      partial_tp:    { short: 'Partial TP',    title: 'Partial take-profit', icon: 'target' },
+      partial_close: { short: 'Partial close', title: 'Partial close',       icon: 'scissors' },
+    };
+    const dcol = (dir) => dir === 'long' ? '#34d399' : '#fb7185';
+    const openIco = (dir) => dir === 'long' ? 'trending-up' : 'trending-down';
+    const actIco = (act) => act.type === 'open' ? openIco(act.dir) : A[act.type].icon;
+    const actAccent = (act) => act.type === 'open' ? dcol(act.dir) : null;
+    const tradeRefBase = { alignItems: 'center', gap: '5px', fontFamily: 'ui-monospace,Menlo,monospace', fontSize: '12px', fontWeight: 600, color: '#d4d4d8', background: 'rgba(255,255,255,.05)', borderRadius: '6px', padding: '4px 9px', cursor: 'pointer', transition: 'all .12s' };
+    const dot = (on) => ({ width: '6px', height: '6px', borderRadius: '50%', flex: 'none', background: on ? '#34d399' : '#5a5a60', boxShadow: on ? '0 0 8px 0 rgba(52,211,153,.6)' : 'none' });
+
+    const mkMsg = (m, enabled) => {
+      const acts = m.actions || [];
+      const isAi = m.method === 'ai';
+      const has = acts.length > 0;
+      const single = acts.length === 1 ? acts[0] : null;
+      const actionRows = acts.map(act => {
+        const a = A[act.type];
+        const accent = actAccent(act);
+        const pctSuffix = act.pct ? ' · ' + act.pct : '';
+        return {
+          icon: actIco(act), iconColor: !enabled ? '#5a5a60' : (accent || '#e5e5e5'),
+          title: a.title + pctSuffix,
+          titleStyle: { fontSize: '13.5px', fontWeight: 600, lineHeight: 1, color: !enabled ? '#6b6b70' : (accent || '#fafafa') },
+          pair: act.pair,
+          tradeRefLabel: act.tradeRef ? 'Trade ' + act.tradeRef : '',
+          tradeRefStyle: (enabled && act.tradeRef) ? { ...tradeRefBase, display: 'inline-flex', marginLeft: 'auto' } : hidden,
+          tradeRefOn: act.tradeRef ? () => this.goTrade(act.tradeRef) : null,
+          skippedStyle: !enabled ? { marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', fontSize: '10.5px', fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase', color: '#fbbf24', background: 'rgba(251,191,36,.13)', borderRadius: '5px', padding: '3px 8px' } : hidden,
+        };
+      });
+      return {
+        time: m.time, text: m.text,
+        countLabel: acts.length > 1 ? acts.length + ' actions' : '',
+        countStyle: acts.length > 1 ? { fontSize: '10.5px', fontWeight: 600, color: '#ff8a4d', background: 'rgba(255,106,31,.13)', borderRadius: '5px', padding: '2px 7px', letterSpacing: '.02em' } : hidden,
+        photoLabel: m.photoLabel || 'attached screenshot',
+        photoEl: m.img ? React.createElement('img', { src: m.img, alt: '', style: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' } }) : null,
+        photoStyle: m.photo ? { marginTop: '12px', height: '176px', width: '100%', maxWidth: '340px', borderRadius: '8px', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', border: m.img ? '1px solid rgba(255,255,255,.09)' : '1px dashed rgba(255,255,255,.1)', background: m.img ? '#0a0a0c' : 'repeating-linear-gradient(135deg,rgba(255,255,255,.02),rgba(255,255,255,.02) 8px,transparent 8px,transparent 16px)' } : hidden,
+        photoPhStyle: (m.photo && !m.img) ? { display: 'flex', alignItems: 'center', gap: '9px' } : hidden,
+        nodeIcon: !has ? '' : (single ? actIco(single) : 'layers'),
+        nodeIconColor: !enabled ? '#5a5a60' : ((single && single.type === 'open') ? dcol(single.dir) : '#e5e5e5'),
+        nodeTileStyle: has
+          ? { width: '32px', height: '32px', borderRadius: '9px', flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#161618', border: '1px solid rgba(255,255,255,.12)', position: 'relative', zIndex: 1 }
+          : { width: '32px', height: '32px', flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', position: 'relative', zIndex: 1 },
+        nodeIconStyle: has ? { display: 'inline-flex' } : hidden,
+        nodeDotStyle: has ? hidden : { display: 'block', width: '7px', height: '7px', borderRadius: '50%', background: '#3a3a40' },
+        actionRows,
+        resultStyle: has ? { display: 'flex', flexDirection: 'column', gap: '11px', marginTop: '13px', padding: '13px 14px', background: 'rgba(255,255,255,.03)', borderRadius: '9px' } : hidden,
+        summaryStyle: (has && isAi && m.summary) ? { display: 'flex', gap: '8px', alignItems: 'flex-start', paddingTop: '11px', borderTop: '1px solid rgba(255,255,255,.06)' } : hidden,
+        noteStyle: (!has && m.summary) ? { display: 'flex', gap: '8px', alignItems: 'flex-start', marginTop: '11px' } : hidden,
+        summaryText: m.summary || '',
+      };
+    };
+
+    const msgsA = [
+      { time: 'Today, 14:32', method: 'auto', photo: true, img: 'uploads/test/chart-btc.png', photoLabel: 'BTC chart · TradingView', text: '🚀 BTC/USDT LONG\nEntry: 62,400\nTP: 64,000 / 65,500\nSL: 61,500\nLeverage: 5x', actions: [{ type: 'open', dir: 'long', pair: 'BTCUSDT', tradeRef: '#TR-1042' }] },
+      { time: 'Today, 13:20', method: 'ai', summary: 'Booked 50% at TP1 (+2.4%), then closed the remainder at TP2 (+3.1%).', text: 'TP1 & TP2 both hit on BTC 🎯 closed 50% at 64,000 and the rest at 65,500. Clean trade!', actions: [{ type: 'partial_tp', dir: 'long', pair: 'BTCUSDT', pct: '50%', tradeRef: '#TR-1042' }, { type: 'close', dir: 'long', pair: 'BTCUSDT', tradeRef: '#TR-1042' }] },
+      { time: 'Today, 11:05', method: 'auto', text: 'ETH/USDT LONG from 3,180\nTargets 3,300 / 3,420\nStop 3,120', actions: [{ type: 'open', dir: 'long', pair: 'ETHUSDT', tradeRef: '#TR-1043' }] },
+      { time: 'Today, 10:40', method: 'ai', summary: 'Partially closed 30% of the ETH position to de-risk.', text: 'Taking some ETH off the table, closing 30% here.', actions: [{ type: 'partial_close', dir: 'long', pair: 'ETHUSDT', pct: '30%', tradeRef: '#TR-1043' }] },
+      { time: 'Today, 10:05', method: 'ai', summary: 'Opened two long scalps at once: SOL and AVAX, both targeting +6%.', text: 'Loading majors — LONG SOL @ 148 and AVAX @ 27, both targeting +6%.', actions: [{ type: 'open', dir: 'long', pair: 'SOLUSDT', tradeRef: '#TR-1044' }, { type: 'open', dir: 'long', pair: 'AVAXUSDT', tradeRef: '#TR-1045' }] },
+      { time: 'Today, 09:15', method: 'ai', photo: true, img: 'uploads/test/news.png', photoLabel: 'news screenshot', summary: 'Informational message — no trade signal.', text: 'Good morning! US inflation data drops at 15:30 today, trade carefully.', actions: [] },
+    ];
+    const msgsB = [
+      { time: 'Today, 15:10', method: 'auto', photo: true, img: 'uploads/test/chart-sol.png', photoLabel: 'SOL chart · 4H', text: 'SOL/USDT SHORT\nEntry: 148\nTP: 140 / 135\nSL: 152', actions: [{ type: 'open', dir: 'short', pair: 'SOLUSDT', tradeRef: '#TR-1051' }] },
+      { time: 'Today, 14:02', method: 'ai', summary: 'Watching XRP, no action required.', text: 'Large sell volume on XRP in the order book, watching, no entry yet.', actions: [] },
+      { time: 'Today, 12:30', method: 'ai', summary: 'Closed 50% of the SOL position at TP1 (+5.4%).', text: 'SOL hit 140 🎯 booking 50% profit here, stop to entry on the rest.', actions: [{ type: 'partial_tp', dir: 'short', pair: 'SOLUSDT', pct: '50%', tradeRef: '#TR-1051' }] },
+      { time: 'Today, 11:00', method: 'ai', summary: 'Closed the remaining SOL position (+4.0%).', text: 'Closing remaining SOL, target reached.', actions: [{ type: 'close', dir: 'short', pair: 'SOLUSDT', tradeRef: '#TR-1051' }] },
+    ];
+    const msgsC = [
+      { time: 'Today, 16:20', method: 'auto', text: 'DOGE/USDT LONG 0.1620\nQuick scalp, TP 0.1680, SL 0.1585', actions: [{ type: 'open', dir: 'long', pair: 'DOGEUSDT', tradeRef: '#TR-1060' }] },
+      { time: 'Today, 16:00', method: 'ai', photo: true, img: 'uploads/test/meme.png', photoLabel: 'meme image', summary: 'Motivational message, no trade signal.', text: 'Pumping today 🐕 stay tuned!', actions: [] },
+      { time: 'Today, 15:30', method: 'ai', summary: 'Partially closed 40% of the DOGE position.', text: 'Locking some gains, closing 40% of DOGE here.', actions: [{ type: 'partial_close', dir: 'long', pair: 'DOGEUSDT', pct: '40%', tradeRef: '#TR-1060' }] },
+    ];
+
+    const raw = [
+      { id: 'c1', name: 'Crypto Signals VIP', handle: '@crypto_vip', initial: 'C', winRate: '68%', status: 'Active', msgs: msgsA },
+      { id: 'c2', name: 'Whale Alerts', handle: '@whalealerts', initial: 'W', winRate: '61%', status: 'Active', msgs: msgsB },
+      { id: 'c3', name: 'Alpha Traders', handle: '@alpha_trade', initial: 'A', winRate: '72%', status: 'Active', msgs: msgsA },
+      { id: 'c4', name: 'Meme Coin Calls', handle: '@memecalls', initial: 'M', winRate: '44%', status: 'Paused', msgs: msgsC },
+      { id: 'c5', name: 'Futures Pro', handle: '@futures_pro', initial: 'F', winRate: '55%', status: 'Paused', msgs: msgsB },
+    ];
+    const countActions = (msgs) => msgs.reduce((n, m) => n + ((m.actions || []).length), 0);
+    const chIdByName = {}; raw.forEach(c => { chIdByName[c.name] = c.id; });
+    const posRaw = [
+      { symbol: 'BTCUSDT',  side: 'long',  size: '0.42 BTC',    entry: '62,400', mark: '63,180', liq: '58,900', lev: 5,  marginMode: 'Cross',    uPnl: 327.6, roi: '+6.2%',  tp: '65,500', sl: '61,500', margin: 5307, value: 26535, source: 'Crypto Signals VIP', tradeRef: '#TR-1042' },
+      { symbol: 'ETHUSDT',  side: 'long',  size: '8.5 ETH',     entry: '3,180',  mark: '3,242',  liq: '2,910',  lev: 5,  marginMode: 'Cross',    uPnl: 527,   roi: '+9.8%',  tp: '3,420',  sl: '3,120',  margin: 5406, value: 27030, source: 'Crypto Signals VIP', tradeRef: '#TR-1043' },
+      { symbol: 'SOLUSDT',  side: 'short', size: '120 SOL',     entry: '148.0',  mark: '143.2',  liq: '168.0',  lev: 10, marginMode: 'Isolated', uPnl: 576,   roi: '+32.4%', tp: '135.0',  sl: '152.0',  margin: 1776, value: 17184, source: 'Whale Alerts',      tradeRef: '#TR-1051' },
+      { symbol: 'AVAXUSDT', side: 'long',  size: '40 AVAX',     entry: '27.00',  mark: '26.40',  liq: '22.10',  lev: 5,  marginMode: 'Cross',    uPnl: -24,   roi: '-2.2%',  tp: '29.00',  sl: '25.50',  margin: 216,  value: 1056,  source: 'Crypto Signals VIP', tradeRef: '#TR-1045' },
+      { symbol: 'DOGEUSDT', side: 'long',  size: '15,000 DOGE', entry: '0.1620', mark: '0.1668', liq: '0.1280', lev: 8,  marginMode: 'Isolated', uPnl: 72,    roi: '+23.7%', tp: '0.1680', sl: '0.1590', margin: 304,  value: 2502,  source: 'Meme Coin Calls',    tradeRef: '#TR-1060' },
+      { symbol: 'XRPUSDT',  side: 'short', size: '3,000 XRP',   entry: '0.6200', mark: '0.6310', liq: '0.7100', lev: 6,  marginMode: 'Cross',    uPnl: -33,   roi: '-10.6%', tp: '0.5800', sl: '0.6500', margin: 310,  value: 1893,  source: 'Whale Alerts',      tradeRef: '#TR-1052' },
+      { symbol: 'LINKUSDT', side: 'long',  size: '200 LINK',    entry: '14.20',  mark: '14.55',  liq: '11.90',  lev: 5,  marginMode: 'Cross',    uPnl: 70,    roi: '+12.3%', tp: '15.50',  sl: '13.80',  margin: 568,  value: 2910,  source: 'Alpha Traders',      tradeRef: '#TR-1047' },
+    ];
+    const activeByChannel = {}; posRaw.forEach(p => { activeByChannel[p.source] = (activeByChannel[p.source] || 0) + 1; });
+
+    const channels = raw.map(c => {
+      const cset = this.state.settings[c.id] || { enabled: true, tradeSize: 0, maxLev: 0, cross: true };
+      const activePos = activeByChannel[c.name] || 0;
+      return {
+        initial: c.initial, name: c.name, handle: c.handle, winRate: c.winRate, status: c.status,
+        dotStyle: dot(c.status === 'Active'),
+        msgCount: c.msgs.length,
+        actionCount: countActions(c.msgs),
+        activePos: String(activePos),
+        activePosStyle: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: '22px', padding: '2px 8px', borderRadius: '5px', fontSize: '12px', fontWeight: 600, fontVariantNumeric: 'tabular-nums', background: activePos > 0 ? 'rgba(52,211,153,.13)' : 'rgba(255,255,255,.05)', color: activePos > 0 ? '#34d399' : '#5a5a60' },
+        copyLabel: cset.enabled ? 'On' : 'Off',
+        copyStyle: { display: 'inline-flex', alignItems: 'center', padding: '2px 9px', borderRadius: '5px', fontSize: '11px', fontWeight: 600, background: cset.enabled ? 'rgba(52,211,153,.13)' : 'rgba(255,255,255,.06)', color: cset.enabled ? '#34d399' : '#8a8a90' },
+        tradeSize: '$' + cset.tradeSize,
+        maxLev: cset.maxLev + 'x',
+        open: () => this.open(c.id),
+      };
+    });
+
+    const cur = raw.find(c => c.id === this.state.channelId) || raw[0];
+    const cs = this.state.settings[cur.id] || { enabled: true, tradeSize: 500, maxLev: 10, cross: true };
+    const messages = cur.msgs.map(m => mkMsg(m, cs.enabled));
+    const sel = {
+      initial: cur.initial, name: cur.name, handle: cur.handle, status: cur.status,
+      dotStyle: dot(cur.status === 'Active'), msgCount: cur.msgs.length, actionCount: countActions(cur.msgs),
+    };
+
+    // --- global actions (flattened: one row per action) ---
+    const { fAction, fDir, fQuery, fChannel } = this.state;
+    let rows = [];
+    raw.forEach(c => c.msgs.forEach(m => (m.actions || []).forEach(act => rows.push({ act, m, ch: c }))));
+    if (fChannel !== 'all') rows = rows.filter(r => r.ch.id === fChannel);
+    if (fAction !== 'all') rows = rows.filter(r => r.act.type === fAction);
+    if (fDir !== 'all') rows = rows.filter(r => r.act.dir === fDir);
+    if (fQuery && fQuery.trim()) { const q = fQuery.trim().toUpperCase(); rows = rows.filter(r => (r.act.pair || '').toUpperCase().includes(q)); }
+
+    const actions = rows.map(({ act, m, ch }) => {
+      const a = A[act.type]; const isAi = m.method === 'ai'; const isLong = act.dir === 'long';
+      const accent = actAccent(act);
+      const pctSuffix = act.pct ? ' · ' + act.pct : '';
+      return {
+        short: a.short, icon: actIco(act), iconColor: accent || '#e5e5e5',
+        shortStyle: { fontSize: '12.5px', fontWeight: 600, letterSpacing: '.02em', color: accent || '#fafafa' },
+        iconTileStyle: { width: '26px', height: '26px', borderRadius: '7px', flex: 'none', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(255,255,255,.05)' },
+        chInitial: ch.initial, chName: ch.name,
+        chTileStyle: { width: '24px', height: '24px', borderRadius: '6px', flex: 'none', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(255,255,255,.05)', fontSize: '11px', fontWeight: 600, color: '#a1a1aa' },
+        dirLabel: isLong ? 'LONG' : 'SHORT',
+        dirIcon: isLong ? 'trending-up' : 'trending-down',
+        dirColor: isLong ? '#34d399' : '#fb7185',
+        dirStyle: { display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, letterSpacing: '.02em', color: isLong ? '#34d399' : '#fb7185' },
+        dirTextStyle: { fontSize: '12.5px', fontWeight: 600, letterSpacing: '.02em', color: isLong ? '#34d399' : '#fb7185' },
+        actionPair: act.pair, detail: a.title + pctSuffix,
+        parseLabel: isAi ? 'AI parsing' : 'Auto parsing',
+        parseStyle: { fontSize: '12px', fontWeight: isAi ? 600 : 500, color: isAi ? '#ff8a4d' : '#8a8a90' },
+        tradeRefLabel: 'Trade ' + act.tradeRef,
+        tradeRefStyle: { ...tradeRefBase, display: 'inline-flex' },
+        tradeRefOn: () => this.goTrade(act.tradeRef),
+        channelOn: () => this.open(ch.id),
+        time: m.time,
+      };
+    });
+
+    // --- positions (Bybit /v5/position/list) ---
+    const money = (n) => '$' + Math.round(n).toLocaleString('en-US');
+    const signedMoney = (n) => (n >= 0 ? '+$' : '-$') + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const statVal = (c) => ({ fontSize: '22px', fontWeight: 700, letterSpacing: '-.02em', color: c });
+    let plist = posRaw.slice();
+    if (this.state.fPosChannel !== 'all') plist = plist.filter(p => p.source === this.state.fPosChannel);
+    if (this.state.fPosSide !== 'all') plist = plist.filter(p => p.side === this.state.fPosSide);
+    if (this.state.fPosMargin !== 'all') plist = plist.filter(p => p.marginMode.toLowerCase() === this.state.fPosMargin);
+    if (this.state.fPosQuery && this.state.fPosQuery.trim()) { const q = this.state.fPosQuery.trim().toUpperCase(); plist = plist.filter(p => (p.symbol + ' ' + p.source + ' ' + p.tradeRef).toUpperCase().includes(q)); }
+    const positions = plist.map(p => {
+      const long = p.side === 'long'; const pnlColor = p.uPnl >= 0 ? '#34d399' : '#fb7185';
+      return {
+        symbol: p.symbol, size: p.size, entry: p.entry, mark: p.mark, liq: p.liq,
+        dirLabel: long ? 'LONG' : 'SHORT', dirIcon: long ? 'trending-up' : 'trending-down', dirColor: long ? '#34d399' : '#fb7185',
+        dirStyle: { display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, letterSpacing: '.02em', color: long ? '#34d399' : '#fb7185' },
+        pnlStr: signedMoney(p.uPnl), roiStr: p.roi,
+        pnlStyle: { fontSize: '13px', fontWeight: 600, color: pnlColor, fontFamily: 'ui-monospace,Menlo,monospace' },
+        roiStyle: { fontSize: '11.5px', color: pnlColor, opacity: .8, fontFamily: 'ui-monospace,Menlo,monospace' },
+        tp: p.tp, sl: p.sl, lev: p.lev + 'x', marginMode: p.marginMode,
+        marginChipStyle: { fontSize: '10.5px', fontWeight: 600, color: '#8a8a90', background: 'rgba(255,255,255,.06)', borderRadius: '4px', padding: '1px 6px' },
+        source: p.source, tradeRef: p.tradeRef,
+        sourceOn: () => { const id = chIdByName[p.source]; if (id) this.open(id); },
+        tradeOn: () => this.setState({ fPosQuery: p.tradeRef }),
+      };
+    });
+    const totPnl = posRaw.reduce((a, p) => a + p.uPnl, 0);
+    const totVal = posRaw.reduce((a, p) => a + p.value, 0);
+    const totMargin = posRaw.reduce((a, p) => a + p.margin, 0);
+    const posStats = [
+      { label: 'Open positions', value: String(posRaw.length), sub: 'across all channels', valueStyle: statVal('#fafafa') },
+      { label: 'Unrealised PnL', value: signedMoney(totPnl), sub: 'live mark-to-market', valueStyle: statVal(totPnl >= 0 ? '#34d399' : '#fb7185') },
+      { label: 'Position value', value: money(totVal), sub: 'total notional', valueStyle: statVal('#fafafa') },
+      { label: 'Margin used', value: money(totMargin), sub: 'initial margin', valueStyle: statVal('#fafafa') },
+    ];
+    const posEmptyStyle = positions.length === 0 ? { padding: '32px 22px', textAlign: 'center', borderTop: '1px solid rgba(255,255,255,.06)' } : { display: 'none' };
+
+    const segBtn = (on) => ({
+      padding: '5px 13px', border: 'none', borderRadius: '6px', fontFamily: 'inherit', cursor: 'pointer',
+      fontSize: '12px', fontWeight: on ? 600 : 500,
+      background: on ? 'rgba(255,255,255,.09)' : 'transparent',
+      color: on ? '#fafafa' : '#8a8a90',
+    });
+    const mkOpts = (curVal, key, opts) => opts.map(o => ({ label: o[1], style: segBtn(curVal === o[0]), on: () => this.setState({ [key]: o[0] }) }));
+    const periodOpts = mkOpts(this.state.fPeriod, 'fPeriod', [['all', 'All'], ['today', 'Today'], ['7d', '7d'], ['30d', '30d']]);
+    const typeOpts = mkOpts(this.state.fAction, 'fAction', [['all', 'All'], ['open', 'Open'], ['close', 'Close'], ['partial_tp', 'Partial TP'], ['partial_close', 'Partial close']]);
+    const dirOpts = mkOpts(this.state.fDir, 'fDir', [['all', 'All'], ['long', 'LONG'], ['short', 'SHORT']]);
+    const channelOpts = mkOpts(this.state.fChannel, 'fChannel', [['all', 'All channels']].concat(raw.map(c => [c.id, c.name])));
+    const posSideOpts = mkOpts(this.state.fPosSide, 'fPosSide', [['all', 'All'], ['long', 'LONG'], ['short', 'SHORT']]);
+    const posMarginOpts = mkOpts(this.state.fPosMargin, 'fPosMargin', [['all', 'All'], ['cross', 'Cross'], ['isolated', 'Isolated']]);
+    const posChannelOpts = mkOpts(this.state.fPosChannel, 'fPosChannel', [['all', 'All channels']].concat(raw.map(c => [c.name, c.name])));
+
+    const navItem = (on) => ({
+      display: 'flex', alignItems: 'center', gap: '11px', width: '100%', padding: '9px 11px',
+      border: 'none', borderRadius: '7px', fontSize: '13.5px', fontFamily: 'inherit', cursor: 'pointer', textAlign: 'left',
+      background: on ? 'rgba(255,255,255,.06)' : 'transparent', color: on ? '#fafafa' : '#8a8a90', fontWeight: on ? 600 : 500,
+    });
+    const inChannels = this.state.view === 'channels' || this.state.view === 'channel';
+    const v = this.state.view;
+    const crumb = (label, onClick, current) => ({ label, onClick: onClick || null, style: { fontSize: '14px', fontWeight: current ? 600 : 500, color: current ? '#fafafa' : '#8a8a90', cursor: onClick ? 'pointer' : 'default', whiteSpace: 'nowrap' } });
+    let crumbs = v === 'channel' ? [crumb('Telegram Channels', () => this.goChannels(), false), crumb(cur.name, null, true)]
+      : v === 'actions' ? [crumb('Actions', null, true)]
+      : v === 'positions' ? [crumb('Positions', null, true)]
+      : [crumb('Telegram Channels', null, true)];
+    crumbs = crumbs.map((c, i) => ({ ...c, sepStyle: i === 0 ? hidden : { color: '#3a3a40', fontSize: '13px' } }));
+    const bnItem = (label, icon, active, on) => ({ label, icon, on, iconColor: active ? '#ff6a1f' : '#6b6b70', labelStyle: { fontSize: '10px', fontWeight: active ? 600 : 500, color: active ? '#ff6a1f' : '#6b6b70' } });
+    const bottomNav = [
+      bnItem('Channels', 'send', inChannels, () => this.goChannels()),
+      bnItem('Actions', 'activity', v === 'actions', () => this.goActions()),
+      bnItem('Positions', 'coins', v === 'positions', () => this.goPositions()),
+    ];
+    const tabStyle = (on) => ({ padding: '10px 16px', border: 'none', background: 'transparent', cursor: 'pointer', fontSize: '13.5px', fontFamily: 'inherit', marginBottom: '-1px', fontWeight: on ? 600 : 500, color: on ? '#fafafa' : '#6b6b70', borderBottom: on ? '2px solid #ff6a1f' : '2px solid transparent' });
+    const swTrack = (on) => ({ width: '42px', height: '24px', borderRadius: '12px', background: on ? '#ff6a1f' : 'rgba(255,255,255,.14)', position: 'relative', cursor: 'pointer', flex: 'none', transition: 'background .15s' });
+    const swKnob = (on) => ({ position: 'absolute', top: '3px', left: on ? '21px' : '3px', width: '18px', height: '18px', borderRadius: '50%', background: '#fff', transition: 'left .15s' });
+    const set = {
+      enabledTrack: swTrack(cs.enabled), enabledKnob: swKnob(cs.enabled), toggleEnabled: () => this.setSetting(cur.id, 'enabled', !cs.enabled),
+      crossTrack: swTrack(cs.cross), crossKnob: swKnob(cs.cross), toggleCross: () => this.setSetting(cur.id, 'cross', !cs.cross),
+      tradeSize: cs.tradeSize, maxLev: cs.maxLev,
+      onTradeSize: (e) => this.setSetting(cur.id, 'tradeSize', e.target.value),
+      onMaxLev: (e) => this.setSetting(cur.id, 'maxLev', e.target.value),
+      defLev: cs.defLev || '',
+      onDefLev: (e) => this.setSetting(cur.id, 'defLev', e.target.value),
+      onSave: () => this.saveSettings(),
+      savedStyle: this.state.savedFlash ? { display: 'inline-flex', alignItems: 'center', gap: '5px', fontSize: '12.5px', fontWeight: 600, color: '#34d399' } : { display: 'none' },
+    };
+
+    return {
+      isChannels: this.state.view === 'channels',
+      isChannel: this.state.view === 'channel',
+      isActions: this.state.view === 'actions',
+      pageTitle: this.state.view === 'channel' ? cur.name : (this.state.view === 'actions' ? 'Actions' : (this.state.view === 'positions' ? 'Positions' : 'Telegram Channels')),
+      channels, messages, sel, actions, crumbs, bottomNav,
+      isLogin: !this.state.authed, authed: this.state.authed,
+      loginUser: this.state.loginUser, loginPass: this.state.loginPass, loginErr: this.state.loginErr,
+      loginErrStyle: this.state.loginErr ? { display: 'block', fontSize: '12.5px', color: '#fb7185', margin: '0' } : { display: 'none' },
+      onLoginUser: (e) => this.setState({ loginUser: e.target.value }),
+      onLoginPass: (e) => this.setState({ loginPass: e.target.value }),
+      onPassKey: (e) => { if (e.key === 'Enter') this.login(); },
+      doLogin: () => this.login(),
+      logout: () => this.logout(),
+      isMsgTab: this.state.tab === 'messages', isSettingsTab: this.state.tab === 'settings',
+      msgTabStyle: tabStyle(this.state.tab === 'messages'), settingsTabStyle: tabStyle(this.state.tab === 'settings'),
+      tabMsgs: () => this.setTab('messages'), tabSettings: () => this.setTab('settings'), set,
+      isPositions: this.state.view === 'positions', positions, posStats, posSideOpts, posMarginOpts, posChannelOpts,
+      fPosQuery: this.state.fPosQuery, onPosQuery: (e) => this.setState({ fPosQuery: e.target.value }), posEmptyStyle,
+      goPositions: () => this.goPositions(),
+      navPositionsStyle: navItem(this.state.view === 'positions'),
+      navPositionsIcon: this.state.view === 'positions' ? '#ff6a1f' : '#6b6b70',
+      goChannels: () => this.goChannels(),
+      goActions: () => this.goActions(),
+      navChannelsStyle: navItem(inChannels),
+      navActionsStyle: navItem(this.state.view === 'actions'),
+      navChannelsIcon: inChannels ? '#ff6a1f' : '#6b6b70',
+      navActionsIcon: this.state.view === 'actions' ? '#ff6a1f' : '#6b6b70',
+      fQuery: this.state.fQuery,
+      onQuery: (e) => this.setState({ fQuery: e.target.value }),
+      periodOpts, typeOpts, dirOpts, channelOpts,
+      emptyStyle: actions.length === 0 ? { padding: '32px 22px', textAlign: 'center', borderTop: '1px solid rgba(255,255,255,.06)' } : { display: 'none' },
+    };
+  }
+}
+</script>
+</body>
+</html>

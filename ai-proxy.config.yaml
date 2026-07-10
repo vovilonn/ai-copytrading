@@ -1,0 +1,36 @@
+# Конфиг CLIProxyAPI (ai-proxy), монтируется в контейнер как /CLIProxyAPI/config.yaml.
+# Секретов здесь нет: пароль management API приходит из .env через переменную MANAGEMENT_PASSWORD.
+
+host: ''
+port: 8317
+
+# ВАЖНО: порт 8317 нельзя менять в отрыве от docker-compose.yml.
+# Callback-forwarder редиректит браузер на http://127.0.0.1:<port>/anthropic/callback,
+# поэтому порт на хосте обязан совпадать с этим значением.
+
+auth-dir: '/root/.cli-proxy-api'
+
+remote-management:
+  # Запросы с хоста приходят в контейнер с IP docker-шлюза, а не с 127.0.0.1,
+  # поэтому без allow-remote management API отдаёт 403. Порт 8317 при этом
+  # опубликован только на loopback хоста (см. docker-compose.yml).
+  allow-remote: true
+  # Пустой secret-key => аутентификация идёт по env MANAGEMENT_PASSWORD.
+  secret-key: ''
+  disable-control-panel: false
+
+# Прокси слушает только loopback хоста и внутреннюю сеть compose,
+# поэтому статические ключи для /v1 не заводим — клиенты ходят без Authorization.
+api-keys: []
+
+debug: false
+# Логи в stdout, а не в файл: тогда их видно через `pnpm ai-proxy:logs`,
+# а ротацией занимается docker.
+logging-to-file: false
+usage-statistics-enabled: false
+
+# Не переключаться на preview-модели при исчерпании квоты подписки —
+# пусть ошибка всплывает наверх, а не подменяется другой моделью.
+quota-exceeded:
+  switch-project: false
+  switch-preview-model: false

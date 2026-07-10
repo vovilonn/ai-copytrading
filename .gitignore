@@ -1,0 +1,6 @@
+.env
+temp/
+node_modules/
+
+# Runtime-состояние ai-proxy: OAuth-токены Claude и логи.
+.ai-proxy/
