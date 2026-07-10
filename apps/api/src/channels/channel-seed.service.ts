@@ -1,43 +1,39 @@
 import { Inject, Injectable, type OnModuleInit } from '@nestjs/common'
+import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
 import { DatabaseService } from '../db/database.service.js'
 
 /**
- * Дублирует apps/tg-ingest/src/sources.ts (id/key/topicId/adapterId) — оба сервиса сидируют
- * одни и те же 2 канала независимо друг от друга: api не имеет доступа к Telegram, чтобы
- * динамически резолвить title/handle, поэтому свой сид оставляет их null. ON CONFLICT(id) DO
- * NOTHING никогда не перезаписывает title/handle/ord, выставленные при первом реальном
- * коннекте tg-ingest, — порядок запуска сервисов не важен.
+ * Список каналов — единый источник CHANNEL_SOURCES (packages/shared/src/sources.ts), общий с
+ * apps/tg-ingest/src/ingest.service.ts. Оба сервиса сидируют одни и те же каналы независимо
+ * друг от друга: api не имеет доступа к Telegram, чтобы динамически резолвить title/handle,
+ * поэтому свой сид оставляет их null. ON CONFLICT(id) DO NOTHING никогда не перезаписывает
+ * title/handle/ord, выставленные при первом реальном коннекте tg-ingest, — порядок запуска
+ * сервисов не важен.
  */
-const CHANNEL_SEEDS = [
-  { id: 2088626562, key: 'ch-2088626562', topicId: null, adapterId: 'ch1-structured' },
-  { id: 1962583820, key: 'ch-1962583820-t173666', topicId: 173666, adapterId: 'ch2-freeform' },
-] as const
-
 @Injectable()
 export class ChannelSeedService implements OnModuleInit {
   constructor(@Inject(DatabaseService) private readonly database: DatabaseService) {}
 
   async onModuleInit(): Promise<void> {
-    let ord = 1
-    for (const seed of CHANNEL_SEEDS) {
-      await this.seedOne(seed, ord)
-      ord += 1
+    for (const source of CHANNEL_SOURCES) {
+      await this.seedOne(source)
     }
   }
 
-  private async seedOne(seed: (typeof CHANNEL_SEEDS)[number], ord: number): Promise<void> {
+  private async seedOne(source: ChannelSource): Promise<void> {
     const now = new Date()
     const db = this.database.db
+    const channelId = Number(source.channelId) // channels.id в БД — BIGINT, читается Kysely как number
 
     await db
       .insertInto('channels')
       .values({
-        id: seed.id,
-        ord,
-        key: seed.key,
-        source_kind: seed.topicId != null ? 'forum_topic' : 'channel',
-        topic_id: seed.topicId,
-        adapter_id: seed.adapterId,
+        id: channelId,
+        ord: source.ord,
+        key: source.key,
+        source_kind: source.sourceKind,
+        topic_id: source.topicId,
+        adapter_id: source.adapterId,
         title: null,
         handle: null,
         status: 'active',
@@ -54,7 +50,7 @@ export class ChannelSeedService implements OnModuleInit {
     await db
       .insertInto('channel_settings')
       .values({
-        channel_id: seed.id,
+        channel_id: channelId,
         enabled: false,
         trade_size: '500',
         max_leverage: '10',

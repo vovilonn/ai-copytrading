@@ -17,7 +17,7 @@ import { topicOf } from './topic-filter.js'
 import { AlbumBuffer, type AlbumMessage } from './album-buffer.js'
 import { pickMedia } from './media.js'
 import { saveMessage, advanceCursor, getCursor } from './repository.js'
-import { SOURCES, type Source } from './sources.js'
+import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
 
 // var/media лежит в корне репозитория, а не в apps/tg-ingest — путь считаем от расположения
 // этого модуля (устойчиво к тому, из какого cwd запущен процесс), как и scripts/tg-dump.mjs.
@@ -34,13 +34,13 @@ const BACKFILL_PAGE_SIZE = 200
 type ResolvedEntity = Api.User | Api.Chat | Api.Channel | Api.TypeUser | Api.TypeChat
 
 interface ResolvedSource {
-  source: Source
+  source: ChannelSource
   entity: ResolvedEntity
 }
 
 interface BufferedMessage extends AlbumMessage {
   raw: Api.Message
-  source: Source
+  source: ChannelSource
 }
 
 export interface ProbedMessage {
@@ -118,12 +118,10 @@ export class IngestService {
     // §10 / определение: перед getEntity(id) обязателен разовый getDialogs — иначе нет access_hash.
     await this.withFloodRetry('getDialogs', () => this.client.getDialogs({ limit: 500 }))
 
-    let ord = 1
-    for (const source of SOURCES) {
+    for (const source of CHANNEL_SOURCES) {
       const entity = await this.resolveEntity(source.channelId)
       this.resolved.set(source.channelId.toString(), { source, entity })
-      await this.seedChannel(source, entity, ord)
-      ord += 1
+      await this.seedChannel(source, entity)
     }
   }
 
@@ -144,7 +142,7 @@ export class IngestService {
   /** Бэкфилл на старте, после реконнекта и периодически — catchUp() в GramJS не восстанавливает
    *  пропущенные апдейты (§5), поэтому это единственный механизм догнать пропуски. */
   async backfillAll(): Promise<void> {
-    for (const source of SOURCES) {
+    for (const source of CHANNEL_SOURCES) {
       try {
         await this.backfillSource(source)
       } catch (err) {
@@ -156,7 +154,7 @@ export class IngestService {
   async start(): Promise<void> {
     await this.backfillAll()
 
-    const chats = SOURCES.map((s) => Number(s.channelId))
+    const chats = CHANNEL_SOURCES.map((s) => Number(s.channelId))
 
     const onIncoming = (event: NewMessageEvent | EditedMessageEvent): void => this.enqueue(event.message)
     this.client.addEventHandler(onIncoming, new NewMessage({ chats }))
@@ -206,7 +204,7 @@ export class IngestService {
     return Array.isArray(entity) ? entity[0]! : entity
   }
 
-  private async seedChannel(source: Source, entity: ResolvedEntity, ord: number): Promise<void> {
+  private async seedChannel(source: ChannelSource, entity: ResolvedEntity): Promise<void> {
     const channelId = Number(source.channelId)
     const title = entityTitle(entity)
     const handle = entityHandle(entity)
@@ -219,9 +217,9 @@ export class IngestService {
       .insertInto('channels')
       .values({
         id: channelId,
-        ord,
+        ord: source.ord,
         key: source.key,
-        source_kind: source.topicId != null ? 'forum_topic' : 'channel',
+        source_kind: source.sourceKind,
         topic_id: source.topicId,
         adapter_id: source.adapterId,
         title,
@@ -259,7 +257,7 @@ export class IngestService {
       .execute()
   }
 
-  private async backfillSource(source: Source): Promise<void> {
+  private async backfillSource(source: ChannelSource): Promise<void> {
     const resolvedSource = this.resolved.get(source.channelId.toString())
     if (!resolvedSource) return // connect() ещё не отработал — backfillAll вызывается только после него
 
@@ -290,7 +288,7 @@ export class IngestService {
   /** Общий вход для live (NewMessage/EditedMessage) и бэкфилла — единый путь склейки альбомов (§2). */
   private enqueue(msg: Api.Message): void {
     // ВАЖНО: msg.chatId — это "маркированный" id (utils.getPeerId с addMark=true даёт
-    // "-100<channelId>"), а не сырой channelId, которым ключуется this.resolved и SOURCES.
+    // "-100<channelId>"), а не сырой channelId, которым ключуется this.resolved и CHANNEL_SOURCES.
     // Сравнивать нужно через msg.peerId (сырой Api.PeerChannel.channelId) — иначе резолв
     // источника всегда промахивается, и enqueue тихо роняет каждое сообщение.
     const channelKey = msg.peerId instanceof Api.PeerChannel ? msg.peerId.channelId.toString() : null
@@ -366,7 +364,7 @@ export class IngestService {
   }
 
   private async persistMedia(
-    source: Source,
+    source: ChannelSource,
     messageRowId: string,
     msg: Api.Message,
     hint: NonNullable<ReturnType<typeof pickMedia>>,

@@ -8,6 +8,7 @@ import type { INestApplication } from '@nestjs/common'
 import type { Kysely } from 'kysely'
 import { resetTestSchema } from 'test-db'
 import type { ChannelDto, MessageDto } from 'shared/dto.js'
+import { CHANNEL_SOURCES } from 'shared/sources.js'
 import { createDb, type DB } from '../src/db/database.js'
 import { migrateToLatest } from '../src/db/migrate.js'
 import { createApp } from '../src/app.js'
@@ -22,11 +23,11 @@ const ADMIN_USERNAME = process.env.ADMIN_USERNAME!
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD!
 
 // Те же 2 канала, что сидирует ChannelSeedService при старте приложения (см.
-// apps/api/src/channels/channel-seed.ts) и apps/tg-ingest/src/sources.ts — фиксированные id
-// проекта, известные заранее (не dev-данные, поэтому хардкодить их в тесте нормально).
-const CHANNEL_1_ID = 2088626562
-const CHANNEL_1_KEY = 'ch-2088626562'
-const CHANNEL_2_KEY = 'ch-1962583820-t173666'
+// apps/api/src/channels/channel-seed.service.ts) и apps/tg-ingest/src/ingest.service.ts —
+// оба берут их из единого источника packages/shared/src/sources.ts.
+const CHANNEL_1_ID = Number(CHANNEL_SOURCES[0]!.channelId)
+const CHANNEL_1_KEY = CHANNEL_SOURCES[0]!.key
+const CHANNEL_2_KEY = CHANNEL_SOURCES[1]!.key
 
 let app: INestApplication
 let db: Kysely<DB>
