@@ -1,4 +1,4 @@
-import { Kysely, PostgresDialect } from 'kysely'
+import { Kysely, PostgresDialect, type Generated } from 'kysely'
 import pg from 'pg'
 
 // node-postgres по умолчанию отдаёт int8 строкой, чтобы не потерять точность.
@@ -38,7 +38,10 @@ export interface DB {
     updated_at: Date
   }
   messages: {
-    id: string
+    // Generated<T> — колонки с DEFAULT в схеме (001_initial.ts): при select приходят T,
+    // при insertInto(...).values(...) необязательны — иначе Kysely требует передавать их вручную
+    // и дублировать значение DEFAULT из миграции (впервые всплыло в repository.ts, задача 5).
+    id: Generated<string>
     channel_id: number
     tg_message_id: number
     topic_id: number | null
@@ -53,17 +56,17 @@ export interface DB {
     fwd_from: string | null
     views: number | null
     msg_ts: Date
-    edit_count: number
+    edit_count: Generated<number>
     edited_ts: Date | null
-    deleted: boolean
-    status: string
+    deleted: Generated<boolean>
+    status: Generated<string>
     status_reason: string | null
     method: string | null
     ai_summary: string | null
     raw: unknown
-    correlation_id: string
-    received_at: Date
-    updated_at: Date
+    correlation_id: Generated<string>
+    received_at: Generated<Date>
+    updated_at: Generated<Date>
   }
   message_media: {
     id: string

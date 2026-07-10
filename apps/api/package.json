@@ -2,6 +2,9 @@
   "name": "api",
   "private": true,
   "type": "module",
+  "exports": {
+    "./db/*": "./src/db/*"
+  },
   "scripts": {
     "migrate:up": "tsx src/db/migrate.ts up",
     "test": "vitest run",

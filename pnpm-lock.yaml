@@ -75,7 +75,23 @@ importers:
         version: 3.2.7(@types/node@26.1.1)(tsx@4.23.0)
 
   apps/tg-ingest:
+    dependencies:
+      api:
+        specifier: workspace:*
+        version: link:../api
+      kysely:
+        specifier: ^0.28.0
+        version: 0.28.17
+      telegram:
+        specifier: ^2.26.22
+        version: 2.26.22
     devDependencies:
+      big-integer:
+        specifier: ^1.6.52
+        version: 1.6.52
+      dotenv:
+        specifier: ^16.4.0
+        version: 16.6.1
       typescript:
         specifier: ^5.7.0
         version: 5.9.3

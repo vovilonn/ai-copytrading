@@ -6,7 +6,14 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "api": "workspace:*",
+    "kysely": "^0.28.0",
+    "telegram": "^2.26.22"
+  },
   "devDependencies": {
+    "big-integer": "^1.6.52",
+    "dotenv": "^16.4.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   }
