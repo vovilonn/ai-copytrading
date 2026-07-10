@@ -5,7 +5,7 @@ import type { ActionType, DeltaOp, Network, ParsedIntent, ParseContext, Side } f
 import { getAdapter } from './adapters/registry.js'
 import { normalize } from './normalize.js'
 import { resolveSymbol } from './symbol-resolver.js'
-import { computeLeverage, floorTo } from './risk/leverage.js'
+import { computeLeverage, floorTo, liqPrice } from './risk/leverage.js'
 import { computeSize } from './risk/sizing.js'
 import { acquireSymbol, addLeg, closeTrade, openTrade } from './state/trades.js'
 import type { ExecutionPort, OrderContext } from './execution/port.js'
@@ -14,12 +14,20 @@ import { reconcile } from './reconciler.js'
 
 /**
  * Пайплайн разбора и исполнения одного сообщения (design spec §6, task-7-brief.md):
- * normalize → adapter.parse → reconcile → (на каждый intent) risk → ExecutionPort. Одна
+ * adapter.parse(сырой текст) → reconcile → (на каждый intent) risk → ExecutionPort. Одна
  * транзакция на сообщение — либо весь эффект (parse_results/actions/trades/orders/positions/
  * domain_events) коммитится целиком, либо ничего (крэш посреди обработки не оставляет "половину"
  * сделки в БД). NOTIFY по domain_events шлётся СТРОГО после коммита (тот же приём, что и
  * apps/tg-ingest/src/ingest.service.ts — иначе слушатель получит уведомление раньше, чем
  * увидит строку своим собственным SELECT).
+ *
+ * normalize() здесь считается ОТДЕЛЬНО и пишется в messages.normalized_text (см. ниже) —
+ * это ДИАГНОСТИЧЕСКОЕ поле для отладки/UI, а не вход парсера: adapter.parse(ctx) получает
+ * СЫРОЙ message.text (buildParseContext/toParseContextMessage ниже кладут row.text как есть).
+ * Так и должно быть — regex CH1 (ch1.adapter.ts) требуют исходный регистр `#TICKER/USDT`,
+ * а normalize() лоуэркейсит текст целиком; примени её к парсингу — и CH1 перестанет матчить
+ * собственные сигналы. Нормализация текста под парсинг — забота КОНКРЕТНОГО адаптера (CH2 в
+ * Ф2 применит её сам к своему свободному тексту), не общего шага ядра.
  */
 
 export interface PipelineMessage {
@@ -124,8 +132,13 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
 
     // decision.outcome === 'executing'
     const base: IntentBase = { message, channel, settings, instruments, deps }
+    // Гейт "Copy trading" (channel_settings.enabled, DEFAULT false — design spec: "off → каждый
+    // action Skipped, ордера не отправляются"). Сообщение по-прежнему парсится и actions
+    // пишутся (нужны UI/таймлайну), но ни один intent НЕ доходит до handleEntrySignal/handleDelta —
+    // ExecutionPort не вызывается, символ не захватывается, trade/position не создаются.
+    const copySkipReason = settings.enabled === false ? 'copy_disabled' : undefined
     for (const { actionIndex, intent } of decision.decided) {
-      const emitted = await processIntent(trx, base, actionIndex, intent)
+      const emitted = await processIntent(trx, base, actionIndex, intent, copySkipReason)
       if (emitted) notifyNeeded = true
     }
 
@@ -336,9 +349,18 @@ function intentParams(intent: ParsedIntent): unknown {
  * Обрабатывает один канонический intent (actionIndex уже назначен reconciler'ом). Идемпотентно:
  * если actions-строка для (message_id, actionIndex) уже существует — предыдущий прогон уже
  * довёл её до терминального состояния, повторно ничего не делаем (не плодим вторую trade/order).
+ * @param forceSkipReason Если задан (channel_settings.enabled===false, см. processMessage) —
+ *   intent НЕ передаётся в handleEntrySignal/handleDelta вовсе: action сразу помечается skipped
+ *   с этой причиной, ExecutionPort не вызывается и символ не захватывается.
  * @returns true, если был опубликован хотя бы один domain_events (нужно ли слать pg_notify).
  */
-async function processIntent(trx: Kysely<DB>, base: IntentBase, actionIndex: number, intent: ParsedIntent): Promise<boolean> {
+async function processIntent(
+  trx: Kysely<DB>,
+  base: IntentBase,
+  actionIndex: number,
+  intent: ParsedIntent,
+  forceSkipReason?: string,
+): Promise<boolean> {
   const existing = await trx
     .selectFrom('actions')
     .select('id')
@@ -367,19 +389,25 @@ async function processIntent(trx: Kysely<DB>, base: IntentBase, actionIndex: num
   const actionId = inserted.id
 
   let result: HandlerResult
-  switch (intent.kind) {
-    case 'entry_signal':
-      result = await handleEntrySignal(trx, base, actionIndex, actionId, intent)
-      break
-    case 'delta':
-      result = await handleDelta(trx, base, actionIndex, actionId, intent)
-      break
-    default:
-      // 'add'/'limit_entry'/'market_entry' — типы CH2/Ф2 (AI). Ни один Ф1-адаптер их не
-      // производит (ch1.adapter.ts даёт только entry_signal/delta; ch2Stub — всегда route='ai'
-      // с пустыми intents), поэтому ветка ниже сейчас недостижима, но исчерпывающий switch
-      // (strict TS) требует явного решения на будущее — needs_review, а не молчаливый крэш.
-      result = { skipReason: 'not_implemented_phase1' }
+  if (forceSkipReason) {
+    // channel_settings.enabled===false — не заходим ни в один хендлер вовсе (см. processMessage):
+    // ExecutionPort не вызывается, символ не захватывается, trade/position не создаются.
+    result = { skipReason: forceSkipReason }
+  } else {
+    switch (intent.kind) {
+      case 'entry_signal':
+        result = await handleEntrySignal(trx, base, actionIndex, actionId, intent)
+        break
+      case 'delta':
+        result = await handleDelta(trx, base, actionIndex, actionId, intent)
+        break
+      default:
+        // 'add'/'limit_entry'/'market_entry' — типы CH2/Ф2 (AI). Ни один Ф1-адаптер их не
+        // производит (ch1.adapter.ts даёт только entry_signal/delta; ch2Stub — всегда route='ai'
+        // с пустыми intents), поэтому ветка ниже сейчас недостижима, но исчерпывающий switch
+        // (strict TS) требует явного решения на будущее — needs_review, а не молчаливый крэш.
+        result = { skipReason: 'not_implemented_phase1' }
+    }
   }
 
   const now = new Date()
@@ -503,6 +531,40 @@ function splitQtyEvenly(total: Decimal, n: number, qtyStep: string): Decimal[] {
   return [...shares, last]
 }
 
+/**
+ * Строит цели TP-лесенки, отбрасывая доли, которые floor_to(qtyStep, ...) округлил до нуля
+ * (Minor #4 адверсариального ревью): при `total/n < qtyStep` splitQtyEvenly отдаёт нулевые
+ * доли для первых n-1 целей — без фильтра это были бы мусорные orders-строки с qty='0'.
+ * Если ВСЕ доли обнулились (сама позиция меньше qtyStep·n) — не оставляем сделку вовсе без
+ * выхода: кладём весь объём в ПОСЛЕДНЮЮ цель лесенки одним TP-ордером (лог — для наблюдаемости,
+ * это осознанное отклонение от "равных долей", а не баг). `total` здесь всегда > 0 — это уже
+ * sizeResult.qty, гарантированно не-zero_qty (computeSize сам скипнул бы zero_qty раньше).
+ */
+function buildTpTargets(
+  total: Decimal,
+  tps: readonly number[],
+  qtyStep: string,
+): { price: string; qty: string; index: number }[] {
+  const n = tps.length
+  if (n === 0) return []
+
+  const qtys = splitQtyEvenly(total, n, qtyStep)
+  const nonZero = tps
+    .map((price, index) => ({ price: price.toString(), qty: (qtys[index] ?? new Decimal(0)).toString(), index }))
+    .filter((t) => !new Decimal(t.qty).isZero())
+  if (nonZero.length > 0) return nonZero
+
+  const lastIndex = n - 1
+  const lastPrice = tps[lastIndex]
+  if (lastPrice === undefined) return [] // n===0 уже отсечено выше — сюда не попасть, defensive
+
+  console.warn(
+    `[pipeline] TP-лесенка из ${n} целей схлопнута в один TP: qty=${total.toString()} < qtyStep=${qtyStep} · ${n} — ` +
+      `равными долями раздать нечего, весь объём уходит в последнюю цель (${lastPrice}).`,
+  )
+  return [{ price: lastPrice.toString(), qty: total.toString(), index: lastIndex }]
+}
+
 async function handleEntrySignal(
   trx: Kysely<DB>,
   base: IntentBase,
@@ -533,11 +595,16 @@ async function handleEntrySignal(
   // Вход диапазоном без живого тикер-фида (задача 10 — Ф1 его не подключает) — берём середину
   // диапазона как цену симулированного market-филла (research: "entry для лимитки — цена
   // лимитки, для market — текущая цена"; тот же 1.5004 для LIT 2796, что и в sizing.test.ts).
-  const entryPrice = Array.isArray(intent.entry) ? (intent.entry[0] + intent.entry[1]) / 2 : intent.entry
+  // Decimal, а НЕ JS-float (Minor #3 адверсариального ревью, CLAUDE.md: "деньги — Decimal/строки")
+  // — это единственная денежная величина ядра, которая считалась во float, до этого исправления.
+  const entryPrice = Array.isArray(intent.entry)
+    ? new Decimal(intent.entry[0]).plus(intent.entry[1]).div(2)
+    : new Decimal(intent.entry)
+  const sl = new Decimal(intent.sl)
 
   const leverage = computeLeverage({
     entry: entryPrice.toString(),
-    sl: intent.sl.toString(),
+    sl: sl.toString(),
     side: intent.side,
     mmr: instrument.mmr,
     channelMaxLev: base.settings.max_leverage,
@@ -545,12 +612,35 @@ async function handleEntrySignal(
     leverageStep: instrument.leverageStep,
   })
 
+  // Важный денежный инвариант (Important #1 адверсариального ревью): SL обязан оставаться
+  // ЗА ценой ликвидации на выбранном плече, иначе позицию ликвидирует раньше, чем сработает
+  // пользовательский стоп. Парсер (ch1.adapter.ts) не проверяет ни сторону, ни дистанцию SL —
+  // валидируем здесь, на пороге открытия позиции, ДО burn'а human_ref/символа/ордеров.
+  //
+  // 1) Сторона SL: long требует sl < entry, short — sl > entry. Ловит, например, вход
+  //    "long entry=100 sl=200" (SL выше входа для лонга — физически не стоп, а профит).
+  const invalidSide = intent.side === 'long' ? sl.gte(entryPrice) : sl.lte(entryPrice)
+  if (invalidSide) return { skipReason: 'invalid_sl_side' }
+
+  // 2) Безопасность: даже при корректной стороне SL может быть настолько далёк от входа
+  //    (d = |entry-sl|/entry ≥ ~0.995), что computeLeverage клампит плечо к 1x (нижняя
+  //    граница, ниже физически не опуститься) — и цена ликвидации на этом 1x оказывается
+  //    ХУЖЕ (ближе ко входу), чем сам SL: "long entry=100 sl=0.4 -> lev=1, liq=0.5 > sl=0.4"
+  //    (ликвидация ВЫШЕ стопа для лонга — сработает раньше). Проверяем с небольшим буфером
+  //    0.1%, а не впритык — запас на округление/комиссии/проскальзывание.
+  const projectedLiq = liqPrice({ entry: entryPrice, side: intent.side, lev: leverage, mmr: instrument.mmr })
+  const SAFE_STOP_BUFFER = '0.001'
+  const buf = new Decimal(SAFE_STOP_BUFFER)
+  const safeStop =
+    intent.side === 'long' ? projectedLiq.mul(new Decimal(1).plus(buf)).lt(sl) : projectedLiq.mul(new Decimal(1).minus(buf)).gt(sl)
+  if (!safeStop) return { skipReason: 'unsafe_stop' }
+
   const sizeResult = computeSize({
     ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct.toString() } : {}),
     equity: base.deps.equity,
     tradeSize: base.settings.trade_size,
     entry: entryPrice.toString(),
-    sl: intent.sl.toString(),
+    sl: sl.toString(),
     lev: leverage,
     minNotional: instrument.minNotional,
     ...(base.settings.max_symbol_notional !== null ? { maxSymbolNotional: base.settings.max_symbol_notional } : {}),
@@ -596,14 +686,13 @@ async function handleEntrySignal(
   })
 
   if (intent.tps.length > 0) {
-    const tpQtys = splitQtyEvenly(sizeResult.qty, intent.tps.length, instrument.qtyStep)
-    await base.deps.executionPort.placeTpLadder(trx, {
-      ...orderCtx,
-      tps: intent.tps.map((price, index) => ({ price: price.toString(), qty: (tpQtys[index] ?? new Decimal(0)).toString(), index })),
-    })
+    const tpTargets = buildTpTargets(sizeResult.qty, intent.tps, instrument.qtyStep)
+    if (tpTargets.length > 0) {
+      await base.deps.executionPort.placeTpLadder(trx, { ...orderCtx, tps: tpTargets })
+    }
   }
 
-  await base.deps.executionPort.setStopLoss(trx, { ...orderCtx, price: intent.sl.toString(), qty: sizeResult.qty.toString() })
+  await base.deps.executionPort.setStopLoss(trx, { ...orderCtx, price: sl.toString(), qty: sizeResult.qty.toString() })
 
   const now = new Date()
   await trx
