@@ -1,5 +1,6 @@
 import { Inject, Injectable, type OnModuleInit } from '@nestjs/common'
 import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
+import { DEFAULT_CHANNEL_SETTINGS } from 'shared/channel-settings.js'
 import { DatabaseService } from '../db/database.service.js'
 
 /**
@@ -51,17 +52,7 @@ export class ChannelSeedService implements OnModuleInit {
       .insertInto('channel_settings')
       .values({
         channel_id: channelId,
-        enabled: false,
-        trade_size: '500',
-        max_leverage: '10',
-        default_leverage: null,
-        cross_margin: true,
-        no_sl_policy: 'attach_protective_sl',
-        no_sl_buffer_sec: 0,
-        add_sizing_mode: 'trade_size',
-        max_symbol_notional: null,
-        mirror_manual_fraction: false,
-        limit_ttl_sec: 604_800,
+        ...DEFAULT_CHANNEL_SETTINGS,
         updated_at: now,
       })
       // Не затираем настройки, выставленные оператором из админки после старта.

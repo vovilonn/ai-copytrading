@@ -2,8 +2,8 @@ import { Inject, Logger } from '@nestjs/common'
 import {
   ConnectedSocket,
   MessageBody,
-  OnGatewayConnection,
   OnGatewayDisconnect,
+  OnGatewayInit,
   SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
@@ -47,7 +47,7 @@ function readCookie(header: string | undefined, name: string): string | undefine
 @WebSocketGateway({
   cors: { origin: DEV_ORIGIN, credentials: true },
 })
-export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class RealtimeGateway implements OnGatewayInit, OnGatewayDisconnect {
   private readonly logger = new Logger(RealtimeGateway.name)
 
   @WebSocketServer()
@@ -56,21 +56,27 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   // Явный @Inject — см. комментарий в auth.service.ts про design:paramtypes под vitest/esbuild.
   constructor(@Inject(AuthService) private readonly auth: AuthService) {}
 
-  /** Тот же код проверки JWT, что и JwtGuard (AuthService.verifyToken) — невалидная/отсутствующая
-   *  кука обрывает соединение сразу, без единого события клиенту, кроме disconnect. */
-  async handleConnection(socket: Socket): Promise<void> {
-    const token = readCookie(socket.handshake.headers.cookie, SESSION_COOKIE)
-    if (!token) {
-      socket.disconnect(true)
-      return
-    }
+  /** Проверка куки/JWT перенесена в middleware хендшейка (io.use): раньше она жила в
+   *  handleConnection и выполнялась уже ПОСЛЕ установления соединения — окно TOCTOU, в котором
+   *  @SubscribeMessage('channel.subscribe') формально активен до socket.disconnect(true).
+   *  next(new Error(...)) в middleware не даёт соединению установиться вовсе — обработчики
+   *  сообщений сокета для неаутентифицированного клиента никогда не регистрируются. */
+  afterInit(server: Server<ClientToServerEvents, ServerToClientEvents>): void {
+    server.use((socket, next) => {
+      const token = readCookie(socket.handshake.headers.cookie, SESSION_COOKIE)
+      if (!token) {
+        next(new Error('unauthorized'))
+        return
+      }
 
-    try {
-      await this.auth.verifyToken(token)
-    } catch {
-      // Просроченный/подделанный токен — тот же исход, что и отсутствие куки (см. JwtGuard).
-      socket.disconnect(true)
-    }
+      this.auth
+        .verifyToken(token)
+        .then(() => next())
+        .catch(() => {
+          // Просроченный/подделанный токен — тот же исход, что и отсутствие куки (см. JwtGuard).
+          next(new Error('unauthorized'))
+        })
+    })
   }
 
   handleDisconnect(): void {

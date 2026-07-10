@@ -62,12 +62,15 @@ afterAll(async () => {
 })
 
 describe('realtime gateway', () => {
-  it('без куки — сервер разрывает соединение', async () => {
+  it('без куки — сервер отклоняет соединение на хендшейке', async () => {
     const socket = io(baseUrl, { transports: ['websocket'], reconnection: false, forceNew: true })
     try {
-      // Сервер обязан сам разорвать сокет в handleConnection — ждём именно disconnect,
-      // а не просто отсутствие события (иначе тест был бы зелёным и без гварда вовсе).
-      await waitForEvent(socket, 'disconnect', 10_000)
+      // Проверка куки перенесена в middleware хендшейка (io.use, см. realtime.gateway.ts) — сервер
+      // теперь обрывает попытку ДО того, как соединение успевает установиться, поэтому клиент
+      // получает connect_error, а не connect + disconnect (последнего в этом сценарии больше не
+      // бывает вовсе). Ждём именно connect_error — не просто отсутствие события (иначе тест был бы
+      // зелёным и без guard'а вовсе).
+      await waitForEvent(socket, 'connect_error', 10_000)
     } finally {
       socket.close()
     }

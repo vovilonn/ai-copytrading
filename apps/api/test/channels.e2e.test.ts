@@ -285,4 +285,68 @@ describe('GET /media/:id', () => {
   it('некорректный (не-UUID) id -> 404, а не 500', async () => {
     await agent.get('/api/media/not-a-uuid').expect(404)
   })
+
+  // Path traversal (защита в глубину, финальное ревью): storage_path пишет только воркер
+  // константными путями, но если в колонке однажды окажется значение с "..", контроллер не должен
+  // отдавать файл наружу файловой системы репозитория.
+  it('storage_path с "../../etc/passwd" -> 404, а не содержимое файла вне var/media', async () => {
+    const row = await db
+      .insertInto('message_media')
+      .values({
+        id: crypto.randomUUID(),
+        message_id: (
+          await db
+            .selectFrom('messages')
+            .select('id')
+            .where('channel_id', '=', CHANNEL_1_ID)
+            .where('tg_message_id', '=', 1001)
+            .executeTakeFirstOrThrow()
+        ).id,
+        tg_message_id: 1001,
+        grouped_id: null,
+        order_index: 1,
+        storage_path: '../../etc/passwd',
+        media_type: 'image/jpeg',
+        width: null,
+        height: null,
+        bytes: null,
+        sha256: null,
+        created_at: new Date(),
+      })
+      .returning('id')
+      .executeTakeFirstOrThrow()
+
+    await agent.get(`/api/media/${row.id}`).expect(404)
+  })
+
+  // Абсолютный storage_path тоже не должен отдаваться как есть (см. media.controller.ts).
+  it('storage_path = "/etc/passwd" (абсолютный) -> 404', async () => {
+    const row = await db
+      .insertInto('message_media')
+      .values({
+        id: crypto.randomUUID(),
+        message_id: (
+          await db
+            .selectFrom('messages')
+            .select('id')
+            .where('channel_id', '=', CHANNEL_1_ID)
+            .where('tg_message_id', '=', 1001)
+            .executeTakeFirstOrThrow()
+        ).id,
+        tg_message_id: 1001,
+        grouped_id: null,
+        order_index: 2,
+        storage_path: '/etc/passwd',
+        media_type: 'image/jpeg',
+        width: null,
+        height: null,
+        bytes: null,
+        sha256: null,
+        created_at: new Date(),
+      })
+      .returning('id')
+      .executeTakeFirstOrThrow()
+
+    await agent.get(`/api/media/${row.id}`).expect(404)
+  })
 })

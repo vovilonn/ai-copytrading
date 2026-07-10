@@ -28,6 +28,7 @@ import { MediaRepairService, type MediaFetcher, type DownloadedMediaResult } fro
 import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
 import type { MessageNewPayload } from 'shared/ws-events.js'
 import { mediaUrl } from 'shared/media.js'
+import { DEFAULT_CHANNEL_SETTINGS } from 'shared/channel-settings.js'
 
 // var/media лежит в корне репозитория, а не в apps/tg-ingest — путь считаем от расположения
 // этого модуля (устойчиво к тому, из какого cwd запущен процесс), как и scripts/tg-dump.mjs.
@@ -289,17 +290,7 @@ export class IngestService {
       .insertInto('channel_settings')
       .values({
         channel_id: channelId,
-        enabled: false,
-        trade_size: '500',
-        max_leverage: '10',
-        default_leverage: null,
-        cross_margin: true,
-        no_sl_policy: 'attach_protective_sl',
-        no_sl_buffer_sec: 0,
-        add_sizing_mode: 'trade_size',
-        max_symbol_notional: null,
-        mirror_manual_fraction: false,
-        limit_ttl_sec: 604_800,
+        ...DEFAULT_CHANNEL_SETTINGS,
         updated_at: new Date(),
       })
       // Сид не должен затирать настройки, выставленные оператором из админки после старта.

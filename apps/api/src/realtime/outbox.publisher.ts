@@ -106,30 +106,45 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
     if (this.draining) return
     this.draining = true
     try {
-      for (;;) {
-        const rows = await this.database.db
-          .selectFrom('domain_events')
-          .selectAll()
-          .where('published_at', 'is', null)
-          .orderBy('id', 'asc')
-          .limit(BATCH_SIZE)
-          .execute()
-        if (rows.length === 0) break
+      let batchSize = 0
+      do {
+        // FOR UPDATE SKIP LOCKED + выборка и UPDATE published_at в одной транзакции: `draining`
+        // защищает только от гонки внутри одного процесса api, а при двух репликах api независимый
+        // `draining` каждой не спасает — обе выберут одни и те же строки с published_at IS NULL и
+        // разошлют дубли клиентам. SKIP LOCKED отдаёт реплике только строки, не залоченные другой
+        // (та просто пропускает их и заберёт следующим тиком), а транзакция гарантирует, что между
+        // SELECT ... FOR UPDATE и UPDATE published_at строку не перехватит третий конкурент.
+        batchSize = await this.database.db.transaction().execute(async (trx) => {
+          const rows = await trx
+            .selectFrom('domain_events')
+            .selectAll()
+            .where('published_at', 'is', null)
+            .orderBy('id', 'asc')
+            .limit(BATCH_SIZE)
+            .forUpdate()
+            .skipLocked()
+            .execute()
+          if (rows.length === 0) return 0
 
-        for (const row of rows) this.publishRow(row)
+          // Рассылаем до коммита UPDATE published_at — так же, как раньше вне транзакции (см.
+          // комментарий про outbox-инвариант в realtime.e2e.test.ts, task-9-brief §3): при крэше
+          // между emit и коммитом клиент в худшем случае получит дубль на следующем тике опроса,
+          // а не потеряет событие навсегда, если бы published_at успел закоммититься раньше рассылки.
+          for (const row of rows) this.publishRow(row)
 
-        await this.database.db
-          .updateTable('domain_events')
-          .set({ published_at: new Date() })
-          .where(
-            'id',
-            'in',
-            rows.map((r) => r.id),
-          )
-          .execute()
+          await trx
+            .updateTable('domain_events')
+            .set({ published_at: new Date() })
+            .where(
+              'id',
+              'in',
+              rows.map((r) => r.id),
+            )
+            .execute()
 
-        if (rows.length < BATCH_SIZE) break
-      }
+          return rows.length
+        })
+      } while (batchSize === BATCH_SIZE)
     } finally {
       this.draining = false
     }
