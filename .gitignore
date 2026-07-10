@@ -4,3 +4,5 @@ node_modules/
 
 # Runtime-состояние ai-proxy: OAuth-токены Claude и логи.
 .ai-proxy/
+# Рабочие файлы subagent-driven-development
+.superpowers/

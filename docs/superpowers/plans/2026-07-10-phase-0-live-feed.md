@@ -15,7 +15,9 @@
 
 - Node `>=22`, packageManager `pnpm@10.28.1`.
 - Все деньги, цены и количества в БД — `NUMERIC`, никогда `float`/`double precision`.
-- Порт `8317` занят `ai-proxy` и не переназначается. `api` слушает `3000`, `web` — `5173`, Postgres — `5432`.
+- Порт `8317` занят `ai-proxy` и не переназначается. `api` слушает `3000`, `web` — `5173`.
+  Postgres опубликован на `POSTGRES_PORT` (по умолчанию **5442**, а не 5432: на хосте 5432
+  занят postgres другого проекта).
 - Команды запускаются **из корня репозитория**: внутри `ai-proxy/` лежит свой `docker-compose.yml`, а compose ищет файл вверх по дереву.
 - `tg-ingest` работает **ровно в одной реплике**. Две сессии с одним auth-key дают потерю апдейтов и `AUTH_KEY_DUPLICATED`.
 - Порядок обработки сообщений — по `message.id`, никогда по `date`.
@@ -335,6 +337,12 @@ Expected: FAIL — модуль `../src/db/database.js` не найден.
 ```ts
 import { Kysely, PostgresDialect } from 'kysely'
 import pg from 'pg'
+
+// node-postgres по умолчанию отдаёт int8 строкой, чтобы не потерять точность.
+// Все наши BIGINT (id каналов и сообщений Telegram, счётчик событий) заведомо
+// меньше Number.MAX_SAFE_INTEGER, поэтому читаем их числом — иначе типы DB лгут,
+// и сравнения вида channel.id === 123 молча ломаются.
+pg.types.setTypeParser(pg.types.builtins.INT8, (value) => Number(value))
 
 // NUMERIC приходит строкой — оставляем строкой и парсим Decimal'ом в домене,
 // иначе теряем точность на ценах.
