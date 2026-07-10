@@ -1,0 +1,133 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Шрифт лежит в apps/web/public/fonts (скопирован из design/project/uploads/Exo_2),
+   font-weight:100 900 — variable font, один файл покрывает весь диапазон начертаний. */
+@font-face {
+  font-family: 'Exo 2';
+  src: url('/fonts/Exo2-VariableFont_wght.ttf') format('truetype');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Exo 2';
+  src: url('/fonts/Exo2-Italic-VariableFont_wght.ttf') format('truetype');
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: dark;
+
+  /* Дизайн-токены — дословно из таблицы в брифе задач 10/11 и Admin.dc.html:12-21. */
+  --color-bg: #000000;
+  --color-card: #0d0d0f;
+  --color-border-card: rgba(255, 255, 255, 0.07);
+  --color-border-row: rgba(255, 255, 255, 0.06);
+  --color-accent: #ff6a1f;
+  --color-accent-hover: #ff8a4d;
+  --color-fg: #fafafa;
+  --color-message: #e4e4e7;
+  --color-secondary-1: #c9c9cf;
+  --color-secondary-2: #a1a1aa;
+  --color-secondary-3: #8a8a90;
+  --color-muted-1: #6b6b70;
+  --color-muted-2: #5a5a60;
+  --color-muted-3: #4a4a50;
+  --color-long: #34d399;
+  --color-short: #fb7185;
+  --color-skipped: #fbbf24;
+  --color-skipped-bg: rgba(251, 191, 36, 0.13);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  font-family:
+    'Exo 2',
+    system-ui,
+    -apple-system,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  color: #f5f5f5;
+}
+
+a {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--color-accent-hover);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  border: 2px solid #000;
+}
+::selection {
+  background: rgba(255, 106, 31, 0.3);
+}
+
+/* Медиазапросы 1 к 1 из Admin.dc.html:22-39 — брейкпоинты сайдбара/нижней навигации
+   и адаптивных фильтров привязаны к data-m атрибутам на реальных элементах разметки. */
+@media (max-width: 820px) {
+  [data-m='sidebar'] {
+    display: none !important;
+  }
+  [data-m='bottomnav'] {
+    display: flex !important;
+  }
+  [data-m='main'] {
+    padding: 18px 14px 92px !important;
+  }
+  [data-m='topbar'] {
+    padding: 0 14px !important;
+    gap: 10px !important;
+  }
+  [data-m='tablecard'] {
+    overflow-x: auto !important;
+  }
+}
+@media (max-width: 480px) {
+  [data-m='parsertext'] {
+    display: none !important;
+  }
+  [data-m='main'] {
+    padding: 15px 11px 92px !important;
+  }
+}
+@media (max-width: 640px) {
+  [data-m='filters'] > div {
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 11px !important;
+  }
+  [data-m='filters'] > div > div {
+    flex-wrap: wrap !important;
+  }
+  [data-m='filters'] > div > div > div {
+    flex-wrap: wrap !important;
+  }
+  [data-m='searchwrap'] {
+    margin-left: 0 !important;
+    width: 100% !important;
+  }
+  [data-m='searchwrap'] input {
+    width: 100% !important;
+  }
+}
