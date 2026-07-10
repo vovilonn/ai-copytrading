@@ -83,12 +83,15 @@ export interface DB {
     created_at: Date
   }
   domain_events: {
-    id: number
+    // id (BIGSERIAL) и created_at (DEFAULT now()) — задача 9 впервые вставляет строки в эту
+    // таблицу, поэтому оборачиваем в Generated<>, как и другие DEFAULT-колонки (messages выше):
+    // иначе insertInto(...).values() требовал бы указывать nextval-значение id вручную.
+    id: Generated<number>
     type: string
     aggregate: string
     aggregate_id: string | null
     payload: unknown
-    created_at: Date
+    created_at: Generated<Date>
     published_at: Date | null
   }
   channel_settings: {

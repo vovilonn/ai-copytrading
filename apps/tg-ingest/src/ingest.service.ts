@@ -10,14 +10,15 @@ import { DeletedMessage, type DeletedMessageEvent } from 'telegram/events/Delete
 import { LogLevel } from 'telegram/extensions/Logger.js'
 import { UpdateConnectionState } from 'telegram/network/index.js'
 import { FloodWaitError } from 'telegram/errors/index.js'
-import type { Kysely } from 'kysely'
+import { sql, type Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 import type { AppConfig } from 'api/config/config.schema.js'
 import { topicOf } from './topic-filter.js'
 import { AlbumBuffer, type AlbumMessage } from './album-buffer.js'
-import { pickMedia } from './media.js'
-import { saveMessage, advanceCursor, getCursor } from './repository.js'
+import { pickMedia, type DownloadHint } from './media.js'
+import { saveMessageWithEvent, advanceCursor, getCursor, type IngestMediaInput } from './repository.js'
 import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
+import type { MessageNewPayload } from 'shared/ws-events.js'
 
 // var/media лежит в корне репозитория, а не в apps/tg-ingest — путь считаем от расположения
 // этого модуля (устойчиво к тому, из какого cwd запущен процесс), как и scripts/tg-dump.mjs.
@@ -47,6 +48,14 @@ export interface ProbedMessage {
   id: number
   text: string
   topicKind: 'root' | 'reply' | 'other'
+}
+
+/** Результат downloadMediaFile — уже скачанный и записанный на диск файл, ждущий вставки в БД. */
+interface DownloadedMedia {
+  relPath: string
+  buffer: Buffer
+  sha256: string
+  kind: DownloadHint['kind']
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -330,61 +339,101 @@ export class IngestService {
     const channelId = Number(source.channelId)
     const hint = pickMedia(msg.media)
     const editedTs = msg.editDate ? new Date(msg.editDate * 1000) : null
+    const text = msg.message ?? ''
+    const msgTs = new Date(msg.date * 1000)
+    // Генерируется здесь, а не в saveMessage — так payload события domain_events (ниже)
+    // знает итоговый id сообщения ещё до открытия транзакции.
+    const messageId = crypto.randomUUID()
 
-    const saved = await saveMessage(this.db, {
-      channelId,
-      tgMessageId: msg.id,
-      topicId: source.topicId,
-      groupedId: msg.groupedId ? msg.groupedId.toString() : null,
-      replyToMsgId: msg.replyTo?.replyToMsgId ?? null,
-      replyToTopId: msg.replyTo?.replyToTopId ?? null,
-      isTopicMessage: Boolean(msg.replyTo?.forumTopic),
-      text: msg.message ?? '',
-      hasMedia: hint != null,
-      mediaKind: msg.media?.className ?? null,
-      msgTs: new Date(msg.date * 1000),
-      editedTs,
-      raw: snapshotMessage(msg),
-    })
-
+    // Скачивание — сетевой I/O к Telegram, вне транзакции с БД: сбой (флаки сети, недоступный
+    // DC) не должен ни блокировать, ни откатывать вставку самого сообщения — тот же принцип
+    // best-effort изоляции медиа, что и раньше (курсор не должен упираться в упрямый файл).
+    let downloaded: DownloadedMedia | null = null
     if (hint) {
-      // Медиа — best-effort и изолирован от текста: сбой скачивания (флаки сети, недоступный
-      // DC) не должен блокировать advanceCursor — иначе один упрямый файл навсегда останавливает
-      // курсор и все сообщения за ним теряются для бэкфилла (minId уже не вернётся назад).
       try {
-        await this.persistMedia(source, saved.id, msg, hint, orderIndex)
+        downloaded = await this.downloadMediaFile(source, msg, hint, orderIndex)
       } catch (err) {
         this.logError(`persistMedia ${source.key}#${msg.id}`, err)
       }
     }
 
+    const mediaRowId = downloaded ? crypto.randomUUID() : null
+    const media: IngestMediaInput | null =
+      downloaded && mediaRowId
+        ? {
+            id: mediaRowId,
+            tgMessageId: msg.id,
+            groupedId: msg.groupedId ? msg.groupedId.toString() : null,
+            orderIndex,
+            storagePath: downloaded.relPath,
+            mediaType: 'image/jpeg',
+            bytes: downloaded.buffer.length,
+            sha256: downloaded.sha256,
+          }
+        : null
+
+    // payload задачи 9: готовый MessageDto + channelId (см. packages/shared/src/ws-events.ts).
+    // aiSummary/actions/method — Ф0-заглушки (пайплайн разбора появится в Ф1+, см. shared/dto.ts).
+    const payload: MessageNewPayload = {
+      channelId,
+      message: {
+        id: messageId,
+        tgMessageId: msg.id,
+        time: msgTs.toISOString(),
+        text,
+        media: downloaded && mediaRowId ? [{ url: `/media/${mediaRowId}`, kind: downloaded.kind }] : [],
+        aiSummary: null,
+        actions: [],
+        method: null,
+      },
+    }
+
+    const saved = await saveMessageWithEvent(
+      this.db,
+      {
+        id: messageId,
+        channelId,
+        tgMessageId: msg.id,
+        topicId: source.topicId,
+        groupedId: msg.groupedId ? msg.groupedId.toString() : null,
+        replyToMsgId: msg.replyTo?.replyToMsgId ?? null,
+        replyToTopId: msg.replyTo?.replyToTopId ?? null,
+        isTopicMessage: Boolean(msg.replyTo?.forumTopic),
+        text,
+        hasMedia: downloaded != null,
+        mediaKind: msg.media?.className ?? null,
+        msgTs,
+        editedTs,
+        raw: snapshotMessage(msg),
+      },
+      media,
+      { type: 'message.new', aggregate: 'message', payload },
+    )
+
     // Курсор двигаем и для правок, и для отфильтрованных повторов — GREATEST внутри
     // advanceCursor делает это безопасным независимо от порядка вызовов (§4).
     await advanceCursor(this.db, channelId, msg.id)
+
+    if (saved.inserted) {
+      // NOTIFY строго после коммита транзакции (await выше уже дождался commit) — иначе
+      // слушатель на стороне api рискует получить уведомление раньше, чем строка станет видна
+      // его собственному SELECT (task-9-brief §2/§3).
+      await sql`SELECT pg_notify('domain_events', '')`.execute(this.db)
+    }
   }
 
-  private async persistMedia(
+  /** Скачивает медиа-файл и кладёт его на диск. Только сетевой I/O + fs — без обращений к БД,
+   *  чтобы сбой скачивания не держал открытую транзакцию и не откатывал вставку сообщения. */
+  private async downloadMediaFile(
     source: ChannelSource,
-    messageRowId: string,
     msg: Api.Message,
-    hint: NonNullable<ReturnType<typeof pickMedia>>,
+    hint: DownloadHint,
     orderIndex: number,
-  ): Promise<void> {
-    // Дедуп: бэкфилл и live пересекаются на границе (§4/§5) — повторный saveMessage того же
-    // сообщения не должен плодить повторные строки медиа. saveMessage не даёт надёжного признака
-    // "это первая вставка" на стыке edit+first-seen, поэтому проверяем message_media напрямую.
-    const existing = await this.db
-      .selectFrom('message_media')
-      .select('id')
-      .where('message_id', '=', messageRowId)
-      .where('order_index', '=', orderIndex)
-      .executeTakeFirst()
-    if (existing) return
-
+  ): Promise<DownloadedMedia | null> {
     const buffer = await this.withFloodRetry(`downloadMedia ${source.key}#${msg.id}`, () =>
       this.client.downloadMedia(msg, hint.options),
     )
-    if (!buffer || typeof buffer === 'string' || buffer.length === 0) return
+    if (!buffer || typeof buffer === 'string' || buffer.length === 0) return null
 
     const relPath = path.posix.join(MEDIA_ROOT_REL, source.key, `${msg.id}_${orderIndex}.jpg`)
     const absPath = path.join(REPO_ROOT, relPath)
@@ -392,26 +441,7 @@ export class IngestService {
     await fs.writeFile(absPath, buffer)
 
     const sha256 = crypto.createHash('sha256').update(buffer).digest('hex')
-
-    await this.db
-      .insertInto('message_media')
-      .values({
-        id: crypto.randomUUID(),
-        message_id: messageRowId,
-        tg_message_id: msg.id,
-        grouped_id: msg.groupedId ? msg.groupedId.toString() : null,
-        order_index: orderIndex,
-        storage_path: relPath,
-        media_type: 'image/jpeg',
-        // Ширина/высота не входят в требования задачи и не нужны текущим потребителям (raw
-        // не расширяем ради этого) — колонки nullable, поэтому осознанно оставляем null.
-        width: null,
-        height: null,
-        bytes: buffer.length,
-        sha256,
-        created_at: new Date(),
-      })
-      .execute()
+    return { relPath, buffer, sha256, kind: hint.kind }
   }
 
   private async onDeleted(event: DeletedMessageEvent): Promise<void> {
