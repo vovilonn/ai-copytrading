@@ -12,8 +12,13 @@
  * ДО любого обращения к БД/бирже — ретрай/реконнект после краша реконструирует ТОТ ЖЕ ключ.
  */
 
+import type { OrderPurpose } from 'shared/domain.js'
+
+// OrderPurpose переиспользован из shared/domain.ts (тот же enum order_purpose схемы,
+// единый источник правды для api/database.ts и engine/execution/port.ts — задача 6).
+export type { OrderPurpose }
+
 export type ExecutionMode = 'dry_run' | 'live'
-export type OrderPurpose = 'entry' | 'add' | 'tp' | 'sl' | 'close' | 'cancel'
 
 export interface OrderLinkIdParams {
   mode: ExecutionMode

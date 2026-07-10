@@ -97,3 +97,19 @@ export interface ParsedResult {
 export type TradeStatus = 'pending' | 'open' | 'partially_closed' | 'closed' | 'cancelled' | 'skipped'
 export type LegKind = 'entry' | 'add'
 export type LegStatus = 'pending' | 'working' | 'partially_filled' | 'filled' | 'cancelled' | 'rejected'
+
+// Типы состояния ордеров/исполнений (задача 6, `apps/engine/src/execution/*`) — дословно
+// enum'ы из миграции 001_initial.ts (order_purpose/order_type_t/order_status). Единый источник
+// правды для api (apps/api/src/db/database.ts) и engine (execution/order-link-id.ts,
+// execution/port.ts) — та же причина, что у TradeStatus/LegKind/LegStatus выше.
+export type OrderPurpose = 'entry' | 'add' | 'tp' | 'sl' | 'close' | 'cancel'
+export type OrderType = 'market' | 'limit'
+export type OrderStatus =
+  | 'created'
+  | 'pending_submit'
+  | 'submitted'
+  | 'partially_filled'
+  | 'filled'
+  | 'rejected'
+  | 'cancelled'
+  | 'expired'

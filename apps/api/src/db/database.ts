@@ -1,6 +1,6 @@
 import { Kysely, PostgresDialect, type Generated } from 'kysely'
 import pg from 'pg'
-import type { Side, TradeStatus, LegKind, LegStatus } from 'shared/domain.js'
+import type { Side, TradeStatus, LegKind, LegStatus, OrderPurpose, OrderType, OrderStatus } from 'shared/domain.js'
 
 // node-postgres по умолчанию отдаёт int8 строкой, чтобы не потерять точность.
 // Все наши BIGINT (id каналов и сообщений Telegram, счётчик событий) заведомо
@@ -182,8 +182,104 @@ export interface DB {
     acquired_at: Generated<Date>
     released_at: Date | null
   }
-  // остальные таблицы схемы (processed_messages, parse_results, ai_calls,
-  // ai_cache, actions, orders, executions, positions,
+  // actions: плоский слой действий (задача 6 использует только как FK-якорь orders.action_id —
+  // type/method/status оставлены свободной строкой, как messages.status/method выше: их полные
+  // enum'ы — забота парсера/оркестратора действий (более поздняя задача Ф1), не исполнения.
+  actions: {
+    id: Generated<string>
+    message_id: string
+    channel_id: number
+    action_index: number
+    type: string
+    side: Side | null
+    symbol: string | null
+    pair: string | null
+    method: string
+    trade_id: string | null
+    pct: string | null
+    params: Generated<unknown>
+    detail: string | null
+    status: Generated<string>
+    skip_reason: string | null
+    created_at: Generated<Date>
+    updated_at: Generated<Date>
+    executed_at: Date | null
+  }
+  // Задача 6 (Ф1): ExecutionPort/DryRunAdapter (apps/engine/src/execution/*) — транзакционный
+  // outbox ордеров + зеркало исполнений/позиций. purpose/order_type/status переиспользуют
+  // enum'ы из shared/domain.ts (тот же приём, что и Side/TradeStatus/LegKind/LegStatus выше).
+  orders: {
+    id: Generated<string>
+    trade_id: string | null
+    leg_id: string | null
+    action_id: string
+    channel_id: number
+    symbol: string
+    order_link_id: string
+    bybit_order_id: string | null
+    purpose: OrderPurpose
+    side: Side
+    order_type: OrderType
+    reduce_only: Generated<boolean>
+    qty: string | null
+    price: string | null
+    trigger_price: string | null
+    tp_index: number | null
+    time_in_force: Generated<string>
+    status: Generated<OrderStatus>
+    ret_code: number | null
+    ret_msg: string | null
+    ttl_expires_at: Date | null
+    submit_attempts: Generated<number>
+    submitted_at: Date | null
+    filled_at: Date | null
+    cancelled_at: Date | null
+    created_at: Generated<Date>
+    updated_at: Generated<Date>
+  }
+  executions: {
+    id: Generated<string>
+    order_id: string | null
+    trade_id: string | null
+    leg_id: string | null
+    bybit_exec_id: string
+    order_link_id: string | null
+    symbol: string
+    side: Side
+    exec_qty: string
+    exec_price: string
+    closed_size: Generated<string>
+    leaves_qty: Generated<string>
+    exec_fee: Generated<string>
+    exec_pnl: Generated<string>
+    exec_type: string | null
+    is_maker: boolean | null
+    exec_ts: Date
+    created_at: Generated<Date>
+  }
+  // Зеркало позиций (реконсиляция + realtime + Active Positions, PK (channel_id, symbol)).
+  // mark_price/liq_price/unrealised_pnl — реальный live-фид подключит задача 9; в Ф1
+  // DryRunAdapter пишет только size/avg_price/leverage/stop_loss (см. dry-run.adapter.ts).
+  positions: {
+    channel_id: number
+    symbol: string
+    trade_id: string | null
+    side: Side | null
+    size: Generated<string>
+    avg_price: string | null
+    mark_price: string | null
+    liq_price: string | null
+    leverage: string | null
+    position_im: string | null
+    unrealised_pnl: string | null
+    cur_realised_pnl: string | null
+    take_profit: string | null
+    stop_loss: string | null
+    position_status: string | null
+    bybit_seq: number | null
+    updated_at: Generated<Date>
+  }
+  // остальные таблицы схемы (processed_messages, parse_results, ai_calls, ai_cache,
   // audit_log, app_state) объявляются здесь же по мере использования в Ф1–Ф4.
   // Пока созданы миграцией, но не типизированы — тесты, которым нужен сырой SQL, используют sql`...`.
 }
