@@ -1,13 +1,13 @@
 {
-  "name": "shared",
+  "name": "engine",
   "private": true,
   "type": "module",
-  "exports": {
-    "./*": "./src/*"
-  },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "shared": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

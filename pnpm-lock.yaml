@@ -98,6 +98,19 @@ importers:
         specifier: ^3.0.0
         version: 3.2.7(@types/node@26.1.1)(jiti@1.21.7)(jsdom@25.0.1(bufferutil@4.1.0)(utf-8-validate@5.0.10))(tsx@4.23.0)
 
+  apps/engine:
+    dependencies:
+      shared:
+        specifier: workspace:*
+        version: link:../../packages/shared
+    devDependencies:
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.7(@types/node@26.1.1)(jiti@1.21.7)(jsdom@25.0.1(bufferutil@4.1.0)(utf-8-validate@5.0.10))(tsx@4.23.0)
+
   apps/tg-ingest:
     dependencies:
       api:
@@ -222,6 +235,9 @@ importers:
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.7(@types/node@26.1.1)(jiti@1.21.7)(jsdom@25.0.1(bufferutil@4.1.0)(utf-8-validate@5.0.10))(tsx@4.23.0)
 
   packages/test-db:
     dependencies:
