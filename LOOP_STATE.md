@@ -122,9 +122,13 @@ Production-ready AI копитрейдинг-платформа:
       (`docs/superpowers/research/`)
 - [x] Пересогласованы решения, опровергнутые верификацией
 - [x] Дизайн-док: `docs/superpowers/specs/2026-07-10-ai-copytrading-platform-design.md`
-- [ ] **Аппрув спеки заказчиком**
-- [ ] План реализации по фазам (writing-plans)
-- [ ] Реализация по фазам Ф0–Ф4 и тесты на реальном API
+- [x] **Аппрув спеки заказчиком**
+- [x] План реализации по фазам (writing-plans)
+- [x] **Ф0 реализована и принята** (задача 13: docker-compose целиком, приёмка вручную —
+      см. `.superpowers/sdd/task-13-report.md`): вход, оба канала с реальными счётчиками,
+      таймлайны с текстом/фото/альбомами, реалтайм по WebSocket без перезагрузки страницы,
+      дедуп подтверждён (0 дублей `channel_id, tg_message_id`), `pnpm test`/`pnpm typecheck` зелёные.
+- [ ] Ф1–Ф4: парсер, AI-слой, исполнение на Bybit, страницы Actions/Positions
 
 ## Известные грабли
 
@@ -132,3 +136,46 @@ Production-ready AI копитрейдинг-платформа:
 - Внутри `ai-proxy/` лежит свой `docker-compose.yml`; compose ищет файл вверх по дереву — команды запускать из корня.
 - `--force` у pnpm-скрипта перехватывается самим pnpm, поэтому флаг называется `--relogin`.
 - Баланс Bybit testnet пуст — перед e2e нужен faucet на `testnet.bybit.com`.
+
+## Грабли Ф0 (задача 13 — docker-compose и приёмка)
+
+- `pg` отдаёт `BIGINT` строкой → зарегистрирован `setTypeParser(INT8, Number)`.
+- `msg.chatId` в GramJS — marked id (`-100<id>`), сырой id лежит в `msg.peerId`.
+- `saveMessage.inserted` нельзя выводить из `editedTs`: сообщения форума приходят уже с
+  `editDate`. Признак реальной вставки — `RETURNING (xmax = 0)`.
+- `catchUp()` в GramJS — заглушка, бэкфилл только свой.
+- Скачивание медиа падало при массовом бэкфилле и глушилось → нужны ретраи и ремонтный проход
+  (`apps/tg-ingest/src/retry.ts`, `media-repair.ts`).
+- Альбом Telegram — это N сообщений с общим `grouped_id`; группировать в один узел таймлайна
+  должен API (`apps/api/src/channels/channels.service.ts`), не ingest.
+- Vite-прокси по префиксу `/channels` перехватывал SPA-роут → весь HTTP API вынесен под `/api`
+  (`app.setGlobalPrefix('api')`), это же зеркалит `apps/web/nginx.conf` в контейнере.
+- Порт `5432` на хосте занят другим проектом → `POSTGRES_PORT=5442` (проброшен только наружу;
+  внутри сети compose `api`/`tg-ingest` ходят в `postgres:5432` напрямую).
+- vitest/esbuild не эмитит `design:paramtypes` → в NestJS-провайдерах обязателен явный
+  `@Inject(Class)` (актуально и для нового `HealthController` — не понадобился, DI без параметров).
+- **`pnpm up` — не наш скрипт**: pnpm резервирует `up` как alias для `pnpm update`, поэтому
+  голый `pnpm up` тихо не запускает `docker compose up`, а гоняет resolution зависимостей.
+  Нужно `pnpm run up` (или `pnpm run down`/`pnpm run logs` для симметрии).
+- **`ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` в чистом контейнере**: `pnpm-lock.yaml` записан с
+  `settings.injectWorkspacePackages: true`, а этот флаг на хосте стоял только в глобальном
+  `~/Library/Preferences/pnpm/rc`, не в репозитории — в Docker (нет глобального rc) `pnpm install
+  --frozen-lockfile` падал. Зафиксировано явно в корневом `.npmrc` (`inject-workspace-packages=true`),
+  чтобы сборка не зависела от конфигурации конкретной машины.
+- **Секьюр-кука ломает вход за `http`**: `sessionCookieOptions()` ставит `Secure` только при
+  `NODE_ENV=production`. Весь стек здесь работает по обычному http (`127.0.0.1:5173`, без TLS) —
+  если по привычке выставить `NODE_ENV=production` в compose для `api`, браузер тихо не сохранит
+  куку и вход будет молча не работать (без единой ошибки в сети). В `docker-compose.yml` `api`
+  намеренно держит `NODE_ENV=development`.
+- **`apps/api`/`apps/tg-ingest` рантайм — это `tsx`, не скомпилированный JS**: `exports` в
+  `package.json` обоих пакетов указывают на `./src/*`, а `tg-ingest` импортирует исходники `api`
+  напрямую как workspace-зависимость. Значит "прод-зависимости" в Dockerfile в привычном смысле
+  (`--prod`, без devDependencies) не подходят — `tsx`/`typescript` нужны в рантайме контейнера.
+  Ставим зависимости всего workspace одним `pnpm install` (без `--prod`) — осознанный компромисс,
+  задокументирован в `.superpowers/sdd/task-13-report.md`.
+- `RealtimeGateway` (WS) жёстко проверяет `Origin: http://localhost:5173` на хендшейке — порт
+  веб-контейнера в compose нельзя менять без правки кода, поэтому `127.0.0.1:5173:80` — не
+  только рекомендация брифа, но и жёсткое требование текущего кода.
+- Media-контроллер `api` читает файлы с диска (`var/media/...` относительно корня репозитория) —
+  контейнеру `api` тоже нужен том `./var:/app/var`, не только `tg-ingest` (иначе картинки в
+  таймлайне не отдаются, 404).

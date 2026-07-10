@@ -5,10 +5,11 @@ import { JwtGuard } from './auth/jwt.guard.js'
 import { ChannelsModule } from './channels/channels.module.js'
 import { ConfigModule } from './config/config.module.js'
 import { DbModule } from './db/db.module.js'
+import { HealthModule } from './health/health.module.js'
 import { RealtimeModule } from './realtime/realtime.module.js'
 
 @Module({
-  imports: [ConfigModule, DbModule, AuthModule, ChannelsModule, RealtimeModule],
+  imports: [ConfigModule, DbModule, AuthModule, ChannelsModule, RealtimeModule, HealthModule],
   providers: [
     // Все роуты закрыты JwtGuard, кроме помеченных @Public() (сейчас — только POST /auth/login).
     { provide: APP_GUARD, useClass: JwtGuard },

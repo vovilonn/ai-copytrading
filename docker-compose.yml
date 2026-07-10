@@ -48,5 +48,86 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: bybit-copytrade-api:local
+    container_name: bybit-copytrade-api
+    env_file:
+      - .env
+    environment:
+      # Внутри сети compose postgres слушает свой контейнерный порт (5432), а не опубликованный
+      # на хосте POSTGRES_PORT (5442 по умолчанию) — .env не трогаем, переопределяем только
+      # здесь (см. бриф задачи 13). env_file подставляет .env первым, эта секция — поверх него.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-copytrade}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-copytrade}
+      PORT: 3000
+      # ВАЖНО: не production. sessionCookieOptions() (apps/api/src/auth/cookie.ts) ставит
+      # Secure только когда NODE_ENV=production — а весь стек здесь работает по обычному http
+      # (127.0.0.1:5173, без TLS). Secure-кука над http браузер тихо не сохранит, и вход
+      # сломается без единой видимой ошибки.
+      NODE_ENV: development
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Раздача медиа: GET /api/media/:id (apps/api/src/channels/media.controller.ts) читает
+      # var/media/<key>/... относительно корня репозитория — тот же том, что пишет tg-ingest.
+      - ./var:/app/var
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  tg-ingest:
+    build:
+      context: .
+      dockerfile: apps/tg-ingest/Dockerfile
+    image: bybit-copytrade-tg-ingest:local
+    container_name: bybit-copytrade-tg-ingest
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-copytrade}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-copytrade}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    volumes:
+      # Медиа (фото/превью видео) пишется сюда воркером — apps/tg-ingest/src/ingest.service.ts,
+      # MEDIA_ROOT_REL = 'var/media', резолвится относительно корня репозитория внутри контейнера.
+      - ./var:/app/var
+    deploy:
+      # Ровно одна реплика: воркер MTProto держит единственную сессию Telegram (TG_SESSION) —
+      # вторая реплика вызвала бы конфликт сессии/дублирующийся консюмер обновлений.
+      replicas: 1
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    image: bybit-copytrade-web:local
+    container_name: bybit-copytrade-web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # Порт зафиксирован на 5173 не только по брифу, но и по факту: RealtimeGateway
+      # (apps/api/src/realtime/realtime.gateway.ts, DEV_ORIGIN) жёстко проверяет Origin
+      # 'http://localhost:5173' на WS-хендшейке — другой порт хоста сломает CORS сокета.
+      - "127.0.0.1:5173:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   postgres-data:

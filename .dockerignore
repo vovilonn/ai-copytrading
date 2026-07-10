@@ -1,0 +1,12 @@
+node_modules
+var
+.git
+.env
+temp
+.superpowers
+.ai-proxy
+
+# Артефакты сборок и локальные логи — не нужны в контексте сборки образов.
+**/dist
+.ai-proxy/logs
+*.log
