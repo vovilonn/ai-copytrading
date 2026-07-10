@@ -58,7 +58,7 @@ beforeAll(async () => {
   }
 
   agent = request.agent(app.getHttpServer())
-  await agent.post('/auth/login').send({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }).expect(204)
+  await agent.post('/api/auth/login').send({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }).expect(204)
 })
 
 afterAll(async () => {
@@ -67,12 +67,12 @@ afterAll(async () => {
 })
 
 it('GET /channels без куки -> 401', async () => {
-  const res = await request(app.getHttpServer()).get('/channels')
+  const res = await request(app.getHttpServer()).get('/api/channels')
   expect(res.status).toBe(401)
 })
 
 it('GET /channels возвращает оба засеянных канала', async () => {
-  const res = await agent.get('/channels').expect(200)
+  const res = await agent.get('/api/channels').expect(200)
   const channels = res.body as ChannelDto[]
   expect(channels).toHaveLength(2)
   expect(channels.map((c) => c.key).sort()).toEqual([CHANNEL_2_KEY, CHANNEL_1_KEY].sort())
@@ -92,24 +92,24 @@ it('GET /channels возвращает оба засеянных канала', 
 it('channels.handle пуст в БД -> фолбэк "#<id>" (приватный канал без username)', async () => {
   // ChannelSeedService всегда сидирует handle: null (без доступа к Telegram) — оба тестовых
   // канала попадают под фолбэк, пока их никто не обновил.
-  const res = await agent.get(`/channels/${CHANNEL_1_ID}`).expect(200)
+  const res = await agent.get(`/api/channels/${CHANNEL_1_ID}`).expect(200)
   const channel = res.body as ChannelDto
   expect(channel.handle).toBe(`#${CHANNEL_1_ID}`)
 })
 
 it('GET /channels/:id отдаёт один канал в том же формате', async () => {
-  const res = await agent.get(`/channels/${CHANNEL_1_ID}`).expect(200)
+  const res = await agent.get(`/api/channels/${CHANNEL_1_ID}`).expect(200)
   const channel = res.body as ChannelDto
   expect(channel.id).toBe(CHANNEL_1_ID)
   expect(channel.key).toBe(CHANNEL_1_KEY)
 })
 
 it('GET /channels/999999 -> 404', async () => {
-  await agent.get('/channels/999999').expect(404)
+  await agent.get('/api/channels/999999').expect(404)
 })
 
 it('GET /channels/:id/messages?limit=3 отдаёт ровно 3 записи по убыванию tgMessageId', async () => {
-  const res = await agent.get(`/channels/${CHANNEL_1_ID}/messages?limit=3`).expect(200)
+  const res = await agent.get(`/api/channels/${CHANNEL_1_ID}/messages?limit=3`).expect(200)
   const messages = res.body as MessageDto[]
   expect(messages).toHaveLength(3)
   const ids = messages.map((m) => m.tgMessageId)
@@ -122,13 +122,13 @@ it('GET /channels/:id/messages?limit=3 отдаёт ровно 3 записи п
 })
 
 it('GET /channels/:id/messages?limit=3&before=1004 продолжает пагинацию', async () => {
-  const res = await agent.get(`/channels/${CHANNEL_1_ID}/messages?limit=3&before=1004`).expect(200)
+  const res = await agent.get(`/api/channels/${CHANNEL_1_ID}/messages?limit=3&before=1004`).expect(200)
   const messages = res.body as MessageDto[]
   expect(messages.map((m) => m.tgMessageId)).toEqual([1003, 1002, 1001])
 })
 
 it('GET /channels/:id/messages с некорректными limit/before откатывается к дефолту, а не 500', async () => {
-  const res = await agent.get(`/channels/${CHANNEL_1_ID}/messages?limit=abc&before=xyz`).expect(200)
+  const res = await agent.get(`/api/channels/${CHANNEL_1_ID}/messages?limit=abc&before=xyz`).expect(200)
   const messages = res.body as MessageDto[]
   expect(messages.map((m) => m.tgMessageId)).toEqual([1005, 1004, 1003, 1002, 1001])
 })
@@ -193,7 +193,7 @@ describe('альбом (grouped_id) — один узел таймлайна с 
   })
 
   it('альбом из трёх сообщений отдаётся одним MessageDto с тремя media, tgMessageId = min группы, text = единственная подпись', async () => {
-    const res = await agent.get(`/channels/${CHANNEL_1_ID}/messages?limit=50`).expect(200)
+    const res = await agent.get(`/api/channels/${CHANNEL_1_ID}/messages?limit=50`).expect(200)
     const messages = res.body as MessageDto[]
 
     const albumNode = messages.find((m) => m.tgMessageId === ALBUM_BASE_TG_ID)
@@ -208,7 +208,7 @@ describe('альбом (grouped_id) — один узел таймлайна с 
   })
 
   it('limit=2 при данных «альбом(3) + одиночное» отдаёт ровно 2 узла таймлайна (лимит по узлам, не по строкам messages)', async () => {
-    const res = await agent.get(`/channels/${CHANNEL_1_ID}/messages?limit=2`).expect(200)
+    const res = await agent.get(`/api/channels/${CHANNEL_1_ID}/messages?limit=2`).expect(200)
     const messages = res.body as MessageDto[]
     expect(messages).toHaveLength(2)
     expect(messages[0]!.tgMessageId).toBe(ALBUM_BASE_TG_ID) // самый новый узел — альбом (3 строки, 1 узел)
@@ -216,7 +216,7 @@ describe('альбом (grouped_id) — один узел таймлайна с 
   })
 
   it('одиночные сообщения не изменились: у них ровно один узел на строку messages, media не смешивается с чужими', async () => {
-    const res = await agent.get(`/channels/${CHANNEL_1_ID}/messages?limit=50`).expect(200)
+    const res = await agent.get(`/api/channels/${CHANNEL_1_ID}/messages?limit=50`).expect(200)
     const messages = res.body as MessageDto[]
     for (const tgId of [1001, 1002, 1003, 1004, 1005]) {
       const node = messages.find((m) => m.tgMessageId === tgId)
@@ -268,21 +268,21 @@ describe('GET /media/:id', () => {
   })
 
   it('отдаёт файл по storage_path потоком с корректным Content-Type', async () => {
-    const res = await agent.get(`/media/${mediaId}`).expect(200)
+    const res = await agent.get(`/api/media/${mediaId}`).expect(200)
     expect(res.headers['content-type']).toContain('image/jpeg')
     expect(Buffer.from(res.body as Buffer).equals(fixtureBytes)).toBe(true)
   })
 
   it('без куки -> 401', async () => {
-    const res = await request(app.getHttpServer()).get(`/media/${mediaId}`)
+    const res = await request(app.getHttpServer()).get(`/api/media/${mediaId}`)
     expect(res.status).toBe(401)
   })
 
   it('несуществующий id -> 404', async () => {
-    await agent.get('/media/00000000-0000-0000-0000-000000000000').expect(404)
+    await agent.get('/api/media/00000000-0000-0000-0000-000000000000').expect(404)
   })
 
   it('некорректный (не-UUID) id -> 404, а не 500', async () => {
-    await agent.get('/media/not-a-uuid').expect(404)
+    await agent.get('/api/media/not-a-uuid').expect(404)
   })
 })

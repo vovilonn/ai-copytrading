@@ -11,5 +11,11 @@ import { AppModule } from './app.module.js'
 export async function createApp(): Promise<INestApplication> {
   const app = await NestFactory.create(AppModule, { logger: ['error', 'warn'] })
   app.use(cookieParser())
+  // Задача 12c: все HTTP-роуты (/auth/*, /channels/*, /media/*) переезжают под /api/*, чтобы
+  // dev-прокси Vite (apps/web/vite.config.ts) мог проксировать РОВНО /api и /socket.io, не
+  // перехватывая SPA-роут /channels/:id как HTTP-запрос к API при жёсткой перезагрузке
+  // страницы. socket.io на этот префикс не смотрит — его путь (/socket.io) задаётся отдельно
+  // и не является Nest HTTP-роутом (см. RealtimeGateway).
+  app.setGlobalPrefix('api')
   return app
 }

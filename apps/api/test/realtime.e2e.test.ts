@@ -47,7 +47,7 @@ beforeAll(async () => {
 
   const agent = request.agent(app.getHttpServer())
   const res = await agent
-    .post('/auth/login')
+    .post('/api/auth/login')
     .send({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD })
     .expect(204)
   const setCookie = res.headers['set-cookie']

@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common'
 import { sql } from 'kysely'
 import type { ChannelDto, MessageDto } from 'shared/dto.js'
+import { mediaUrl } from 'shared/media.js'
 import { DatabaseService } from '../db/database.service.js'
 
 export const DEFAULT_MESSAGE_LIMIT = 50
@@ -162,7 +163,7 @@ export class ChannelsService {
     for (const row of media) {
       const kind = mediaKindOf(mediaKindByMessageId.get(row.message_id) ?? null, row.media_type)
       const list = mediaByMessage.get(row.message_id) ?? []
-      list.push({ url: `/media/${row.id}`, kind })
+      list.push({ url: mediaUrl(row.id), kind })
       mediaByMessage.set(row.message_id, list)
     }
 

@@ -12,6 +12,13 @@ export class ApiError extends Error {
   }
 }
 
+// Весь HTTP API смонтирован под /api (apps/api/src/app.ts, setGlobalPrefix('api') — задача
+// 12c): без этого прокси Vite (apps/web/vite.config.ts) не может отличить SPA-роут
+// /channels/:id от HTTP-запроса к API при жёсткой перезагрузке страницы. Префикс подклеен
+// здесь ОДИН раз — вызывающий код (useAuth, routes/*.tsx, MessageTimeline и т.д.) передаёт
+// путь без /api, как и раньше.
+const API_PREFIX = '/api'
+
 // Обёртка над fetch для всех запросов к API: всегда шлёт куку сессии (credentials:
 // 'include' — API и фронт на разных портах в деве, прокси Vite их сшивает), бросает
 // ApiError на не-2xx вместо тихого возврата, сама разбирает JSON (204 → undefined).
@@ -20,9 +27,10 @@ export async function apiFetch<T = unknown>(path: string, init: RequestInit = {}
   if (init.body !== undefined && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
-  const res = await fetch(path, { ...init, credentials: 'include', headers })
+  const url = `${API_PREFIX}${path}`
+  const res = await fetch(url, { ...init, credentials: 'include', headers })
   if (!res.ok) {
-    throw new ApiError(`${init.method ?? 'GET'} ${path} failed: ${res.status}`, res.status)
+    throw new ApiError(`${init.method ?? 'GET'} ${url} failed: ${res.status}`, res.status)
   }
   if (res.status === 204) return undefined as T
   return (await res.json()) as T

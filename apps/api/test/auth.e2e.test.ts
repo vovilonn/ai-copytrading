@@ -32,7 +32,7 @@ afterAll(async () => {
 describe('POST /auth/login', () => {
   it('успешный вход ставит httpOnly-куку', async () => {
     const res = await request(app.getHttpServer())
-      .post('/auth/login')
+      .post('/api/auth/login')
       .send({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD })
 
     expect(res.status).toBe(204)
@@ -43,7 +43,7 @@ describe('POST /auth/login', () => {
 
   it('неверный пароль -> 401', async () => {
     const res = await request(app.getHttpServer())
-      .post('/auth/login')
+      .post('/api/auth/login')
       .send({ username: ADMIN_USERNAME, password: 'definitely-wrong-password' })
 
     expect(res.status).toBe(401)
@@ -52,20 +52,20 @@ describe('POST /auth/login', () => {
 
 describe('GET /auth/me', () => {
   it('без куки -> 401', async () => {
-    const res = await request(app.getHttpServer()).get('/auth/me')
+    const res = await request(app.getHttpServer()).get('/api/auth/me')
     expect(res.status).toBe(401)
   })
 
   it('с кукой отдаёт username; после logout кука очищена и /auth/me снова 401', async () => {
     const agent = request.agent(app.getHttpServer())
-    await agent.post('/auth/login').send({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }).expect(204)
+    await agent.post('/api/auth/login').send({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }).expect(204)
 
-    const me = await agent.get('/auth/me').expect(200)
+    const me = await agent.get('/api/auth/me').expect(200)
     expect(me.body).toEqual({ username: ADMIN_USERNAME })
 
-    await agent.post('/auth/logout').expect(204)
+    await agent.post('/api/auth/logout').expect(204)
 
-    const meAfterLogout = await agent.get('/auth/me')
+    const meAfterLogout = await agent.get('/api/auth/me')
     expect(meAfterLogout.status).toBe(401)
   })
 })

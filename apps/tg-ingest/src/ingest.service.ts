@@ -27,6 +27,7 @@ import { withDownloadRetry } from './retry.js'
 import { MediaRepairService, type MediaFetcher, type DownloadedMediaResult } from './media-repair.js'
 import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
 import type { MessageNewPayload } from 'shared/ws-events.js'
+import { mediaUrl } from 'shared/media.js'
 
 // var/media лежит в корне репозитория, а не в apps/tg-ingest — путь считаем от расположения
 // этого модуля (устойчиво к тому, из какого cwd запущен процесс), как и scripts/tg-dump.mjs.
@@ -496,7 +497,7 @@ export class IngestService {
       text,
       msgTs,
       member,
-      mediaEntry: downloaded && mediaRowId ? { url: `/media/${mediaRowId}`, kind: downloaded.kind } : null,
+      mediaEntry: downloaded && mediaRowId ? { url: mediaUrl(mediaRowId), kind: downloaded.kind } : null,
     }
   }
 
