@@ -23,3 +23,11 @@ it('падает, если JWT_SECRET короче 32 символов', () => {
 it('падает на неизвестном EXECUTION_MODE', () => {
   expect(() => loadConfig({ ...valid, EXECUTION_MODE: 'yolo' })).toThrow(/EXECUTION_MODE/)
 })
+
+it('BYBIT_NETWORK не задан -> дефолт testnet', () => {
+  expect(loadConfig(valid).bybitNetwork).toBe('testnet')
+})
+
+it('падает на невалидном BYBIT_NETWORK', () => {
+  expect(() => loadConfig({ ...valid, BYBIT_NETWORK: 'mars' })).toThrow(/BYBIT_NETWORK/)
+})

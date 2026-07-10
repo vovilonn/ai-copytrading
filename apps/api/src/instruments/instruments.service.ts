@@ -5,7 +5,7 @@ import { APP_CONFIG } from '../config/config.module.js'
 import type { AppConfig } from '../config/config.schema.js'
 import { DatabaseService } from '../db/database.service.js'
 import type { DB } from '../db/database.js'
-import { fetchAllInstruments, fetchTier1Mmr, mapWithConcurrency } from './bybit-client.js'
+import { fetchAllInstruments, fetchTier1Mmr, mapWithConcurrency, type InstrumentInfoDto } from './bybit-client.js'
 
 type InstrumentRow = Selectable<DB['instruments']>
 
@@ -16,6 +16,26 @@ const RISK_LIMIT_CONCURRENCY = 20
 // Держим batch upsert под лимитом параметров Postgres (~65535 на запрос) с большим запасом:
 // 12 колонок * 500 строк = 6000 параметров на чанк.
 const UPSERT_CHUNK_SIZE = 500
+
+/**
+ * USDT-перпетуал — единственный тип контракта, с которым работает система: резолвер
+ * (symbol-resolver.ts) всегда достраивает символ суффиксом `USDT`. Без этого фильтра
+ * bulk-реестр всех статусов (fetchAllInstruments тянет ещё Closed/PreLaunch/Delivering)
+ * тащит в кэш и USDC-перпы, и istёкшие квартальные фьючерсы (`BTC-01DEC23`,
+ * `BTCUSDT-17JUL26` и т.п., contractType='LinearFutures') — 986 Closed-строк исторического
+ * реестра, которые никогда не встретятся в сигнале. `!symbol.includes('-')` — доп.
+ * подстраховка "для чистоты": единственное известное исключение из settleCoin/contractType
+ * фильтра — легаси-делистнутый `1M-AIDOGEUSDT`, где дефис часть самого тикера, а не
+ * разделитель даты экспирации; системе, которая всегда строит символ конкатенацией
+ * TICKER+USDT без разделителей, такой тикер всё равно бесполезен.
+ */
+function isUsdtPerpetual(info: InstrumentInfoDto): boolean {
+  return (
+    info.settleCoin === 'USDT' &&
+    (info.contractType === undefined || info.contractType.includes('Perpetual')) &&
+    !info.symbol.includes('-')
+  )
+}
 
 /**
  * Кэш инструментов Bybit (instruments-info + risk-limit) в таблице `instruments`. Единственный
@@ -35,7 +55,7 @@ export class InstrumentsService {
 
   /** Полностью обновляет реестр активной сети из Bybit. Возвращает число upsert'нутых строк. */
   async refresh(): Promise<number> {
-    const instruments = await fetchAllInstruments(this.network)
+    const instruments = (await fetchAllInstruments(this.network)).filter(isUsdtPerpetual)
     if (instruments.length === 0) return 0
 
     // MMR имеет смысл только для реально торгуемых символов (risk-limit для делистнутых

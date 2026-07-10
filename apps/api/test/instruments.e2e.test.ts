@@ -60,6 +60,11 @@ describe.skipIf(!networkAvailable)('InstrumentsService (живой Bybit testnet
     expect(await service.isTrading('BTCUSDT')).toBe(true)
   })
 
+  it('после refresh() в кэше нет дефисных фьючерсов (BTC-*/BTCUSDT-*) и USDC-перпов — только USDT-перпетуалы', async () => {
+    const dashed = await db.selectFrom('instruments').select('symbol').where('symbol', 'like', '%-%').execute()
+    expect(dashed).toEqual([])
+  })
+
   it("на testnet GRASSUSDT известен кэшу, но не торгуется (status != 'Trading')", async () => {
     // GRASSUSDT/EIGENUSDT отсутствуют в bulk-листинге 'Trading' на testnet, но существуют как
     // делистнутые (status='Closed') — см. §13 research-дока и комментарий в bybit-client.ts.

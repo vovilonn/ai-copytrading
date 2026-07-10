@@ -34,6 +34,30 @@ describe('resolveSymbol — стем-мап кириллица (research §9)', 
   })
 })
 
+describe('resolveSymbol/extractCoins — слова-ловушки НЕ матчатся (КРИТИЧНЫЙ баг: префиксный алиас ловил обычные слова)', () => {
+  const traps = ['битва', 'битвы', 'договор', 'договорились', 'догнать', 'догадка', 'солнце']
+
+  for (const trap of traps) {
+    it(`resolveSymbol('${trap}') -> null`, () => {
+      expect(resolveSymbol(trap, alwaysListed)).toBeNull()
+    })
+
+    it(`extractCoins('${trap}') -> []`, () => {
+      expect(extractCoins(trap)).toEqual([])
+    })
+  }
+
+  it("'мы договорились' -> resolveSymbol null, extractCoins [] (репро КРИТИЧНОГО бага: раньше давало DOGE)", () => {
+    expect(resolveSymbol('мы договорились', alwaysListed)).toBeNull()
+    expect(extractCoins('мы договорились')).toEqual([])
+  })
+
+  it("эфирный -> null (после normalize() 'эфирный' -> 'ефирный', не входит в перечисленные формы ETH)", () => {
+    expect(resolveSymbol('эфирный', alwaysListed)).toBeNull()
+    expect(extractCoins('эфирный')).toEqual([])
+  })
+})
+
 describe('resolveSymbol — хэштег #TICKER(/USDT)? (research §9)', () => {
   it('#GRASS/USDT -> GRASSUSDT', () => {
     expect(resolveSymbol('#GRASS/USDT', alwaysListed)).toBe('GRASSUSDT')

@@ -28,6 +28,12 @@ export interface InstrumentInfoDto {
   symbol: string
   status: string
   baseCoin: string
+  // Валюта расчёта контракта ('USDT'/'USDC') и тип контракта ('LinearPerpetual'/'LinearFutures')
+  // — нужны InstrumentsService.refresh() для фильтрации: система резолвит только USDT-перпетуалы
+  // (symbol-resolver.ts всегда достраивает символ суффиксом USDT), остальное — балласт кэша.
+  // contractType опционален defensively — вдруг Bybit его не отдаст (см. "если поле есть" в брифе).
+  settleCoin: string
+  contractType?: string
   lotSizeFilter: { qtyStep: string; minOrderQty: string; minNotionalValue?: string }
   priceFilter: { tickSize: string }
   leverageFilter: { maxLeverage: string; leverageStep: string }
@@ -93,7 +99,14 @@ export async function fetchTier1Mmr(network: Network, symbol: string): Promise<s
   try {
     const result = await bybitGet<{ list: RiskLimitTierDto[] }>(url)
     return result.list.find((tier) => tier.isLowestRisk === 1)?.maintenanceMargin ?? null
-  } catch {
+  } catch (err) {
+    // retCode=10001 ("params error"/делистнутый символ без risk-limit) — ОЖИДАЕМЫЙ исход,
+    // глотаем тихо. Всё остальное (сетевой сбой, HTTP-ошибка, иной retCode) — не должно тонуть
+    // молча: MMR участвует в формуле безопасного плеча, поэтому такие сбои обязаны попасть в лог.
+    const isExpectedDelisted = err instanceof Error && err.message.includes('retCode=10001')
+    if (!isExpectedDelisted) {
+      console.warn(`fetchTier1Mmr(${symbol}): непредвиденная ошибка risk-limit`, err)
+    }
     return null
   }
 }
