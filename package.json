@@ -20,9 +20,12 @@
     "typecheck": "pnpm -r typecheck"
   },
   "devDependencies": {
+    "playwright": "^1.61.1",
     "telegram": "^2.26.22"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }
