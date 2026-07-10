@@ -37,6 +37,7 @@ export default {
         'muted-2': 'var(--color-muted-2)',
         'muted-3': 'var(--color-muted-3)',
         long: 'var(--color-long)',
+        'long-bg': 'var(--color-long-bg)',
         short: 'var(--color-short)',
         skipped: 'var(--color-skipped)',
         'skipped-bg': 'var(--color-skipped-bg)',

@@ -38,6 +38,10 @@
   --color-muted-2: #5a5a60;
   --color-muted-3: #4a4a50;
   --color-long: #34d399;
+  /* Tailwind не умеет накладывать opacity-модификатор (bg-long/[.13]) на цвет,
+     заданный через var() — не может статически разобрать альфа-канал. Поэтому
+     готовый rgba с прозрачностью 13% — отдельный токен (как и skipped-bg ниже). */
+  --color-long-bg: rgba(52, 211, 153, 0.13);
   --color-short: #fb7185;
   --color-skipped: #fbbf24;
   --color-skipped-bg: rgba(251, 191, 36, 0.13);

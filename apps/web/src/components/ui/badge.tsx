@@ -8,7 +8,7 @@ import { cn } from '../../lib/utils.js'
 const badgeVariants = cva('inline-flex items-center justify-center rounded-[5px] font-semibold', {
   variants: {
     variant: {
-      on: 'bg-long/[.13] text-long',
+      on: 'bg-long-bg text-long',
       off: 'bg-white/[.06] text-secondary-3',
       offMuted: 'bg-white/[.05] text-muted-2',
     },
