@@ -9,6 +9,9 @@ config({ path: fileURLToPath(new URL('../../.env', import.meta.url)) })
 export default defineConfig({
   test: {
     environment: 'node',
+    // Несколько файлов тестов пишут в одни и те же таблицы одной живой Postgres (repository.test.ts,
+    // ingest.smoke.test.ts): параллельные файлы гонялись бы за один UNIQUE(ord) и друг друга ломали.
+    fileParallelism: false,
     // FileMigrationProvider делает динамический import() .ts-файлов миграций из node_modules/kysely;
     // без инлайна kysely этот import попадает в нативный загрузчик Node и не умеет резолвить .ts.
     server: {

@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./db/*": "./src/db/*"
+    "./db/*": "./src/db/*",
+    "./config/*": "./src/config/*"
   },
   "scripts": {
     "migrate:up": "tsx src/db/migrate.ts up",

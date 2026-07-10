@@ -2,6 +2,9 @@
 temp/
 node_modules/
 
+# Скачанные медиа тг-ингеста (фото/превью видео) — бинарные файлы, в репозиторий не идут.
+var/
+
 # Runtime-состояние ai-proxy: OAuth-токены Claude и логи.
 .ai-proxy/
 # Рабочие файлы subagent-driven-development

@@ -12,8 +12,11 @@ beforeAll(async () => {
   // Тесты идемпотентны: гоняются повторно против той же живой БД,
   // поэтому чистим фикстуры перед каждым прогоном (аналогично apps/api/test/migration.test.ts).
   await sql`TRUNCATE messages, channel_settings, channels RESTART IDENTITY CASCADE`.execute(db)
+  // ord=101 — заведомо вне диапазона реальных источников (SOURCES использует ord=1,2 —
+  // см. apps/tg-ingest/src/sources.ts и ingest.service.ts.seedChannel), иначе UNIQUE(ord)
+  // конфликтует с сидом ingest.smoke.test.ts на одной живой БД.
   await sql`INSERT INTO channels (id, ord, key, source_kind, adapter_id)
-            VALUES (1, 1, 'test', 'channel', 'x')`.execute(db)
+            VALUES (1, 101, 'test', 'channel', 'x')`.execute(db)
 })
 
 afterAll(async () => {

@@ -32,8 +32,11 @@ it('создаёт все таблицы схемы', async () => {
 })
 
 it('запрещает два сообщения с одним tg_message_id в канале', async () => {
+  // ord=991 — заведомо вне диапазона реальных источников (SOURCES использует ord=1,2, см.
+  // apps/tg-ingest/src/sources.ts), иначе UNIQUE(ord) конфликтует с сидом ingest.service.ts
+  // при совместном запуске тестов обоих пакетов (pnpm test в корне).
   await sql`INSERT INTO channels (id, ord, key, source_kind, adapter_id)
-            VALUES (1, 1, 'test', 'channel', 'x') ON CONFLICT DO NOTHING`.execute(db)
+            VALUES (1, 991, 'test', 'channel', 'x') ON CONFLICT DO NOTHING`.execute(db)
   const ins = sql`INSERT INTO messages (channel_id, tg_message_id, msg_ts, raw)
                   VALUES (1, 100, now(), '{}'::jsonb)`
   await ins.execute(db)
@@ -43,7 +46,7 @@ it('запрещает два сообщения с одним tg_message_id в 
 it('разрешает двум каналам владеть одним символом', async () => {
   // субаккаунт на канал ⇒ владение уникально по (channel_id, symbol)
   await sql`INSERT INTO channels (id, ord, key, source_kind, adapter_id)
-            VALUES (2, 2, 'test2', 'channel', 'x') ON CONFLICT DO NOTHING`.execute(db)
+            VALUES (2, 992, 'test2', 'channel', 'x') ON CONFLICT DO NOTHING`.execute(db)
   // nextval вызывается один раз (через CTE) и это же значение идёт и в human_ref, и в seq —
   // два отдельных вызова nextval() дали бы разные числа (human_ref='TR-1058' при seq=1059).
   const trade = async (ch: number) => {
@@ -69,7 +72,7 @@ it('BIGINT читается через Kysely как number, NUMERIC — ост�
   // id канала Telegram (~2*10^9) заведомо меньше Number.MAX_SAFE_INTEGER
   const channelId = 2088626562
   await sql`INSERT INTO channels (id, ord, key, source_kind, adapter_id)
-            VALUES (${channelId}, 3, 'test-bigint', 'channel', 'x') ON CONFLICT DO NOTHING`.execute(db)
+            VALUES (${channelId}, 993, 'test-bigint', 'channel', 'x') ON CONFLICT DO NOTHING`.execute(db)
 
   const channel = await db
     .selectFrom('channels')
