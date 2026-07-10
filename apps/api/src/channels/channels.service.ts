@@ -63,7 +63,10 @@ function toChannelDto(row: ChannelRow): ChannelDto {
     id: row.id,
     key: row.key,
     title,
-    handle: row.handle ?? '',
+    // Приватные каналы/форумы не имеют username → channels.handle пуст. Фолбэк — «#<id>»
+    // (id канала — это же «сырой» Telegram id, см. packages/shared/src/sources.ts), чтобы
+    // моноширинная строка под названием никогда не была пустой (design/project/Admin.dc.html:184).
+    handle: row.handle ?? `#${row.id}`,
     initial: title.charAt(0).toUpperCase(),
     status: row.status,
     copyEnabled: row.enabled,

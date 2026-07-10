@@ -10,6 +10,10 @@ import { apiFetch } from '../src/lib/api.js'
 // apiFetch замокан целиком — тест проверяет только рендер таблицы и навигацию,
 // без реальной сети (GET /channels).
 vi.mock('../src/lib/api.js', () => ({ apiFetch: vi.fn() }))
+// ChannelPage (после задачи 12) тянет реалтайм через useChannelStream/socket.io-client —
+// в этом файле проверяется только навигация со списка каналов, поэтому сокет замокан в no-op,
+// чтобы не открывать реальное соединение внутри jsdom.
+vi.mock('../src/lib/ws.js', () => ({ useChannelStream: () => {} }))
 
 const CHANNELS: ChannelDto[] = [
   {
@@ -69,10 +73,26 @@ function renderChannels() {
   )
 }
 
+// ChannelPage запрашивает GET /channels/:id (шапка) и GET /channels/:id/messages (таймлайн) —
+// апиfetch тут мокается по пути запроса, а не одним and тем же значением для всех вызовов.
+function mockApiByPath() {
+  vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+    if (path === '/channels') return CHANNELS
+    const messagesMatch = /^\/channels\/(\d+)\/messages/.exec(path)
+    if (messagesMatch) return []
+    const channelMatch = /^\/channels\/(\d+)$/.exec(path)
+    if (channelMatch) {
+      const found = CHANNELS.find((c) => String(c.id) === channelMatch[1])
+      if (found) return found
+    }
+    throw new Error(`неожиданный путь в моке apiFetch: ${path}`)
+  })
+}
+
 describe('ChannelsPage', () => {
   beforeEach(() => {
     vi.mocked(apiFetch).mockReset()
-    vi.mocked(apiFetch).mockResolvedValue(CHANNELS)
+    mockApiByPath()
   })
 
   it('рендерит все восемь заголовков колонок', async () => {
@@ -96,6 +116,8 @@ describe('ChannelsPage', () => {
     renderChannels()
     const row = await screen.findByText('Crypto Signals VIP')
     row.closest('tr')?.click()
-    expect(await screen.findByText('Channel #1')).toBeInTheDocument()
+    // Список каналов размонтируется при переходе — на экране канала остаётся его шапка
+    // (design/project/Admin.dc.html:184: `{handle} · {messageCount} messages · {actionCount} actions`).
+    expect(await screen.findByText('@crypto_vip · 340 messages · 12 actions')).toBeInTheDocument()
   })
 })

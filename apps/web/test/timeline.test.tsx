@@ -1,0 +1,132 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { render, screen, waitFor } from '@testing-library/react'
+import type { MessageDto } from 'shared/dto.js'
+import type { MessageNewPayload } from 'shared/ws-events.js'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { MessageTimeline } from '../src/components/MessageTimeline.js'
+import { apiFetch } from '../src/lib/api.js'
+
+// apiFetch замокан целиком — тест проверяет только рендер таймлайна, без реальной сети.
+vi.mock('../src/lib/api.js', () => ({ apiFetch: vi.fn() }))
+
+// socket.io-client замокан целиком: useChannelStream должен работать поверх любого сокета,
+// а тест дальше сам «нажимает» на message.new через захваченный обработчик — без реального
+// сетевого соединения (jsdom его всё равно не поднимет).
+function createMockSocket() {
+  return { on: vi.fn(), off: vi.fn(), emit: vi.fn() }
+}
+const mockSocket = createMockSocket()
+vi.mock('socket.io-client', () => ({ io: vi.fn(() => mockSocket) }))
+
+const CHANNEL_ID = 1
+
+function messageFixture(overrides: Partial<MessageDto> = {}): MessageDto {
+  return {
+    id: 'm-1',
+    tgMessageId: 1001,
+    time: '2026-07-10T12:00:00.000Z',
+    text: 'ETH/USDT LONG from 3,180',
+    media: [],
+    aiSummary: null,
+    actions: [],
+    method: 'auto',
+    ...overrides,
+  }
+}
+
+function renderTimeline(initial: MessageDto[]) {
+  vi.mocked(apiFetch).mockResolvedValue(initial)
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  render(
+    <QueryClientProvider client={queryClient}>
+      <MessageTimeline channelId={CHANNEL_ID} />
+    </QueryClientProvider>,
+  )
+  return queryClient
+}
+
+// Обработчик 'message.new', зарегистрированный useChannelStream через мок-сокет —
+// вызываем его напрямую, эмулируя приход события с сервера.
+function getMessageNewHandler(): (payload: MessageNewPayload) => void {
+  const call = mockSocket.on.mock.calls.findLast(([event]) => event === 'message.new') as
+    | [string, (payload: MessageNewPayload) => void]
+    | undefined
+  if (!call) throw new Error("обработчик 'message.new' не зарегистрирован")
+  return call[1]
+}
+
+describe('MessageTimeline', () => {
+  beforeEach(() => {
+    vi.mocked(apiFetch).mockReset()
+    mockSocket.on.mockClear()
+    mockSocket.off.mockClear()
+    mockSocket.emit.mockClear()
+  })
+
+  it('сообщение без действий рисует серую точку узла, а не плитку с иконкой', async () => {
+    renderTimeline([messageFixture({ actions: [] })])
+    const dot = await screen.findByTestId('node-dot')
+    expect(dot).toBeInTheDocument()
+    expect(getComputedStyle(dot).backgroundColor).toBe('rgb(58, 58, 64)')
+    const tile = screen.getByTestId('node-tile')
+    expect(tile.querySelector('svg')).toBeNull()
+  })
+
+  it('сообщение с media рендерит <img> с src="/media/<id>"', async () => {
+    renderTimeline([
+      messageFixture({ media: [{ url: '/media/abc-123', kind: 'photo' }] }),
+    ])
+    await screen.findByTestId('node-dot')
+    const img = document.querySelector('img')
+    expect(img).not.toBeNull()
+    expect(img?.getAttribute('src')).toBe('/media/abc-123')
+  })
+
+  it('сообщение с aiSummary и пустыми actions рендерит блок саммари с иконкой sparkles', async () => {
+    renderTimeline([
+      messageFixture({ aiSummary: 'Информационное сообщение, сигнала нет.', actions: [] }),
+    ])
+    const summary = await screen.findByTestId('ai-summary')
+    expect(summary).toHaveTextContent('Информационное сообщение, сигнала нет.')
+    expect(summary.querySelector('svg')).not.toBeNull()
+  })
+
+  it("событие message.new добавляет узел в начало списка без перезагрузки", async () => {
+    renderTimeline([messageFixture({ id: 'm-1', text: 'старое сообщение' })])
+    await screen.findByText('старое сообщение')
+    expect(screen.getAllByTestId('message-row')).toHaveLength(1)
+
+    const handler = getMessageNewHandler()
+    handler({
+      channelId: CHANNEL_ID,
+      message: messageFixture({ id: 'm-2', text: 'новое сообщение из сокета' }),
+    })
+
+    // findAllByTestId резолвится, как только находит ХОТЬ ОДИН элемент — уже существующая
+    // строка удовлетворяет этому условию раньше, чем кэш успевает обновиться, поэтому здесь
+    // нужен именно waitFor с проверкой длины, а не неявный ретрай findBy*.
+    await waitFor(() => {
+      expect(screen.getAllByTestId('message-row')).toHaveLength(2)
+    })
+    const rows = screen.getAllByTestId('message-row')
+    expect(rows[0]).toHaveTextContent('новое сообщение из сокета')
+    expect(rows[1]).toHaveTextContent('старое сообщение')
+  })
+
+  it('повторное message.new с тем же id не создаёт второй узел', async () => {
+    renderTimeline([messageFixture({ id: 'm-1', text: 'старое сообщение' })])
+    await screen.findByText('старое сообщение')
+
+    const handler = getMessageNewHandler()
+    const duplicate = messageFixture({ id: 'm-2', text: 'новое сообщение из сокета' })
+    handler({ channelId: CHANNEL_ID, message: duplicate })
+    await waitFor(() => {
+      expect(screen.getAllByTestId('message-row')).toHaveLength(2)
+    })
+
+    handler({ channelId: CHANNEL_ID, message: duplicate })
+    await waitFor(() => {
+      expect(screen.getAllByTestId('message-row')).toHaveLength(2)
+    })
+  })
+})

@@ -16,7 +16,7 @@
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose stop postgres",
     "db:psql": "docker compose exec postgres psql -U ${POSTGRES_USER:-copytrade} -d ${POSTGRES_DB:-copytrade}",
-    "test": "pnpm -r test",
+    "test": "pnpm -r --workspace-concurrency=1 test",
     "typecheck": "pnpm -r typecheck"
   },
   "devDependencies": {

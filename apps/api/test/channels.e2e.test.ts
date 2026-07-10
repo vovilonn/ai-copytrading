@@ -89,6 +89,14 @@ it('GET /channels возвращает оба засеянных канала', 
   expect(ch1.initial.length).toBe(1)
 })
 
+it('channels.handle пуст в БД -> фолбэк "#<id>" (приватный канал без username)', async () => {
+  // ChannelSeedService всегда сидирует handle: null (без доступа к Telegram) — оба тестовых
+  // канала попадают под фолбэк, пока их никто не обновил.
+  const res = await agent.get(`/channels/${CHANNEL_1_ID}`).expect(200)
+  const channel = res.body as ChannelDto
+  expect(channel.handle).toBe(`#${CHANNEL_1_ID}`)
+})
+
 it('GET /channels/:id отдаёт один канал в том же формате', async () => {
   const res = await agent.get(`/channels/${CHANNEL_1_ID}`).expect(200)
   const channel = res.body as ChannelDto
