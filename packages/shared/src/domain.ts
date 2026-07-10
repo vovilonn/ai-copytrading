@@ -89,3 +89,11 @@ export interface ParsedResult {
   reason?: string // 'no_SL' | 'symbol_not_listed' | 'symbol_unknown_needs_vision'
   needsVision?: boolean // CH2: символ только в mediaFile
 }
+
+// Типы состояния сделки (задача 5, `apps/engine/src/state/trades.ts` + БД-типы
+// apps/api/src/db/database.ts) — дословно enum'ы из миграции 001_initial.ts
+// (trade_status/leg_kind/leg_status). Единый источник правды для api и engine —
+// не дублировать строковые union'ы в обоих местах (DRY).
+export type TradeStatus = 'pending' | 'open' | 'partially_closed' | 'closed' | 'cancelled' | 'skipped'
+export type LegKind = 'entry' | 'add'
+export type LegStatus = 'pending' | 'working' | 'partially_filled' | 'filled' | 'cancelled' | 'rejected'

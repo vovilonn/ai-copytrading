@@ -1,5 +1,6 @@
 import { Kysely, PostgresDialect, type Generated } from 'kysely'
 import pg from 'pg'
+import type { Side, TradeStatus, LegKind, LegStatus } from 'shared/domain.js'
 
 // node-postgres по умолчанию отдаёт int8 строкой, чтобы не потерять точность.
 // Все наши BIGINT (id каналов и сообщений Telegram, счётчик событий) заведомо
@@ -131,8 +132,58 @@ export interface DB {
     mmr: string | null
     refreshed_at: Generated<Date>
   }
+  // Задача 5 (Ф1): trades/trade_legs/symbol_ownership — состояние сделок и атомарный захват
+  // символа внутри канала (apps/engine/src/state/trades.ts). side/status-энумы переиспользованы
+  // из shared/domain.ts (DRY, единый источник правды с engine).
+  trades: {
+    // seq — БЕЗ Generated: у колонки в схеме нет DEFAULT (значение берётся из nextval('trade_ref_seq')
+    // на стороне JS одним вызовом вместе с human_ref, см. openTrade — граблю Ф0 из task-2-report.md).
+    id: Generated<string>
+    human_ref: string
+    seq: number
+    channel_id: number
+    symbol: string
+    side: Side
+    status: Generated<TradeStatus>
+    opened_action_id: string | null
+    opened_msg_id: string | null
+    avg_entry: string | null
+    size: Generated<string>
+    initial_size: string | null
+    leverage: string | null
+    margin_mode: Generated<string>
+    realized_pnl: Generated<string>
+    fees_paid: Generated<string>
+    is_win: boolean | null
+    opened_at: Date | null
+    closed_at: Date | null
+    updated_at: Generated<Date>
+  }
+  trade_legs: {
+    id: Generated<string>
+    trade_id: string
+    leg_index: number
+    kind: LegKind
+    source_message_id: string | null
+    source_action_id: string | null
+    requested_qty: string
+    filled_qty: Generated<string>
+    avg_price: string | null
+    notional: string | null
+    status: Generated<LegStatus>
+    opened_at: Date | null
+    updated_at: Generated<Date>
+  }
+  symbol_ownership: {
+    id: Generated<string>
+    symbol: string
+    channel_id: number
+    trade_id: string
+    acquired_at: Generated<Date>
+    released_at: Date | null
+  }
   // остальные таблицы схемы (processed_messages, parse_results, ai_calls,
-  // ai_cache, actions, trades, trade_legs, orders, executions, symbol_ownership, positions,
+  // ai_cache, actions, orders, executions, positions,
   // audit_log, app_state) объявляются здесь же по мере использования в Ф1–Ф4.
   // Пока созданы миграцией, но не типизированы — тесты, которым нужен сырой SQL, используют sql`...`.
 }
