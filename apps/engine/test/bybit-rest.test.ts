@@ -218,6 +218,61 @@ describe('BybitRestClient — идемпотентные/ошибочные retC
     )
   })
 
+  it('createOrder: stopLoss/slTriggerBy пробрасываются в тело запроса (Critical C1 — атомарный SL со входом)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    let capturedBody: Record<string, unknown> | undefined
+    await withMockFetch(
+      (async (_url: unknown, init?: RequestInit) => {
+        capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return mockResponse({ retCode: 0, retMsg: 'OK', result: { orderId: 'abc-1', orderLinkId: 'K01-1-00-E0' } })
+      }) as typeof fetch,
+      () =>
+        client.createOrder({
+          symbol: 'BTCUSDT',
+          side: 'Buy',
+          orderType: 'Market',
+          qty: '0.001',
+          orderLinkId: 'K01-1-00-E0',
+          stopLoss: '45000',
+          slTriggerBy: 'LastPrice',
+        }),
+    )
+    expect(capturedBody).toMatchObject({ stopLoss: '45000', slTriggerBy: 'LastPrice' })
+  })
+
+  it('createOrder: без stopLoss -> поле вообще не попадает в тело запроса (add/доливка не шлёт SL)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    let capturedBody: Record<string, unknown> | undefined
+    await withMockFetch(
+      (async (_url: unknown, init?: RequestInit) => {
+        capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return mockResponse({ retCode: 0, retMsg: 'OK', result: { orderId: 'abc-2', orderLinkId: 'K01-1-00-A0' } })
+      }) as typeof fetch,
+      () => client.createOrder({ symbol: 'BTCUSDT', side: 'Buy', orderType: 'Market', qty: '0.001', orderLinkId: 'K01-1-00-A0' }),
+    )
+    expect(capturedBody).not.toHaveProperty('stopLoss')
+    expect(capturedBody).not.toHaveProperty('slTriggerBy')
+  })
+
+  it('cancelOrder: retCode 110001 ("order not exists") → {ok:true, idempotent:true}, не бросает (Important I1)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    const result = await withMockFetch(
+      (async () => mockResponse({ retCode: 110001, retMsg: 'order not exists', result: {} })) as typeof fetch,
+      () => client.cancelOrder({ symbol: 'BTCUSDT', orderLinkId: 'K01-1-00-S0' }),
+    )
+    expect(result).toEqual({ ok: true, idempotent: true })
+  })
+
+  it('cancelOrder: прочий ненулевой retCode бросает BybitApiError, не проглатывается', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    await expect(
+      withMockFetch(
+        (async () => mockResponse({ retCode: 10001, retMsg: 'params error', result: {} })) as typeof fetch,
+        () => client.cancelOrder({ symbol: 'BTCUSDT', orderLinkId: 'K01-1-00-E0' }),
+      ),
+    ).rejects.toMatchObject({ retCode: 10001 })
+  })
+
   it('retCode 10006 (rate limit UID) → ждёт до X-Bapi-Limit-Reset-Timestamp и повторяет успешно', async () => {
     vi.useFakeTimers()
     try {

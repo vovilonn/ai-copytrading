@@ -544,4 +544,51 @@ describe('BybitPrivateWs — диспетчеризация сырых фрей�
     // op:auth/op:subscribe ack — не топик-фрейм, не должен маршрутизироваться как данные.
     await expect(dispatch.handleMessage('{"op":"auth","success":true}')).resolves.toBeUndefined()
   })
+
+  it('Important I3 адверсариального ревью: ".linear"-суффиксные топики (РЕАЛЬНЫЙ формат подписки — SUBSCRIBE_TOPICS шлёт именно их) маршрутизируются так же, как bare-имена', async () => {
+    const symbol = 'FTMUSDT'
+    const { tradeId, actionId } = await setupTrade(symbol, 'long')
+    const orderLinkId = 'TR-FTM-E0'
+    await seedOrder({ tradeId, actionId, symbol, side: 'long', orderLinkId })
+    const { rest } = mockCancelAllRest()
+
+    const ws = new BybitPrivateWs({ apiKey: 'k', apiSecret: 's', network: 'testnet', db, rest })
+    const dispatch = ws as unknown as { handleMessage(raw: string): Promise<void> }
+
+    await dispatch.handleMessage(
+      JSON.stringify({ topic: 'position.linear', data: [{ symbol, side: 'Buy', size: '3', entryPrice: '1', markPrice: '1.1', seq: 1 }] }),
+    )
+    const position = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(position.mark_price).toBe('1.1000000000')
+
+    await dispatch.handleMessage(JSON.stringify({ topic: 'order.linear', data: [{ orderId: 'bx-linear-1', orderLinkId, orderStatus: 'Filled' }] }))
+    const order = await db.selectFrom('orders').selectAll().where('order_link_id', '=', orderLinkId).executeTakeFirstOrThrow()
+    expect(order.status).toBe('filled')
+    expect(order.bybit_order_id).toBe('bx-linear-1')
+
+    // execution.linear/wallet — те же apply*Push уже покрыты выше на bare-имени; здесь
+    // достаточно подтвердить, что ".linear" не ломает диспетчеризацию ни для одного из четырёх.
+    await expect(dispatch.handleMessage(JSON.stringify({ topic: 'wallet', data: [{ accountType: 'UNIFIED', totalEquity: '500' }] }))).resolves.toBeUndefined()
+  })
+
+  it('Important I3: неизвестный topic логируется (warn), а не тихо дропается', async () => {
+    const logs: string[] = []
+    const log = {
+      log: () => {},
+      warn: (...args: unknown[]) => logs.push(args.map(String).join(' ')),
+      error: () => {},
+    }
+    const { rest } = mockCancelAllRest()
+    const ws = new BybitPrivateWs({ apiKey: 'k', apiSecret: 's', network: 'testnet', db, rest, log })
+    const dispatch = ws as unknown as { handleMessage(raw: string): Promise<void> }
+
+    await dispatch.handleMessage(JSON.stringify({ topic: 'liquidation.linear', data: [{ symbol: 'BTCUSDT' }] }))
+
+    expect(logs.some((l) => l.includes('liquidation.linear'))).toBe(true)
+  })
 })

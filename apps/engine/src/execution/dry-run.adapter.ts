@@ -99,6 +99,41 @@ export class DryRunAdapter implements ExecutionPort {
       `.execute(tx)
     }
 
+    if (order.stopLoss !== undefined) {
+      // Critical C1 адверсариального ревью (p3-core-fix-report.md): паритет с BybitAdapter —
+      // тот же linkId 'sl'/index 0, что раньше писал отдельный вызов setStopLoss(), теперь
+      // атомарно вместе со входом. DryRunAdapter не ходит к бирже вовсе, поэтому здесь просто
+      // строка orders(purpose='sl') + positions.stop_loss, идентично прежнему поведению
+      // setStopLoss (см. ниже) — только МОМЕНТ вызова меняется, не эффект.
+      const slLinkId = buildLinkId(order, 'sl', 0)
+      await tx
+        .insertInto('orders')
+        .values({
+          trade_id: order.tradeId,
+          action_id: order.actionId,
+          channel_id: order.channelId,
+          symbol: order.symbol,
+          order_link_id: slLinkId,
+          purpose: 'sl',
+          side: order.side,
+          order_type: 'limit',
+          reduce_only: true,
+          qty: order.qty,
+          price: order.stopLoss,
+          status: 'submitted',
+          submitted_at: new Date(),
+        })
+        .onConflict((oc) => oc.column('order_link_id').doNothing())
+        .execute()
+
+      await tx
+        .updateTable('positions')
+        .set({ stop_loss: order.stopLoss, updated_at: new Date() })
+        .where('channel_id', '=', order.channelId)
+        .where('symbol', '=', order.symbol)
+        .execute()
+    }
+
     return { orderId: inserted.id, orderLinkId: linkId }
   }
 

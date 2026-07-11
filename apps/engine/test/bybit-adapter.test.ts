@@ -282,6 +282,208 @@ describe('BybitAdapter.placeEntry', () => {
   })
 })
 
+describe('BybitAdapter.placeEntry — Critical C1: SL атомарно со входом', () => {
+  it('order.stopLoss задан -> createOrder получает stopLoss (округлённый к тику по closeSide), setTradingStop НЕ вызывается, локальная orders(purpose=sl) создана без второго сетевого вызова', async () => {
+    await seedInstrument({ symbol: 'ATOMUSDT', qtyStep: '0.01', tickSize: '0.01', leverageStep: '1' })
+    const { rest, calls } = createMockRest()
+    const adapter = new BybitAdapter(rest, 'testnet')
+    const ctx = await setupTradeContext('ATOMUSDT', 'long')
+
+    const entry = await adapter.placeEntry(db, {
+      channelId: CHANNEL_ID,
+      channelOrd: CHANNEL_ORD,
+      tgMessageId: ctx.tgMessageId,
+      actionIndex: 0,
+      actionId: ctx.actionId,
+      tradeId: ctx.tradeId,
+      legId: ctx.legId,
+      symbol: 'ATOMUSDT',
+      side: 'long',
+      purpose: 'entry',
+      orderType: 'market',
+      qty: '10',
+      price: '5',
+      leverage: '5',
+      liqPrice: '4.02',
+      stopLoss: '4.505', // long -> closeSide Sell -> ceil к 0.01 -> 4.51
+    })
+
+    const createOrderCall = vi.mocked(rest.createOrder).mock.calls[0]?.[0]
+    expect(createOrderCall).toMatchObject({ stopLoss: '4.51' })
+    // Ни одного сетевого setTradingStop — SL ушёл АТОМАРНО в теле createOrder выше, второй
+    // вызов не нужен (это и есть исправление Critical C1: раньше здесь был отдельный вызов).
+    expect(calls.some((c) => c === 'setTradingStop')).toBe(false)
+
+    const slOrder = await db
+      .selectFrom('orders')
+      .selectAll()
+      .where('trade_id', '=', ctx.tradeId)
+      .where('purpose', '=', 'sl')
+      .executeTakeFirstOrThrow()
+    expect(slOrder.reduce_only).toBe(true)
+    expect(slOrder.status).toBe('submitted')
+    expect(slOrder.price).toBe('4.5100000000')
+    expect(slOrder.bybit_order_id).toBeNull() // trading-stop — не отдельный ордер, orderId не существует
+
+    // Строка входа осталась ровно одна (SL — companion-строка, не второй "вход").
+    const entryOrder = await db.selectFrom('orders').selectAll().where('id', '=', entry.orderId).executeTakeFirstOrThrow()
+    expect(entryOrder.purpose).toBe('entry')
+  })
+
+  it('order.stopLoss НЕ задан (напр. purpose=add) -> stopLoss в createOrder отсутствует, локальная sl-строка не создаётся', async () => {
+    await seedInstrument({ symbol: 'NEARUSDT', qtyStep: '0.1', tickSize: '0.01', leverageStep: '1' })
+    const { rest } = createMockRest()
+    const adapter = new BybitAdapter(rest, 'testnet')
+    const ctx = await setupTradeContext('NEARUSDT', 'long')
+
+    await adapter.placeEntry(db, {
+      channelId: CHANNEL_ID,
+      channelOrd: CHANNEL_ORD,
+      tgMessageId: ctx.tgMessageId,
+      actionIndex: 0,
+      actionId: ctx.actionId,
+      tradeId: ctx.tradeId,
+      legId: ctx.legId,
+      symbol: 'NEARUSDT',
+      side: 'long',
+      purpose: 'entry',
+      orderType: 'market',
+      qty: '10',
+      price: '5',
+      leverage: '5',
+      liqPrice: '4.02',
+      // stopLoss отсутствует — тот же контракт, что и до Critical C1.
+    })
+
+    const createOrderCall = vi.mocked(rest.createOrder).mock.calls[0]?.[0]
+    expect(createOrderCall).not.toHaveProperty('stopLoss')
+
+    const slCount = await db
+      .selectFrom('orders')
+      .select(({ fn }) => fn.countAll<string>().as('n'))
+      .where('trade_id', '=', ctx.tradeId)
+      .where('purpose', '=', 'sl')
+      .executeTakeFirstOrThrow()
+    expect(Number(slCount.n)).toBe(0)
+  })
+
+  it('createOrder отклоняет вход (мок бросает) -> НИ строки entry, НИ строки sl — позиция никогда не остаётся "наполовину защищённой"', async () => {
+    await seedInstrument({ symbol: 'FTMUSDT', qtyStep: '1', tickSize: '0.001', leverageStep: '1' })
+    const rest: BybitAdapterRestClient = {
+      switchMode: vi.fn(async () => ({ ok: true as const })),
+      setLeverage: vi.fn(async () => ({ ok: true as const, idempotent: false })),
+      createOrder: vi.fn(async () => {
+        throw new Error('Bybit retCode=110017 (qty invalid) на /v5/order/create')
+      }),
+      setTradingStop: vi.fn(async () => ({ ok: true as const })),
+      cancelOrder: vi.fn(async () => ({ ok: true as const })),
+    }
+    const adapter = new BybitAdapter(rest, 'testnet')
+    const ctx = await setupTradeContext('FTMUSDT', 'long')
+
+    await expect(
+      adapter.placeEntry(db, {
+        channelId: CHANNEL_ID,
+        channelOrd: CHANNEL_ORD,
+        tgMessageId: ctx.tgMessageId,
+        actionIndex: 0,
+        actionId: ctx.actionId,
+        tradeId: ctx.tradeId,
+        legId: ctx.legId,
+        symbol: 'FTMUSDT',
+        side: 'long',
+        purpose: 'entry',
+        orderType: 'market',
+        qty: '100',
+        price: '1',
+        leverage: '5',
+        liqPrice: '0.805',
+        stopLoss: '0.9',
+      }),
+    ).rejects.toThrow()
+
+    const orderCount = await db
+      .selectFrom('orders')
+      .select(({ fn }) => fn.countAll<string>().as('n'))
+      .where('trade_id', '=', ctx.tradeId)
+      .executeTakeFirstOrThrow()
+    // Отказ вошёл ДО первого insert — ни строки entry, ни строки sl. Позиция на бирже вообще
+    // не открылась (весь вход отклонён целиком) — не остаётся "живой без защиты".
+    expect(Number(orderCount.n)).toBe(0)
+  })
+})
+
+describe('BybitAdapter.cancelOrder — Important I1: SL снимается через setTradingStop, не order/cancel', () => {
+  it('SL-строка (purpose=sl, bybit_order_id=null) -> setTradingStop(stopLoss="0"), rest.cancelOrder НЕ вызывается', async () => {
+    await seedInstrument({ symbol: 'GALAUSDT', qtyStep: '1', tickSize: '0.0001', leverageStep: '1' })
+    const { rest } = createMockRest()
+    const adapter = new BybitAdapter(rest, 'testnet')
+    const ctx = await setupTradeContext('GALAUSDT', 'long')
+
+    const entry = await adapter.placeEntry(db, {
+      channelId: CHANNEL_ID,
+      channelOrd: CHANNEL_ORD,
+      tgMessageId: ctx.tgMessageId,
+      actionIndex: 0,
+      actionId: ctx.actionId,
+      tradeId: ctx.tradeId,
+      legId: ctx.legId,
+      symbol: 'GALAUSDT',
+      side: 'long',
+      purpose: 'entry',
+      orderType: 'market',
+      qty: '100',
+      price: '0.02',
+      leverage: '5',
+      liqPrice: '0.0161',
+      stopLoss: '0.018',
+    })
+    const slOrder = await db.selectFrom('orders').selectAll().where('trade_id', '=', ctx.tradeId).where('purpose', '=', 'sl').executeTakeFirstOrThrow()
+
+    await adapter.cancelOrder(db, { orderLinkId: slOrder.order_link_id })
+
+    expect(rest.setTradingStop).toHaveBeenCalledWith({ symbol: 'GALAUSDT', positionIdx: 0, tpslMode: 'Full', stopLoss: '0' })
+    expect(rest.cancelOrder).not.toHaveBeenCalled()
+
+    const updated = await db.selectFrom('orders').selectAll().where('id', '=', slOrder.id).executeTakeFirstOrThrow()
+    expect(updated.status).toBe('cancelled')
+
+    // Строка входа (entry) НЕ затронута этой отменой SL.
+    const entryOrder = await db.selectFrom('orders').selectAll().where('id', '=', entry.orderId).executeTakeFirstOrThrow()
+    expect(entryOrder.status).toBe('submitted')
+  })
+
+  it('обычный ордер (entry/tp/close, есть bybit_order_id) -> по-прежнему rest.cancelOrder, setTradingStop НЕ вызывается', async () => {
+    await seedInstrument({ symbol: 'INJUSDT', qtyStep: '0.1', tickSize: '0.001', leverageStep: '1' })
+    const { rest } = createMockRest()
+    const adapter = new BybitAdapter(rest, 'testnet')
+    const ctx = await setupTradeContext('INJUSDT', 'long')
+
+    const entry = await adapter.placeEntry(db, {
+      channelId: CHANNEL_ID,
+      channelOrd: CHANNEL_ORD,
+      tgMessageId: ctx.tgMessageId,
+      actionIndex: 0,
+      actionId: ctx.actionId,
+      tradeId: ctx.tradeId,
+      legId: ctx.legId,
+      symbol: 'INJUSDT',
+      side: 'long',
+      purpose: 'entry',
+      orderType: 'limit', // submitted, не filled — есть что отменять
+      qty: '10',
+      price: '20',
+      leverage: '5',
+      liqPrice: '16.1',
+    })
+
+    await adapter.cancelOrder(db, { orderLinkId: entry.orderLinkId })
+
+    expect(rest.cancelOrder).toHaveBeenCalledWith({ symbol: 'INJUSDT', orderLinkId: entry.orderLinkId })
+    expect(rest.setTradingStop).not.toHaveBeenCalled()
+  })
+})
+
 describe('BybitAdapter.placeTpLadder', () => {
   it('3 цели -> 3 createOrder reduceOnly с разными orderLinkId K...-T0/T1/T2, qty кратно qtyStep, сумма = размеру позиции', async () => {
     await seedInstrument({ symbol: 'XRPUSDT', qtyStep: '1', tickSize: '0.01', leverageStep: '1' })

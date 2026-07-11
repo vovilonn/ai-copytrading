@@ -64,7 +64,25 @@ export interface PipelineDeps {
    * сабаккаунты, это поле заменится на живой баланс — сигнатура ExecutionPort/pipeline не изменится.
    */
   equity: string
+  /**
+   * Important I2 адверсариального ревью (p3-core-fix-report.md): живой mark price символа —
+   * гейт staleness/slippage перед market-входом (см. DEFAULT_MAX_ENTRY_SLIPPAGE_PCT/
+   * handleEntrySignal ниже). `undefined` в dry_run (main.ts не подключает сеть в этом режиме —
+   * см. PipelineDeps.equity выше про тот же принцип "0 сетевых походов в dry-run") — гейт тогда
+   * НЕ применяется, entry_signal ведёт себя ровно как до этого фикса. В live main.ts подставляет
+   * живой запрос (rest.getPositions(symbol) — стаб-позиция несёт markPrice даже при size=0).
+   * Инжектируется функцией (а не готовым значением), т.к. mark price нужен ПЕРЕД каждым входом
+   * и может отличаться по символам внутри одного тика.
+   */
+  getMarkPrice?: (symbol: string) => Promise<string | null>
+  /** Порог гейта I2, % (design: дефолт '0.5' = MAX_ENTRY_SLIPPAGE_PCT, .env.example). */
+  maxEntrySlippagePct?: string
 }
+
+// Important I2 (адверсариальное ревью): вход всегда market по СИГНАЛЬНОЙ цене — если реальный
+// mark отклонился от неё больше чем на этот порог (сигнал устарел/цена уже ушла), риск/сайзинг,
+// посчитанные по сигнальной цене, больше не отражают реальность — лучше skip, чем вход вслепую.
+const DEFAULT_MAX_ENTRY_SLIPPAGE_PCT = '0.5'
 
 type ChannelRow = Selectable<DB['channels']>
 type ChannelSettingsRow = Selectable<DB['channel_settings']>
@@ -843,6 +861,21 @@ async function handleEntrySignal(
     intent.side === 'long' ? projectedLiq.mul(new Decimal(1).plus(buf)).lt(sl) : projectedLiq.mul(new Decimal(1).minus(buf)).gt(sl)
   if (!safeStop) return { skipReason: 'unsafe_stop' }
 
+  // Important I2 адверсариального ревью (p3-core-fix-report.md): вход всегда market по
+  // СИГНАЛЬНОЙ цене — риск/сайзинг ниже считаются от entryPrice, а реальный филл может быть
+  // далеко, если сигнал протух (staleness) или цена уже ушла (slippage). Гейт применяется ТОЛЬКО
+  // когда есть живой источник цены (live, deps.getMarkPrice подключён main.ts) — dry_run или сбой
+  // самого похода за ценой (null) -> fail-open, поведение идентично состоянию до этого фикса
+  // (dry_run не имеет и не должен иметь сетевого пути к бирже, см. PipelineDeps.equity выше).
+  if (base.deps.getMarkPrice) {
+    const currentMark = await base.deps.getMarkPrice(intent.symbol)
+    if (currentMark !== null) {
+      const maxSlippagePct = new Decimal(base.deps.maxEntrySlippagePct ?? DEFAULT_MAX_ENTRY_SLIPPAGE_PCT)
+      const deviationPct = new Decimal(currentMark).minus(entryPrice).abs().div(entryPrice).mul(100)
+      if (deviationPct.gt(maxSlippagePct)) return { skipReason: 'price_slippage' }
+    }
+  }
+
   const sizeResult = computeSize({
     ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct.toString() } : {}),
     equity: base.deps.equity,
@@ -894,6 +927,15 @@ async function handleEntrySignal(
     // Полировка А (task-11-brief.md): projectedLiq уже посчитан выше для гейта safeStop —
     // переиспользуем то же значение, чтобы positions.liq_price не оставался '—' на UI.
     liqPrice: projectedLiq.toString(),
+    // Critical C1 адверсариального ревью (p3-core-fix-report.md): SL идёт АТОМАРНО вместе со
+    // входом (BybitAdapter передаёт его прямо в теле order/create) — либо позиция открывается уже
+    // защищённой, либо не открывается вовсе. Раньше здесь были ТРИ последовательных сетевых
+    // вызова (placeEntry -> placeTpLadder -> setStopLoss) в одной БД-транзакции: гонка "нулевая
+    // позиция сразу после market-входа" могла уронить setStopLoss, а детерминированный отказ SL
+    // откатывал транзакцию -> replay -> тот же детерминированный отказ -> бесконечный цикл при
+    // ЖИВОЙ незащищённой позиции на бирже (см. отчёт). Отдельного setStopLoss после TP-лесенки
+    // больше нет — если TP-лесенка ниже всё же не поставится, позиция УЖЕ защищена этим SL.
+    stopLoss: sl.toString(),
   })
 
   if (intent.tps.length > 0) {
@@ -902,8 +944,6 @@ async function handleEntrySignal(
       await base.deps.executionPort.placeTpLadder(trx, { ...orderCtx, tps: tpTargets })
     }
   }
-
-  await base.deps.executionPort.setStopLoss(trx, { ...orderCtx, price: sl.toString(), qty: sizeResult.qty.toString() })
 
   const now = new Date()
   await trx

@@ -235,11 +235,23 @@ function makeOrder(overrides: Partial<Order> & { symbol: string; orderLinkId: st
   }
 }
 
-function makeRest(positions: Position[], openOrders: Order[] = []): ReconcileRestClient {
-  return {
+function makeRest(
+  positions: Position[],
+  openOrders: Order[] = [],
+): { rest: ReconcileRestClient; cancelOrderCalls: Array<{ symbol: string; orderLinkId: string }> } {
+  const cancelOrderCalls: Array<{ symbol: string; orderLinkId: string }> = []
+  const rest: ReconcileRestClient = {
     getPositions: vi.fn(async () => positions),
     getOpenOrders: vi.fn(async () => openOrders),
+    // M1 (Minor адверсариального ревью): реконсиляция теперь умеет отменять осиротевшие
+    // reduceOnly-остатки — мок нужен ВСЕМ тестам этого файла, даже тем, что его не проверяют
+    // напрямую (без него ReconcileRestClient не удовлетворён типом).
+    cancelOrder: vi.fn(async (params: { symbol: string; orderLinkId: string }) => {
+      cancelOrderCalls.push(params)
+      return { ok: true as const }
+    }),
   }
+  return { rest, cancelOrderCalls }
 }
 
 async function auditLogRows(): Promise<Array<{ action: string; entity_id: string | null }>> {
@@ -251,10 +263,10 @@ async function auditLogRows(): Promise<Array<{ action: string; entity_id: string
 
 describe('reconcileOnStart', () => {
   it('позиция на бирже без атрибуции в журнале -> flagged, канал не угадывается (audit_log)', async () => {
-    const rest = makeRest([makePosition({ symbol: 'UNKNOWNUSDT', side: 'Buy', size: '10' })])
+    const { rest } = makeRest([makePosition({ symbol: 'UNKNOWNUSDT', side: 'Buy', size: '10' })])
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0 })
 
     const audit = await auditLogRows()
     expect(audit).toEqual([{ action: 'unknown_position', entity_id: 'UNKNOWNUSDT' }])
@@ -273,13 +285,13 @@ describe('reconcileOnStart', () => {
     // ещё висит на бирже (order/realtime) — атрибуция по orderLinkId должна её реанимировать.
     const seeded = await seedTrade({ symbol: 'ATTRUSDT', side: 'long', live: true, status: 'closed', acquireOwnership: false })
 
-    const rest = makeRest(
+    const { rest } = makeRest(
       [makePosition({ symbol: 'ATTRUSDT', side: 'Buy', size: '20', avgPrice: '150', leverage: '7' })],
       [makeOrder({ symbol: 'ATTRUSDT', orderLinkId: seeded.orderLinkId })],
     )
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 1, closed: 0, flagged: 0 })
+    expect(result).toEqual({ opened: 1, closed: 0, flagged: 0, orphansCancelled: 0 })
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open')
@@ -309,10 +321,10 @@ describe('reconcileOnStart', () => {
     const live = await seedTrade({ symbol: 'CLOSEUSDT', side: 'long', live: true, status: 'open' })
     const dryRun = await seedTrade({ symbol: 'DRYUSDT', side: 'long', live: false, status: 'open' })
 
-    const rest = makeRest([]) // на бирже вообще ничего не открыто
+    const { rest } = makeRest([]) // на бирже вообще ничего не открыто
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 1, flagged: 0 })
+    expect(result).toEqual({ opened: 0, closed: 1, flagged: 0, orphansCancelled: 0 })
 
     const liveTrade = await db.selectFrom('trades').selectAll().where('id', '=', live.tradeId).executeTakeFirstOrThrow()
     expect(liveTrade.status).toBe('closed')
@@ -344,7 +356,7 @@ describe('reconcileOnStart', () => {
       openedAt: new Date(Date.now() - 5_000),
     })
 
-    const rest = makeRest([
+    const { rest } = makeRest([
       makePosition({
         symbol: 'SYNCUSDT',
         side: 'Buy',
@@ -357,7 +369,7 @@ describe('reconcileOnStart', () => {
     ])
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0 })
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open') // статус не тронут
@@ -388,7 +400,7 @@ describe('reconcileOnStart', () => {
       openedAt,
     })
 
-    const rest = makeRest([
+    const { rest } = makeRest([
       makePosition({
         symbol: 'OLDUSDT',
         side: 'Buy',
@@ -400,7 +412,7 @@ describe('reconcileOnStart', () => {
     ])
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0 })
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open') // не закрыт — позиция формально существует на символе
@@ -429,6 +441,49 @@ describeLive('reconcileOnStart (живой testnet) — требует BYBIT_LIV
 
     const result = await reconcileOnStart(db, client)
     console.log('[live] reconcileOnStart() =', JSON.stringify(result))
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0 })
+  })
+})
+
+describe('reconcileOnStart — M1 (Minor адверсариального ревью): осиротевшие reduceOnly-остатки', () => {
+  it('reduceOnly-ордер (TP/SL/close) по символу БЕЗ открытой позиции -> отменяется (orphansCancelled); entry/add того же типа НЕ трогается', async () => {
+    const { rest, cancelOrderCalls } = makeRest(
+      [], // на бирже открытых позиций нет вовсе
+      [
+        makeOrder({ symbol: 'ORPHANUSDT', orderLinkId: 'K01-1-00-T0', reduceOnly: true, orderType: 'Limit' }),
+        // Легитимная отложенная лимитка (entry) того же "бессимвольного" положения — reduceOnly
+        // не выставлен, TTL/cancel_pending её ведение — НЕ забота M1, эта ветка не должна её трогать.
+        makeOrder({ symbol: 'ORPHANUSDT', orderLinkId: 'K01-1-00-E0', reduceOnly: false, orderType: 'Limit' }),
+      ],
+    )
+
+    const result = await reconcileOnStart(db, rest)
+
+    expect(result.orphansCancelled).toBe(1)
+    expect(cancelOrderCalls).toEqual([{ symbol: 'ORPHANUSDT', orderLinkId: 'K01-1-00-T0' }])
+  })
+
+  it('reduceOnly-ордер символа С открытой позицией на бирже -> НЕ трогается (легитимный TP/SL живой позиции)', async () => {
+    const { rest, cancelOrderCalls } = makeRest(
+      [makePosition({ symbol: 'LIVEUSDT', side: 'Buy', size: '5' })],
+      [makeOrder({ symbol: 'LIVEUSDT', orderLinkId: 'K01-2-00-S0', reduceOnly: true, orderType: 'Limit' })],
+    )
+
+    const result = await reconcileOnStart(db, rest)
+
+    expect(result.orphansCancelled).toBe(0)
+    expect(cancelOrderCalls).toEqual([])
+  })
+
+  it('cancelOrder на бирже бросает -> залогировано, не роняет reconcileOnStart, счётчик не инкрементится для этого ордера', async () => {
+    const { rest } = makeRest(
+      [],
+      [makeOrder({ symbol: 'FAILUSDT', orderLinkId: 'K01-3-00-T0', reduceOnly: true, orderType: 'Limit' })],
+    )
+    vi.mocked(rest.cancelOrder).mockRejectedValueOnce(new Error('network boom'))
+
+    const result = await reconcileOnStart(db, rest)
+
+    expect(result.orphansCancelled).toBe(0)
   })
 })

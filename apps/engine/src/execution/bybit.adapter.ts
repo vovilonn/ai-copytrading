@@ -76,6 +76,14 @@ export class BybitAdapter implements ExecutionPort {
     const isMarket = order.orderType === 'market'
     const submittedPrice = isMarket ? order.price : roundPriceToTick(bybitSide, order.price, instrument.tickSize).toString()
 
+    // Critical C1 адверсариального ревью (p3-core-fix-report.md): SL — АТОМАРНО в теле ЭТОГО ЖЕ
+    // createOrder (closeSide/roundPriceToTick — та же направленная логика округления, что и
+    // setStopLoss/placeTpLadder ниже: "не отдать больше, чем задумано"). order.stopLoss не задан
+    // (напр. purpose='add' — доливка на уже защищённую позицию) -> undefined проходит насквозь,
+    // Bybit не получает поле вовсе (rest-client.ts::createOrder), поведение как до этого фикса.
+    const closeSide = toBybitSide(order.side, false)
+    const slPrice = order.stopLoss !== undefined ? roundPriceToTick(closeSide, order.stopLoss, instrument.tickSize).toString() : undefined
+
     const result = await this.rest.createOrder({
       symbol: order.symbol,
       side: bybitSide,
@@ -84,6 +92,7 @@ export class BybitAdapter implements ExecutionPort {
       ...(isMarket ? {} : { price: submittedPrice }),
       orderLinkId: linkId,
       positionIdx: 0,
+      ...(slPrice !== undefined ? { stopLoss: slPrice } : {}),
     })
 
     const inserted = await tx
@@ -111,9 +120,18 @@ export class BybitAdapter implements ExecutionPort {
 
     if (!inserted) {
       // Дубль orderLinkId (110072, research §8) ИЛИ гонка с уже записанной строкой — идемпотентный
-      // успех, не плодим вторую строку/второй реальный ордер на бирже.
+      // успех, не плодим вторую строку/второй реальный ордер на бирже (и не пишем вторую sl-строку
+      // ниже — она уже была написана первым успешным вызовом).
       const existing = await findOrderId(tx, linkId)
       return { orderId: existing, orderLinkId: linkId }
+    }
+
+    if (slPrice !== undefined) {
+      // Локальная запись SL — БЕЗ второго сетевого вызова (он уже атомарно ушёл выше, вместе со
+      // входом): только строка orders(purpose='sl') для аудита/UI и для будущего cancelOrder
+      // (Important I1 — setTradingStop(0), а не order/cancel). bybit_order_id намеренно null —
+      // trading-stop остаётся атрибутом позиции, не отдельным ордером, даже переданный атомарно.
+      await this.recordStopLossOrder(tx, order, qty, slPrice)
     }
 
     return { orderId: inserted.id, orderLinkId: linkId }
@@ -184,7 +202,9 @@ export class BybitAdapter implements ExecutionPort {
     // trading-stop Full (research §5) — гарантированный market-close ВСЕГО остатка при триггере,
     // slSize=qty (остаток позиции на момент вызова). НЕ смешивать с tpSize в одном вызове
     // (research §4: "tpSize и slSize должны совпадать", если оба переданы) — здесь передаём
-    // только SL-поля, TP уже ушли отдельными reduceOnly-ордерами в placeTpLadder.
+    // только SL-поля, TP уже ушли отдельными reduceOnly-ордерами в placeTpLadder. Используется
+    // ТОЛЬКО для последующих правок SL уже открытой позиции (handleDelta: sl_breakeven/sl_set) —
+    // SL исходного входа теперь ставится атомарно в placeEntry (Critical C1), не здесь.
     await this.rest.setTradingStop({
       symbol: params.symbol,
       positionIdx: 0,
@@ -193,20 +213,28 @@ export class BybitAdapter implements ExecutionPort {
       slSize: qty,
     })
 
-    const linkId = buildLinkId(params, 'sl', 0)
+    return this.recordStopLossOrder(tx, params, qty, price)
+  }
+
+  /**
+   * Локальная запись строки `orders(purpose='sl')` — общая для setStopLoss() (сетевой вызов
+   * setTradingStop уже произошёл у вызывающей стороны) и placeEntry() (SL атомарно ушёл вместе
+   * со входом, второй сетевой вызов НЕ нужен, см. Critical C1 выше) — единственный источник этой
+   * логики (DRY), идемпотентно по order_link_id (ON CONFLICT DO NOTHING). bybit_order_id
+   * намеренно не устанавливается — trading-stop не отдельный ордер, у него нет orderId.
+   */
+  private async recordStopLossOrder(tx: Kysely<DB>, ctx: OrderContext, qty: string, price: string): Promise<{ orderId: string }> {
+    const linkId = buildLinkId(ctx, 'sl', 0)
     const inserted = await tx
       .insertInto('orders')
       .values({
-        trade_id: params.tradeId,
-        action_id: params.actionId,
-        channel_id: params.channelId,
-        symbol: params.symbol,
+        trade_id: ctx.tradeId,
+        action_id: ctx.actionId,
+        channel_id: ctx.channelId,
+        symbol: ctx.symbol,
         order_link_id: linkId,
         purpose: 'sl',
-        side: params.side,
-        // Реальный SL — trading-stop (атрибут позиции), не отдельный ордер на бирже; строка здесь
-        // только для единообразия аудита/orderLinkId (тот же приём, что DryRunAdapter) —
-        // bybit_order_id намеренно не устанавливается (у trading-stop нет orderId).
+        side: ctx.side,
         order_type: 'limit',
         reduce_only: true,
         qty,
@@ -269,14 +297,22 @@ export class BybitAdapter implements ExecutionPort {
     // нужного только здесь; DryRunAdapter вообще не ходит к бирже и symbol ему не нужен).
     const order = await tx
       .selectFrom('orders')
-      .select(['symbol', 'status'])
+      .select(['symbol', 'status', 'purpose', 'bybit_order_id'])
       .where('order_link_id', '=', params.orderLinkId)
       .executeTakeFirst()
 
     if (!order) return // нечего отменять — ни локально, ни на бирже; не ошибка (идемпотентно)
     if (order.status === 'filled' || order.status === 'cancelled') return // терминальный статус — к бирже не ходим
 
-    await this.rest.cancelOrder({ symbol: order.symbol, orderLinkId: params.orderLinkId })
+    if (order.purpose === 'sl' && order.bybit_order_id === null) {
+      // Important I1 адверсариального ревью: SL хранится как trading-stop (атрибут позиции, см.
+      // recordStopLossOrder выше) — у него НЕТ bybit_order_id, `order/cancel` по его orderLinkId
+      // вернул бы 110001 "ордер не существует" и бросил бы исключение (заклинивание delta/свипа).
+      // Снимаем ЕДИНСТВЕННО ВЕРНЫМ способом — тем же вызовом, что и постановку: stopLoss='0'.
+      await this.rest.setTradingStop({ symbol: order.symbol, positionIdx: 0, tpslMode: 'Full', stopLoss: '0' })
+    } else {
+      await this.rest.cancelOrder({ symbol: order.symbol, orderLinkId: params.orderLinkId })
+    }
 
     await tx
       .updateTable('orders')

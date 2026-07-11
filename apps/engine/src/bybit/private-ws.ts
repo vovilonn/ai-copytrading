@@ -669,8 +669,18 @@ export class BybitPrivateWs {
     const frame = parseFrame(raw)
     if (!frame) return
 
+    // Important I3 адверсариального ревью (p3-core-fix-report.md): подписка (SUBSCRIBE_TOPICS
+    // выше) идёт на `position.linear`/`order.linear`/`execution.linear` — Bybit присылает пуши
+    // данных именно с ЭТИМ суффиксом (документированный формат `<topic>.<category>`), а не bare
+    // именем. Старый switch матчил ТОЛЬКО bare 'position'/'order'/'execution' -> НИ ОДИН реальный
+    // пуш не совпадал ни с одним case -> вся синхронизация (позиции/филлы/close-детект/cancel-all)
+    // молча не работала НИКОГДА, при внешне полностью рабочем хендшейке (auth+subscribe success).
+    // Матчим по префиксу до первой точки — тот же топик-идентификатор что для bare 'position'
+    // (тесты §bybit-private-ws.test.ts), так и для 'position.linear' (реальный формат биржи).
+    const topicBase = frame.topic.split('.')[0] ?? frame.topic
+
     let notifyNeeded = false
-    switch (frame.topic) {
+    switch (topicBase) {
       case 'position':
         for (const item of frame.data) {
           const push = toPositionPush(item)
@@ -695,6 +705,11 @@ export class BybitPrivateWs {
           if (push?.totalEquity) this.cachedEquity = push.totalEquity
         }
         break
+      default:
+        // Раньше — тихий drop (return выше по switch без default). Неизвестный топик теперь
+        // виден в логах вместо молчаливой потери данных (та же философия, что весь остальной
+        // fail-safe этого файла — "лучше явный сигнал, чем тихая деградация").
+        log.warn(`[private-ws] неизвестный topic, пуш проигнорирован: ${frame.topic}`)
     }
 
     if (notifyNeeded) {

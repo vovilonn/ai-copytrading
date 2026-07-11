@@ -4,7 +4,8 @@ import { Decimal } from 'decimal.js'
 import { resetTestSchema } from 'test-db'
 import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
-import { createExecutionPort } from '../src/execution/port.js'
+import { createExecutionPort, type ExecutionPort } from '../src/execution/port.js'
+import { DryRunAdapter } from '../src/execution/dry-run.adapter.js'
 import { processMessage, type PipelineDeps, type PipelineMessage } from '../src/pipeline.js'
 
 /**
@@ -156,6 +157,82 @@ async function actionFor(channelId: number, tgMessageId: number) {
     .executeTakeFirstOrThrow()
 }
 
+/**
+ * Спай над DryRunAdapter (Critical C1 адверсариального ревью, p3-core-fix-report.md): записывает
+ * порядок/содержание вызовов ExecutionPort, реальную работу делегирует DryRunAdapter — так тест
+ * проверяет ИМЕННО то, что pipeline.ts вызывает (stopLoss в placeEntry, ни одного отдельного
+ * setStopLoss для исходного входа), независимо от того, какой реальный адаптер это исполняет.
+ */
+function createRecordingExecutionPort(): { port: ExecutionPort; calls: string[] } {
+  const inner = new DryRunAdapter()
+  const calls: string[] = []
+  const port: ExecutionPort = {
+    placeEntry: (tx, order) => {
+      calls.push(`placeEntry:stopLoss=${order.stopLoss ?? 'none'}`)
+      return inner.placeEntry(tx, order)
+    },
+    placeTpLadder: (tx, params) => {
+      calls.push('placeTpLadder')
+      return inner.placeTpLadder(tx, params)
+    },
+    setStopLoss: (tx, params) => {
+      calls.push('setStopLoss')
+      return inner.setStopLoss(tx, params)
+    },
+    closePosition: (tx, params) => {
+      calls.push('closePosition')
+      return inner.closePosition(tx, params)
+    },
+    cancelOrder: (tx, params) => {
+      calls.push('cancelOrder')
+      return inner.cancelOrder(tx, params)
+    },
+  }
+  return { port, calls }
+}
+
+describe('pipeline — Critical C1: SL атомарно со входом (не отдельным вызовом после TP-лесенки)', () => {
+  it('entry_signal без TP -> placeEntry(stopLoss=SL сигнала), setStopLoss НЕ вызывается отдельно', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT' })
+    const { port, calls } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '1000' }
+    const text = '#ATOM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('executed')
+
+    expect(calls).toEqual(['placeEntry:stopLoss=90'])
+
+    // Локальная orders(purpose='sl')-строка всё равно существует (записана АТОМАРНО внутри
+    // placeEntry, а не отдельным вызовом) — SL реально применён, не потерян вместе с рефакторингом.
+    const slOrder = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).where('purpose', '=', 'sl').executeTakeFirstOrThrow()
+    expect(slOrder.price).toBe('90.0000000000')
+    expect(slOrder.reduce_only).toBe(true)
+
+    const position = await db.selectFrom('positions').selectAll().where('channel_id', '=', channelId).where('symbol', '=', 'ATOMUSDT').executeTakeFirstOrThrow()
+    expect(position.stop_loss).toBe('90.0000000000')
+  })
+
+  it('нормальный сигнал с TP-лесенкой (LIT short, реальный дамп CH1) -> placeEntry(stopLoss=...) -> placeTpLadder, setStopLoss НЕ вызывается', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'LITUSDT' })
+    const { port, calls } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '1000' }
+    const text = '#LIT/USDT 📉 SHORT\n\nДиапазон входа: 1.5273-1.4735$\nTP: 1.4428$ - 1.3926$ - 1.2777$\nSL: 1.7137$\n\nРиск: 2%'
+    const message = await insertMessage(channelId, 2796, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 2796)
+    expect(action.status).toBe('executed')
+
+    expect(calls).toEqual(['placeEntry:stopLoss=1.7137', 'placeTpLadder'])
+    expect(calls.includes('setStopLoss')).toBe(false)
+  })
+})
+
 describe('pipeline — гейт безопасного стопа (Important #1)', () => {
   it('long entry=100 sl=0.4 (корректная сторона, но лев клампится к 1x и liq=0.5 > sl=0.4) -> skip unsafe_stop', async () => {
     const channelId = nextChannelId++
@@ -278,5 +355,99 @@ describe('pipeline — TP-лесенка без нулевых долей (Minor
     expect(tpOrders.every((o) => o.qty !== '0')).toBe(true)
     const totalTpQty = tpOrders.reduce((sum, o) => sum + Number(o.qty), 0)
     expect(totalTpQty).toBe(2) // весь qty ушёл в TP-ордера (одной или несколькими не-нулевыми целями)
+  })
+})
+
+describe('pipeline — гейт staleness/slippage перед market-входом (Important I2)', () => {
+  it('deps.getMarkPrice не подключён (dry_run, как в main.ts) -> гейт fail-open, вход как раньше', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'FFFUSDT' })
+    // `deps` модуля — createExecutionPort('dry_run'), БЕЗ getMarkPrice (тот же контракт, что и
+    // main.ts в dry_run) — гейт из pipeline.ts::handleEntrySignal не должен даже попытаться его
+    // вызвать (сети попросту нет).
+    const text = '#FFF/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, deps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('executed')
+  })
+
+  it('mark 6% выше сигнальной цены (100 -> 106), порог 0.5% по умолчанию -> skip price_slippage, 0 ордеров', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'GGGUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      getMarkPrice: async () => '106',
+    }
+    const text = '#GGG/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('skipped')
+    expect(action.skip_reason).toBe('price_slippage')
+
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades).toHaveLength(0)
+    const orders = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).execute()
+    expect(orders).toHaveLength(0)
+  })
+
+  it('mark 0.2% выше сигнальной цены (100 -> 100.2), в пределах порога 0.5% -> входит как обычно', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'HHHUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      getMarkPrice: async () => '100.2',
+    }
+    const text = '#HHH/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('executed')
+
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades).toHaveLength(1)
+  })
+
+  it('кастомный порог maxEntrySlippagePct — 6% отклонение проходит, если порог поднят до 10%', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'IIIUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      getMarkPrice: async () => '106',
+      maxEntrySlippagePct: '10',
+    }
+    const text = '#III/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('executed')
+  })
+
+  it('getMarkPrice возвращает null (сбой похода за ценой) -> гейт fail-open, вход не блокируется', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'JJJUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      getMarkPrice: async () => null,
+    }
+    const text = '#JJJ/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('executed')
   })
 })

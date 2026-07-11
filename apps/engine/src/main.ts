@@ -49,6 +49,12 @@ const EQUITY_REFRESH_INTERVAL_MS = 30_000
 // dry_run-заглушка equity (см. PipelineDeps.equity в pipeline.ts — "совпадает с суммой, которой
 // реально пополнен testnet-аккаунт"); live использует реальный getEquity(rest) ниже.
 const DRY_RUN_EQUITY = '1000'
+// Important I2 адверсариального ревью (p3-core-fix-report.md): порог гейта staleness/slippage
+// перед market-входом (pipeline.ts::handleEntrySignal) — читается напрямую из process.env (не
+// через api/config/config.schema.ts — эта задача не трогает apps/api), с дефолтом '0.5' (0.5%),
+// если переменная не задана/пуста. Применяется в ОБОИХ режимах одинаково (не ветвится по
+// EXECUTION_MODE) — сам гейт в pipeline.ts уже условен на наличие deps.getMarkPrice (только live).
+const MAX_ENTRY_SLIPPAGE_PCT = process.env.MAX_ENTRY_SLIPPAGE_PCT || '0.5'
 
 /**
  * Держит `pg_advisory_lock` (сессионный, НЕ транзакционный) на отдельном соединении на всё время
@@ -139,7 +145,8 @@ export async function initLiveRuntime(
 ): Promise<LiveRuntime> {
   const reconcileResult = await reconcileOnStart(db, rest)
   console.log(
-    `[engine] reconcileOnStart: opened=${reconcileResult.opened} closed=${reconcileResult.closed} flagged=${reconcileResult.flagged}`,
+    `[engine] reconcileOnStart: opened=${reconcileResult.opened} closed=${reconcileResult.closed} ` +
+      `flagged=${reconcileResult.flagged} orphansCancelled=${reconcileResult.orphansCancelled}`,
   )
   const privateWs = new BybitPrivateWs({ apiKey: keys.apiKey, apiSecret: keys.apiSecret, network, db, rest })
   const executionPort = createExecutionPort('live', { rest, network })
@@ -199,6 +206,9 @@ async function main(): Promise<void> {
   let liveRest: BybitRestClient | null = null
   let privateWs: BybitPrivateWs | null = null
   let initialEquity = DRY_RUN_EQUITY
+  // Important I2: undefined в dry_run — pipeline.ts::handleEntrySignal делает гейт fail-open,
+  // если это поле не задано (нет сети в dry_run, тот же принцип, что и initialEquity выше).
+  let getMarkPrice: PipelineDeps['getMarkPrice']
 
   if (config.executionMode === 'live') {
     // Ф3: одно окружение → все каналы (channels.bybit_api_key_enc/secret_enc сегодня всегда NULL,
@@ -212,11 +222,32 @@ async function main(): Promise<void> {
     privateWs.start()
     initialEquity = (await getEquity(liveRest)).toString()
     console.log(`[engine] equity (wallet-balance totalEquity): ${initialEquity}`)
+
+    // Important I2: живой mark price по символу — `position/list` возвращает стаб-позицию с
+    // markPrice ДАЖЕ при size=0 (research §1, подтверждено live-тестом bybit-rest.test.ts) —
+    // не нужен отдельный ticker-эндпоинт. Сбой похода за ценой -> null -> гейт fail-open
+    // (pipeline.ts), не блокирует вход из-за временной сетевой проблемы самого гейта.
+    const rest = liveRest
+    getMarkPrice = async (symbol: string): Promise<string | null> => {
+      try {
+        const positions = await rest.getPositions(symbol)
+        return positions[0]?.markPrice ?? null
+      } catch (err) {
+        console.error(`[engine] getMarkPrice(${symbol}) для гейта slippage:`, err)
+        return null
+      }
+    }
   } else {
     executionPort = createExecutionPort('dry_run')
   }
 
-  const deps: PipelineDeps = { executionPort, network: config.bybitNetwork, equity: initialEquity }
+  const deps: PipelineDeps = {
+    executionPort,
+    network: config.bybitNetwork,
+    equity: initialEquity,
+    ...(getMarkPrice ? { getMarkPrice } : {}),
+    maxEntrySlippagePct: MAX_ENTRY_SLIPPAGE_PCT,
+  }
 
   // Задача 10: публичный WS-фид mark price для символов с открытыми позициями — независим от
   // пайплайна разбора выше (не участвует в EXECUTION_MODE, публичный поток доступен без ключа
@@ -316,7 +347,8 @@ async function main(): Promise<void> {
       reconcileOnStart(db, rest)
         .then((result) =>
           console.log(
-            `[engine] периодическая реконсиляция: opened=${result.opened} closed=${result.closed} flagged=${result.flagged}`,
+            `[engine] периодическая реконсиляция: opened=${result.opened} closed=${result.closed} ` +
+              `flagged=${result.flagged} orphansCancelled=${result.orphansCancelled}`,
           ),
         )
         .catch((err) => console.error('[engine] периодическая реконсиляция:', err))

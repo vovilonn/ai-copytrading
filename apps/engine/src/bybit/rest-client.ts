@@ -53,6 +53,15 @@ const DUPLICATE_ORDER_LINK_ID_RETCODE = 110072
 // V5 и практика ccxt/pybit-обёрток. Если код окажется иным, вызывающая сторона (BybitAdapter,
 // задача 2) увидит явный throw BybitApiError вместо тихого проглатывания — не тихий баг.
 const POSITION_MODE_NOT_MODIFIED_RETCODE = 110025
+// "Order does not exist" (Important I1 адверсариального ревью p3-core-fix-report.md) — код из
+// публичной документации Bybit V5 (список retCode ошибок), тем же статусом верификации, что и
+// POSITION_MODE_NOT_MODIFIED_RETCODE выше: НЕ подтверждён живым мутирующим вызовом в рамках
+// research (мандат верификации — read-only на пустом testnet-аккаунте), но это ДОКУМЕНТИРОВАННЫЙ
+// код для "нет такого ордера" (уже исполнен/уже отменён/никогда не существовал на бирже —
+// SL-строка orders хранится как trading-stop, у неё нет bybit_order_id, order/cancel по её
+// orderLinkId закономерно вернул бы именно этот код). Трактуем как идемпотентный успех отмены —
+// поздняя/повторная отмена уже пропавшего ордера не должна ронять cancelOrder и клинить свип/делту.
+const ORDER_NOT_EXISTS_RETCODE = 110001
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -267,6 +276,14 @@ export interface CreateOrderParams {
   timeInForce?: 'GTC' | 'IOC' | 'FOK' | 'PostOnly'
   /** one-way (research §1) — дефолт 0, если не передано. */
   positionIdx?: 0 | 1 | 2
+  /**
+   * Critical C1 адверсариального ревью (p3-core-fix-report.md): Bybit V5 `order/create` принимает
+   * `stopLoss`/`slTriggerBy` прямо в теле создания ордера — SL устанавливается на позицию
+   * АТОМАРНО с её открытием (тот же сетевой вызов), а не отдельным `position/trading-stop` после.
+   * Либо позиция открывается уже защищённой, либо не открывается вовсе (вход отклонён целиком).
+   */
+  stopLoss?: string
+  slTriggerBy?: string
 }
 
 export interface SetTradingStopParams {
@@ -499,6 +516,11 @@ export class BybitRestClient {
         reduceOnly: params.reduceOnly,
         timeInForce: params.timeInForce,
         positionIdx: params.positionIdx ?? 0,
+        // Critical C1: undefined -> JSON.stringify отбрасывает поле целиком (тот же приём, что и
+        // price/reduceOnly/timeInForce выше) — вход БЕЗ atomic-SL (напр. add/доливка) не шлёт
+        // stopLoss вовсе, ничего не меняя для Bybit относительно поведения до этого фикса.
+        stopLoss: params.stopLoss,
+        slTriggerBy: params.slTriggerBy,
       })
       return { orderId: result.orderId, orderLinkId: result.orderLinkId, ok: true, idempotent: false }
     } catch (err) {
@@ -509,14 +531,27 @@ export class BybitRestClient {
     }
   }
 
-  /** `POST /v5/order/cancel` (research §9) — по `orderLinkId`. */
-  async cancelOrder(params: { symbol: string; orderLinkId: string }): Promise<{ ok: true }> {
-    await this.signedPost('/v5/order/cancel', {
-      category: 'linear',
-      symbol: params.symbol,
-      orderLinkId: params.orderLinkId,
-    })
-    return { ok: true }
+  /**
+   * `POST /v5/order/cancel` (research §9) — по `orderLinkId`. Important I1 адверсариального
+   * ревью: ордер, которого уже нет на бирже (исполнен раньше, чем дошла отмена; WS пропустил
+   * филл; либо это в принципе не биржевой ордер — trading-stop SL, см. bybit.adapter.ts::
+   * cancelOrder) отвечает `retCode=110001` — трактуем как идемпотентный успех отмены (та же
+   * идея, что 110043/110072 у setLeverage/createOrder), а не бросаем и не клиним свип/делту.
+   */
+  async cancelOrder(params: { symbol: string; orderLinkId: string }): Promise<{ ok: true; idempotent?: boolean }> {
+    try {
+      await this.signedPost('/v5/order/cancel', {
+        category: 'linear',
+        symbol: params.symbol,
+        orderLinkId: params.orderLinkId,
+      })
+      return { ok: true }
+    } catch (err) {
+      if (err instanceof BybitApiError && err.retCode === ORDER_NOT_EXISTS_RETCODE) {
+        return { ok: true, idempotent: true }
+      }
+      throw err
+    }
   }
 
   /** `POST /v5/order/cancel-all` (research §9) — все активные ордера символа. */

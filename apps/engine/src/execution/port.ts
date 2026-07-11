@@ -58,6 +58,18 @@ export interface EntryOrder extends OrderContext {
    * готовое значение сюда, а не пересчитываем внутри адаптера — избегаем второго похода за mmr.
    */
   liqPrice: string
+  /**
+   * Critical C1 адверсариального ревью (p3-core-fix-report.md): SL, который нужно поставить
+   * АТОМАРНО вместе со входом — либо позиция откроется уже защищённой, либо не откроется вовсе
+   * (BybitAdapter передаёт это прямо в теле `order/create`, см. rest-client.ts::CreateOrderParams.
+   * stopLoss). Опционально: только 'entry' с этим полем реально осмыслен (handleEntrySignal в
+   * pipeline.ts всегда его передаёт — intent.sl обязателен для entry_signal); 'add'/доливка НЕ
+   * должна его передавать — позиция уже защищена SL первого входа, повторная установка здесь
+   * была бы лишним/неверным сетевым вызовом. DryRunAdapter при наличии поля пишет ту же
+   * orders(purpose='sl')-строку, что раньше писал отдельный вызов setStopLoss — интерфейс/эффект
+   * идентичны, меняется только МОМЕНТ (атомарно, а не отдельным вызовом после TP-лесенки).
+   */
+  stopLoss?: string
 }
 
 /** Одна цель TP-лесенки (design spec §9 / research bybit-execution.md §4: reduceOnly limit). */

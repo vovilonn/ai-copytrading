@@ -13,7 +13,7 @@
 // игнорирует кэш целиком — для мест, которым нужен заведомо свежий баланс (напр. диагностика).
 
 import { Decimal } from 'decimal.js'
-import type { BybitRestClient } from '../bybit/rest-client.js'
+import type { BybitRestClient, WalletBalance } from '../bybit/rest-client.js'
 
 /** Узкий срез BybitRestClient — тот же приём сужения типа мока, что и BybitAdapterRestClient
  *  (execution/bybit.adapter.ts) и BybitPrivateWsRestClient (bybit/private-ws.ts). */
@@ -62,6 +62,29 @@ function mapFor<V>(store: WeakMap<EquityRestClient, Map<string, V>>, rest: Equit
 }
 
 /**
+ * Minor M3 адверсариального ревью (p3-core-fix-report.md): `wallet-balance.totalEquity` иногда
+ * приходит пустой строкой (напр. Bybit не успел досчитать поле сразу после депозита/переброса
+ * маржи) — `new Decimal('')` бросает и валит getEquity целиком, а вместе с ним sizing всего
+ * тика. Порядок деградации: totalEquity -> (пусто) totalAvailableBalance -> (пусто тоже) прошлое
+ * закэшированное значение того же (rest, subaccount) -> (кэша тоже нет, самый первый вызов
+ * процесса) throw — совсем без разумного дефолта на равно пустом аккаунте лучше явная ошибка при
+ * старте, чем тихий Decimal(NaN) в сайзинге живых денег.
+ */
+function resolveEquityValue(balance: WalletBalance, cached: CacheEntry | undefined): Decimal {
+  if (balance.totalEquity !== '') return new Decimal(balance.totalEquity)
+
+  console.warn('[equity] totalEquity пуст в ответе wallet-balance — fallback на totalAvailableBalance')
+  if (balance.totalAvailableBalance !== '') return new Decimal(balance.totalAvailableBalance)
+
+  if (cached) {
+    console.warn(`[equity] totalAvailableBalance тоже пуст — использую прошлое кэшированное значение ${cached.value.toString()}`)
+    return cached.value
+  }
+
+  throw new Error('getEquity: totalEquity и totalAvailableBalance оба пусты в ответе Bybit, кэша тоже нет (первый вызов процесса)')
+}
+
+/**
  * Реальный equity аккаунта — Decimal, из `totalEquity` wallet-balance (не `totalAvailableBalance`):
  * design spec §8 считает риск как "riskPct/100 × equity" от полного equity аккаунта (активы +
  * нереализованный PnL), а НЕ от `totalAvailableBalance` (это остаток СВОБОДНОЙ маржи — другая
@@ -89,7 +112,7 @@ export async function getEquity(rest: EquityRestClient, opts: GetEquityOptions =
   const fetchPromise = (async (): Promise<Decimal> => {
     try {
       const balance = await rest.getWalletBalance()
-      const value = new Decimal(balance.totalEquity)
+      const value = resolveEquityValue(balance, perClientCache.get(key))
       perClientCache.set(key, { value, fetchedAtMs: Date.now() })
       return value
     } finally {

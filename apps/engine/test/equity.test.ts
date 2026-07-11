@@ -72,6 +72,34 @@ describe('getEquity (мок rest, без сети)', () => {
   })
 })
 
+describe('getEquity — Minor M3 адверсариального ревью: пустой totalEquity', () => {
+  it('totalEquity="" -> fallback на totalAvailableBalance, не бросает', async () => {
+    const fn = vi.fn(async () => ({ totalEquity: '', totalAvailableBalance: '777.5', coins: [] }))
+    const equity = await getEquity({ getWalletBalance: fn })
+    expect(equity.toString()).toBe('777.5')
+  })
+
+  it('totalEquity И totalAvailableBalance оба "" -> fallback на прошлое кэшированное значение', async () => {
+    let call = 0
+    const fn = vi.fn(async () => {
+      call += 1
+      // Первый вызов — нормальный ответ (наполняет кэш), второй — оба поля внезапно пусты.
+      return call === 1 ? { totalEquity: '1000', totalAvailableBalance: '1000', coins: [] } : { totalEquity: '', totalAvailableBalance: '', coins: [] }
+    })
+    const rest = { getWalletBalance: fn }
+    const first = await getEquity(rest)
+    expect(first.toString()).toBe('1000')
+
+    const second = await getEquity(rest, { forceRefresh: true })
+    expect(second.toString()).toBe('1000') // прошлое кэшированное значение, не Decimal(NaN)/throw
+  })
+
+  it('totalEquity И totalAvailableBalance оба "" И кэша ещё нет (первый вызов процесса) -> бросает явную ошибку', async () => {
+    const fn = vi.fn(async () => ({ totalEquity: '', totalAvailableBalance: '', coins: [] }))
+    await expect(getEquity({ getWalletBalance: fn })).rejects.toThrow()
+  })
+})
+
 const BYBIT_LIVE_TESTS = process.env.BYBIT_LIVE_TESTS === '1'
 if (!BYBIT_LIVE_TESTS) {
   console.warn('[equity.test] живой Bybit-тест пропущен; задайте BYBIT_LIVE_TESTS=1 для запуска (ходит на testnet)')

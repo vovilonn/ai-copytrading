@@ -30,8 +30,9 @@ import { emitPositionUpsert } from '../pipeline.js'
 import type { BybitRestClient, Order, Position } from './rest-client.js'
 
 /** Узкий срез BybitRestClient — тот же приём, что и BybitAdapterRestClient/BybitPrivateWsRestClient:
- *  реконсиляция вызывает ТОЛЬКО READ-эндпоинты, мок в тестах не обязан знать про мутирующие методы. */
-export type ReconcileRestClient = Pick<BybitRestClient, 'getPositions' | 'getOpenOrders'>
+ *  реконсиляция читает position/list+order/realtime, и (M1 ниже) умеет отменить ПО ОДНОМУ
+ *  осиротевший reduceOnly-остаток — не полный мутирующий набор BybitAdapterRestClient. */
+export type ReconcileRestClient = Pick<BybitRestClient, 'getPositions' | 'getOpenOrders' | 'cancelOrder'>
 
 export interface ReconcileResult {
   /** Позиция на бирже атрибутирована по orderLinkId к сделке журнала, которая не была 'open' —
@@ -42,6 +43,15 @@ export interface ReconcileResult {
   /** Позиция на бирже без однозначной атрибуции (нет кандидата, кандидатов >1, или единственный
    *  кандидат отбракован createdTime-защитой) — залогирована в audit_log, журнал НЕ угадывает канал. */
   flagged: number
+  /**
+   * Minor M1 адверсариального ревью (p3-core-fix-report.md): reduceOnly-остатки биржи (TP/SL/
+   * close) по символам БЕЗ открытой позиции — "осиротевшие" (ручное закрытие мимо нашего WS,
+   * пропущенный cancelAll-пуш applyPositionPush, гонка реконнекта и т.п.). Отменены по одному
+   * (НЕ cancelAll — не трогаем legitimate entry/add лимитки того же символа, ожидающие первого
+   * филла). Эта же функция дёргается и на старте, и периодически (main.ts, RECONCILE_INTERVAL_MS)
+   * — очистка происходит обоими путями, отдельного механизма не требуется.
+   */
+  orphansCancelled: number
 }
 
 // execution/order-link-id.ts::MODE_PREFIX.live — не экспортирован оттуда (сознательно не трогаем
@@ -79,6 +89,9 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
   const allPositions = await rest.getPositions()
   const positions = allPositions.filter((p) => new Decimal(p.size).gt(0))
   const openOrders = await rest.getOpenOrders()
+  // M1: нужен и внутри транзакции (шаг Б), и ПОСЛЕ её коммита (шаг В, orphan-очистка ниже) —
+  // вынесен наружу, а не в двух местах отдельно (DRY).
+  const positionSymbols = new Set(positions.map((p) => p.symbol))
 
   let opened = 0
   let closed = 0
@@ -106,8 +119,6 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
       if (arr) arr.push(t)
       else bySymbol.set(t.symbol, [t])
     }
-
-    const positionSymbols = new Set(positions.map((p) => p.symbol))
 
     // --- Шаг А: что реально открыто на бирже -> сверка/атрибуция/needs_review-флаг. ---
     for (const pos of positions) {
@@ -166,7 +177,25 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
     }
   })
 
-  return { opened, closed, flagged }
+  // --- Шаг В (M1, Minor адверсариального ревью): осиротевшие reduceOnly-остатки — ПОСЛЕ коммита
+  // транзакции, тот же приём "сеть не держит транзакцию БД", что и cancelAll в
+  // private-ws.ts::applyPositionPush. Только reduceOnly (TP/SL/close) — entry/add лимитки того
+  // же "бессимвольного" положения НЕ трогаем, они законно ждут первого филла.
+  const orphans = openOrders.filter((o) => o.reduceOnly && !positionSymbols.has(o.symbol))
+  let orphansCancelled = 0
+  for (const order of orphans) {
+    try {
+      await rest.cancelOrder({ symbol: order.symbol, orderLinkId: order.orderLinkId })
+      orphansCancelled++
+    } catch (err) {
+      console.error(
+        `[reconcile] отмена осиротевшего reduceOnly-ордера symbol=${order.symbol} orderLinkId=${order.orderLinkId} не удалась:`,
+        err,
+      )
+    }
+  }
+
+  return { opened, closed, flagged, orphansCancelled }
 }
 
 // ---------------------------------------------------------------------------
