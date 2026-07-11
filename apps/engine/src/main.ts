@@ -11,6 +11,7 @@ import { BybitRestClient } from './bybit/rest-client.js'
 import { BybitPrivateWs } from './bybit/private-ws.js'
 import { reconcileOnStart, type ReconcileResult } from './bybit/reconcile.js'
 import { getEquity } from './state/equity.js'
+import { writeWalletSnapshot } from './state/wallet-snapshot.js'
 import { getChannelKeys } from './bybit/channel-keys.js'
 import { TickersFeed } from './market-data/tickers-feed.js'
 import { processMessage, type PipelineDeps, type PipelineMessage } from './pipeline.js'
@@ -46,6 +47,11 @@ const RECONCILE_INTERVAL_MS = 10 * 60 * 1000
 // Совпадает с DEFAULT_TTL_MS кэша state/equity.ts — рефреш чаще бессмысленен (getEquity вернул бы
 // то же кэшированное значение), реже — equity в сайзинге отставал бы от биржи дольше, чем нужно.
 const EQUITY_REFRESH_INTERVAL_MS = 30_000
+// Task 3 (мониторинг PnL/баланса, план 2026-07-12-monitoring-pnl-balance.md): писатель
+// wallet_snapshots — ТОЛЬКО live (dry_run не имеет реального баланса, см. writeWalletSnapshot).
+// ~30с — тот же порядок величины, что и EQUITY_REFRESH_INTERVAL_MS выше (баланс не успевает
+// заметно измениться чаще, а история снапшотов не должна расти неограниченно быстро).
+const WALLET_SNAPSHOT_INTERVAL_MS = 30_000
 // dry_run-заглушка equity (см. PipelineDeps.equity в pipeline.ts — "совпадает с суммой, которой
 // реально пополнен testnet-аккаунт"); live использует реальный getEquity(rest) ниже.
 const DRY_RUN_EQUITY = '1000'
@@ -261,6 +267,15 @@ async function main(): Promise<void> {
     initialEquity = (await getEquity(liveRest)).toString()
     console.log(`[engine] equity (wallet-balance totalEquity): ${initialEquity}`)
 
+    // Task 3: первый снапшот wallet_snapshots сразу при старте live — не ждать первого тика
+    // планировщика ниже (см. WALLET_SNAPSHOT_INTERVAL_MS). Сбой похода к Bybit не должен ронять
+    // старт движка — лог и продолжаем (writeWalletSnapshot сама не ловит ошибки, см. её топ-комментарий).
+    try {
+      await writeWalletSnapshot(db, liveRest)
+    } catch (err) {
+      console.error('[engine] writeWalletSnapshot (первый снапшот при старте):', err)
+    }
+
     // Important I2 / фикс p3-slippage-fix: живой mark price — публичный тикер (createMarkPriceGetter
     // выше), не стаб-позиция `position/list` (та отдаёт markPrice="" на аккаунте без истории по
     // символу — см. комментарий над createMarkPriceGetter). Сбой похода за ценой -> null -> гейт
@@ -293,6 +308,7 @@ async function main(): Promise<void> {
   let ttlSweepTimer: NodeJS.Timeout | null = null
   let reconcileTimer: NodeJS.Timeout | null = null
   let equityTimer: NodeJS.Timeout | null = null
+  let walletSnapshotTimer: NodeJS.Timeout | null = null
 
   async function tick(): Promise<void> {
     if (draining) return
@@ -391,6 +407,14 @@ async function main(): Promise<void> {
         })
         .catch((err) => console.error('[engine] рефреш equity:', err))
     }, EQUITY_REFRESH_INTERVAL_MS)
+
+    // Task 3: планировщик снапшотов wallet_snapshots — только live (первый снапшот уже написан
+    // синхронно при старте выше, этот таймер продолжает писать периодически). Ошибка Bybit/БД не
+    // должна ронять движок — try/catch внутри writeWalletSnapshot вызывающей стороной не нужен,
+    // достаточно .catch() на промис планировщика (тот же приём, что reconcileTimer/equityTimer выше).
+    walletSnapshotTimer = setInterval(() => {
+      writeWalletSnapshot(db, rest).catch((err) => console.error('[engine] writeWalletSnapshot (планировщик):', err))
+    }, WALLET_SNAPSHOT_INTERVAL_MS)
   }
 
   console.log(`[engine] воркер запущен: пайплайн разбора и исполнения (${config.executionMode}) активен`)
@@ -406,6 +430,7 @@ async function main(): Promise<void> {
     if (ttlSweepTimer) clearInterval(ttlSweepTimer)
     if (reconcileTimer) clearInterval(reconcileTimer)
     if (equityTimer) clearInterval(equityTimer)
+    if (walletSnapshotTimer) clearInterval(walletSnapshotTimer)
     tickersFeed.stop()
     privateWs?.stop()
     const closeListener = listenClient ? listenClient.end().catch(() => {}) : Promise.resolve()
