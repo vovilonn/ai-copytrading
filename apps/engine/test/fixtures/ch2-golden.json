@@ -1,0 +1,281 @@
+[
+  {
+    "id": 221350,
+    "text": "Не задело , не актуально",
+    "mediaFile": "221350.jpg",
+    "note": "Символ ТОЛЬКО на графике (SOLUSDT, круг — зона 67.87, цена ушла на 74.11 не задев её) — отменяемая лимитка неактуальна.",
+    "expected": [{ "symbol": "SOLUSDT", "type": "cancel_order", "side": "long" }]
+  },
+  {
+    "id": 221355,
+    "text": "Sl btc - 64300\n\nSl Eth - 1730",
+    "note": "research §7 обязательный кейс — два SL одним сообщением, не терять второй (E2 прототипа).",
+    "expected": [
+      { "symbol": "BTCUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "ETHUSDT", "type": "modify_sl", "side": "long" }
+    ]
+  },
+  {
+    "id": 221360,
+    "text": "Первые цели",
+    "mediaFile": "221360.jpg",
+    "note": "Скрин 'Позиции(3)/Ордера→Триггер': BTCUSDT/ETHUSDT/DOGEUSDT 'Закрыть лонг' — три висящих TP-триггера, ещё не сработавших (тот же кейс, что research §7 фиксирует спорным между tp_hit/modify_tp; беру modify_tp — триггеры ПОКА не исполнены).",
+    "expected": [
+      { "symbol": "BTCUSDT", "type": "modify_tp", "side": "long" },
+      { "symbol": "ETHUSDT", "type": "modify_tp", "side": "long" },
+      { "symbol": "DOGEUSDT", "type": "modify_tp", "side": "long" }
+    ]
+  },
+  {
+    "id": 221362,
+    "text": "Стоп на твх btc\nЗакрыло в бу",
+    "note": "твх=точка входа (marker entry_price); 'закрыло в бу' — уже СРАБОТАВШИЙ стоп на безубытке = событие sl_hit, не новая команда.",
+    "expected": [
+      { "symbol": "BTCUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "BTCUSDT", "type": "sl_hit", "side": "long" }
+    ]
+  },
+  {
+    "id": 221363,
+    "text": "Фиксану вместо первой",
+    "mediaFile": "221363.jpg",
+    "note": "Терсно — символ (ETHUSDT, +14.25%, вход 1650.97) только на карточке WEEX.",
+    "expected": [{ "symbol": "ETHUSDT", "type": "close", "side": "long" }]
+  },
+  {
+    "id": 221368,
+    "text": "Здесь фиксанул за место первой\nСтоп на твх\nСледующие цели 1.09, 1.11",
+    "mediaFile": "221368.jpg",
+    "note": "Карточка XRPUSDT (вход 1.0510) — тройной интент одним сообщением: закрытие + стоп на твх + новые цели.",
+    "expected": [
+      { "symbol": "XRPUSDT", "type": "close", "side": "long" },
+      { "symbol": "XRPUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "XRPUSDT", "type": "modify_tp", "side": "long" }
+    ]
+  },
+  {
+    "id": 221371,
+    "text": "Скинул один объем",
+    "mediaFile": "221371.jpg",
+    "note": "'Один объём закрыт' — units/one_unit; символ (BTCUSDT, -1.52%) только на карточке.",
+    "expected": [{ "symbol": "BTCUSDT", "type": "close", "side": "long" }]
+  },
+  {
+    "id": 221372,
+    "text": "Фикс половину\nСтоп в бу",
+    "mediaFile": "221372.jpg",
+    "note": "Карточка SOLUSDT (+16.83%, вход 67.70) — фикс 50% + стоп в безубыток. Используется и в существующем e2e-тесте пайплайна.",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "close", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" }
+    ]
+  },
+  {
+    "id": 221373,
+    "text": "Фикс половину\nСтоп на твх",
+    "mediaFile": "221373.jpg",
+    "note": "Карточка BTCUSDT (+14.23%, вход 60886) — тот же паттерн, другой символ/канал сделки.",
+    "expected": [
+      { "symbol": "BTCUSDT", "type": "close", "side": "long" },
+      { "symbol": "BTCUSDT", "type": "modify_sl", "side": "long" }
+    ]
+  },
+  {
+    "id": 221375,
+    "text": "По Sol и btc убираю стопы\nДобавляю limit long Eth 1615",
+    "note": "Мульти-интент/мульти-символ явным текстом (E4 прототипа: вторичный интент терялся) — 2 отмены SL + 1 добор.",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "BTCUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "ETHUSDT", "type": "add", "side": "long" }
+    ]
+  },
+  {
+    "id": 221377,
+    "text": "Вынос\nПерезахожу в Лонги Sol Eth btc",
+    "note": "'Перезахожу' — новый вход в 3 символа (open, не add — предыдущая позиция подразумевается закрытой выносом).",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "open", "side": "long" },
+      { "symbol": "ETHUSDT", "type": "open", "side": "long" },
+      { "symbol": "BTCUSDT", "type": "open", "side": "long" }
+    ]
+  },
+  {
+    "id": 221386,
+    "text": "Зарываю Лонги",
+    "note": "Опечатка 'Закрываю'→'Зарываю' (E6 прототипа) — символ-less close-all по ВСЕМ открытым лонгам канала; синтетический контекст (openPositions) — BTCUSDT+ETHUSDT.",
+    "openPositions": [
+      { "sym": "BTCUSDT", "side": "long", "legs": 1, "avgEntry": 60800, "sl": "none", "tpsLeft": [] },
+      { "sym": "ETHUSDT", "side": "long", "legs": 1, "avgEntry": 1650, "sl": "none", "tpsLeft": [] }
+    ],
+    "expected": [
+      { "symbol": "BTCUSDT", "type": "close", "side": "long" },
+      { "symbol": "ETHUSDT", "type": "close", "side": "long" }
+    ]
+  },
+  {
+    "id": 221388,
+    "text": "Relong Eth btc",
+    "note": "Смешанный рус/англ жаргон 'Relong' — новый вход в 2 символа.",
+    "expected": [
+      { "symbol": "ETHUSDT", "type": "open", "side": "long" },
+      { "symbol": "BTCUSDT", "type": "open", "side": "long" }
+    ]
+  },
+  {
+    "id": 221393,
+    "text": "С текущих беру",
+    "replyToMsgId": 221389,
+    "note": "reply на 221389 'Sol limit long 69.66' — символ SOL только через reply-parent, вход по рынку.",
+    "expected": [{ "symbol": "SOLUSDT", "type": "open", "side": "long" }]
+  },
+  {
+    "id": 221396,
+    "text": "Стоп на твх\nПервая цель 71.27🎯\nСледующие 72.7 , 74",
+    "mediaFile": "221396.jpg",
+    "note": "Карточка SOLUSDT ЗАКРЫТА по цене 71.27 (совпадает с 'Первая цель 71.27🎯') — тройной интент: стоп в бу + tp_hit(1) + новые цели. Известный из research §7 кейс, где модели пропускали сопутствующий tp_hit.",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "tp_hit", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "modify_tp", "side": "long" }
+    ]
+  },
+  {
+    "id": 221397,
+    "text": "Стоп на твх\nПервый таргет 1600",
+    "mediaFile": "221397.jpg",
+    "note": "Карточка ETHUSDT ОТКРЫТА (маркировка 1589.75, ниже 1600 — цель ещё не достигнута) — это установка цели, не событие.",
+    "expected": [
+      { "symbol": "ETHUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "ETHUSDT", "type": "modify_tp", "side": "long" }
+    ]
+  },
+  {
+    "id": 221398,
+    "text": "2🎯",
+    "mediaFile": "221398.jpg",
+    "note": "Предельно терсно — символ (SOLUSDT, +41.07%) только на карточке.",
+    "expected": [{ "symbol": "SOLUSDT", "type": "tp_hit", "side": "long" }]
+  },
+  {
+    "id": 221401,
+    "text": "Фиксанул здесь половину вместо первой\nПри откатах теперь доливаться буду",
+    "mediaFile": "221401.jpg",
+    "note": "Карточка XRPUSDT — реальное действие только 'фиксанул половину' (close); 'буду доливаться' — намерение на будущее, не текущий add.",
+    "expected": [{ "symbol": "XRPUSDT", "type": "close", "side": "long" }]
+  },
+  {
+    "id": 221404,
+    "text": "🛑 на 68.2\n🎯 - 72.3, 73.7, 75",
+    "replyToMsgId": 221402,
+    "note": "reply на 221402 'Limit long SOL - 71' — символ SOL только через reply-chain (известный кейс, где Haiku ошибочно читал это как ENTRY вместо modify_sl+modify_tp).",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "modify_tp", "side": "long" }
+    ]
+  },
+  {
+    "id": 221406,
+    "text": "Фикс вмест первой\nСтоп на твх",
+    "mediaFile": "221406.jpg",
+    "note": "Карточка SOLUSDT — close + стоп на твх.",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "close", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" }
+    ]
+  },
+  {
+    "id": 221409,
+    "text": "Стоп на твх\nПервый таргет 1.07\nВыбило в бу",
+    "mediaFile": "221409.jpg",
+    "note": "Карточка XRPUSDT ОТКРЫТА (маркировка 1.0651 < 1.07 — цель ещё не достигнута) — тройной интент: стоп в бу (заявка) + цель 1.07 (modify_tp) + 'выбило в бу' — СРАБОТАВШИЙ стоп на безубытке = sl_hit.",
+    "expected": [
+      { "symbol": "XRPUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "XRPUSDT", "type": "modify_tp", "side": "long" },
+      { "symbol": "XRPUSDT", "type": "sl_hit", "side": "long" }
+    ]
+  },
+  {
+    "id": 221410,
+    "text": "1🎯стоп на твх",
+    "mediaFile": "221410.jpg",
+    "note": "Терсно, два интента слитно в одну строку без пробела/разделителя — символ (SOLUSDT) с карточки. Используется и в существующем e2e-тесте пайплайна.",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "tp_hit", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" }
+    ]
+  },
+  {
+    "id": 221417,
+    "text": "Стоп на твх первый таргет 73.5",
+    "replyToMsgId": 221414,
+    "note": "reply на 221414 '72.15 limit long SOL' — символ SOL только через reply-parent, без картинки.",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "modify_tp", "side": "long" }
+    ]
+  },
+  {
+    "id": 221420,
+    "text": "На 72\nLimit long на ту половину которую фиксировал\nСтоп убираю",
+    "replyToMsgId": 221419,
+    "openPositions": [
+      { "sym": "SOLUSDT", "side": "long", "legs": 2, "avgEntry": 72.9, "sl": "BE", "tpsLeft": [75, 76.5] }
+    ],
+    "note": "Дословный кейс research §4.2 — символ ТОЛЬКО через OPEN_POSITIONS (offline без них модель законно вернула бы UNKNOWN, research §7). Добор половины, которую фиксировали, + снятие стопа.",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "add", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" }
+    ]
+  },
+  {
+    "id": 221421,
+    "text": "Sol Sl на твх\nЛимитка не актуальна не задели\nСледующие цели 75, 76.5",
+    "note": "Тройной интент явным текстом SOL: стоп на твх + отмена неактуальной лимитки + новые цели. E3 прототипа: цели 75/76.5 не должны быть спутаны с ценой SL.",
+    "expected": [
+      { "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "cancel_order", "side": "long" },
+      { "symbol": "SOLUSDT", "type": "modify_tp", "side": "long" }
+    ]
+  },
+  {
+    "id": 221422,
+    "text": "Xrp Sl 1.02\nBtc sl 57760\nЭто потенциальное дно. \nЕсли опять будем заваливаться вниз то ожидания отменяются !",
+    "note": "Мульти-символ явным текстом (E2 прототипа: второй SL терялся) + шумовой комментарий про 'дно' без действия.",
+    "expected": [
+      { "symbol": "XRPUSDT", "type": "modify_sl", "side": "long" },
+      { "symbol": "BTCUSDT", "type": "modify_sl", "side": "long" }
+    ]
+  },
+  {
+    "id": 221425,
+    "text": "3🎯",
+    "mediaFile": "221425.jpg",
+    "note": "Карточка SOLUSDT ЗАКРЫТА (вход 72.34→закрытие 76.56, +55.12%) — третья цель.",
+    "expected": [{ "symbol": "SOLUSDT", "type": "tp_hit", "side": "long" }]
+  },
+  {
+    "id": 221426,
+    "text": "Один объем закрыт\nДалее 61300, 62200",
+    "mediaFile": "221426.jpg",
+    "note": "Карточка BTCUSDT — E5 прототипа (лексикон 'объем' без 'ё') + новые цели одним сообщением.",
+    "expected": [
+      { "symbol": "BTCUSDT", "type": "close", "side": "long" },
+      { "symbol": "BTCUSDT", "type": "modify_tp", "side": "long" }
+    ]
+  },
+  {
+    "id": 221427,
+    "text": "2🎯",
+    "mediaFile": "221427.jpg",
+    "note": "Карточка BTCUSDT ЗАКРЫТА (вход 59534.9→закрытие 61330.0, +29.27%) — вторая цель.",
+    "expected": [{ "symbol": "BTCUSDT", "type": "tp_hit", "side": "long" }]
+  },
+  {
+    "id": 221445,
+    "text": "Sl 74\nМожет быть финальный вынос по битку",
+    "replyToMsgId": 221443,
+    "note": "research §7 обязательный кейс E1 — символ ТОЛЬКО через reply-parent (#SOLUSDT), а не через слово 'битку' в тексте (ложный символ прототипа). Ожидание: SOLUSDT, НЕ BTCUSDT.",
+    "expected": [{ "symbol": "SOLUSDT", "type": "modify_sl", "side": "long" }]
+  }
+]

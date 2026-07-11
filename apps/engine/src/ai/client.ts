@@ -14,7 +14,7 @@ import { EXTRACT_SIGNAL_TOOL, type ExtractSignalOutput } from './schema.js'
 import { buildUserTurn, type AnthropicContentBlock, type BuildUserTurnParams, type PromptImage } from './prompt.js'
 
 /** Версия промпта — часть ключа кэша разбора и колонки ai_calls.prompt_version (research §10). */
-export const PROMPT_VERSION = 'extract_signal.v1'
+export const PROMPT_VERSION = 'extract_signal.v2'
 
 /** Модели (research §8, ЖЁСТКО заданы задачей — основная и эскалация). */
 export const MODEL_SONNET = 'claude-sonnet-4-5-20250929'

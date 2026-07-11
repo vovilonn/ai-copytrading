@@ -26,7 +26,9 @@ ACTION TYPES:
 - close: partial or full fix ("первая цель, зафиксировал 50%", "закрываю остаток", "Фикс половину", "Закрываю все Лонги").
 - modify_sl / modify_tp: change stop or targets ("Sl btc - 64300", "Следующие цели 72.7, 74", "Стоп на твх").
 - cancel_order: cancel a pending limit ("лимитка не актуальна не задели").
-- tp_hit / sl_hit: report an exchange event ("выбило по стоп-лоссу"=sl_hit; "первая цель есть"/"2🎯"=tp_hit). These are events, not new orders.
+- tp_hit / sl_hit: report an exchange event ("выбило по стоп-лоссу"/"выбило в бу"/"закрыло в бу"/"стоп сработал"=sl_hit; "первая цель есть"/"2🎯"/"1🎯"=tp_hit). These are events, not new orders.
+
+CO-OCCURRING EVENTS: a single message often mixes a SETUP action with a HIT event on the same symbol — emit ALL of them, never collapse into one. E.g. "Стоп на твх ... Выбило в бу" => modify_sl(marker=entry_price) AND sl_hit (the stop was moved to breakeven AND then triggered). "Первая цель 71.27🎯 ... Следующие 72.7,74" => tp_hit AND modify_tp. Setting/showing pending target orders ("Первые цели"/"Следующие цели"/a screenshot of pending "Закрыть лонг" trigger orders) is modify_tp, NOT tp_hit — tp_hit is reserved for a target actually REACHED ("2🎯", a WEEX result card showing +% with Цена закрытия).
 
 MULTI-SYMBOL: one message may manage several symbols ("🔄 Менеджмент позиций", "Sl btc.. Sl Eth.."). Emit one action per (symbol, intent). message_type=management_multi.
 
