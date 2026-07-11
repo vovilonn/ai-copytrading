@@ -194,6 +194,10 @@ export class PositionsService {
       unrealisedPnl: signedMoney(pnlSum),
       positionValue: money(notionalSum),
       marginUsed: money(marginSum),
+      // Task 1 (мониторинг PnL/баланса): временные дефолты ради компиляции DTO — реальный
+      // расчёт (SUM(trades.realized_pnl) closed + unrealisedPnl) добавляет Task 2.
+      realizedPnl: '0',
+      totalPnl: '0',
     }
   }
 }

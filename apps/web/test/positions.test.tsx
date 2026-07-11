@@ -78,6 +78,10 @@ function statsFixture(overrides: Partial<PositionStatsDto> = {}): PositionStatsD
     unrealisedPnl: '+$327.60',
     positionValue: '$26,535',
     marginUsed: '$5,307',
+    // Task 1 (мониторинг PnL/баланса): поля добавлены в PositionStatsDto ради компиляции;
+    // buildStats() их пока не читает — реальный рендер добавит Task 4.
+    realizedPnl: '0',
+    totalPnl: '0',
     ...overrides,
   }
 }

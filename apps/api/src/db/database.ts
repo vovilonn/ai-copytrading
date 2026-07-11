@@ -311,6 +311,18 @@ export interface DB {
     prompt_version: string | null
     created_at: Generated<Date>
   }
+  // Task 1 (мониторинг PnL/баланса, 006_wallet_snapshots.ts): снимки баланса demo-аккаунта,
+  // которые пишет движок (Task 3) и читает GET /account/wallet (Task 2). channel_id NULL —
+  // снапшот уровня всего аккаунта (единственный вид, который сейчас провижинится); non-null —
+  // задел под будущие реальные субаккаунты на канал.
+  wallet_snapshots: {
+    id: Generated<string>
+    channel_id: number | null
+    total_equity: string
+    available_balance: string
+    currency: Generated<string>
+    created_at: Generated<Date>
+  }
   // остальные таблицы схемы (processed_messages, ai_calls, ai_cache, audit_log, app_state)
   // объявляются здесь же по мере использования в Ф1–Ф4. Пока созданы миграцией, но не
   // типизированы — тесты, которым нужен сырой SQL, используют sql`...`.

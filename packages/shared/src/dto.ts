@@ -109,11 +109,18 @@ export interface PositionDto {
   channelId: number
 }
 
+// Task 1 (мониторинг PnL/баланса, docs/superpowers/plans/2026-07-12-monitoring-pnl-balance.md):
+// realizedPnl/totalPnl добавлены поверх исходных Ф1-полей (openPositions/unrealisedPnl/
+// positionValue/marginUsed остались как есть — старые потребители не ломаются). totalPnl =
+// unrealisedPnl(open) + realizedPnl(closed) — реальный расчёт в Task 2 (apps/api/src/positions/
+// positions.service.ts::getStats), здесь только форма контракта.
 export interface PositionStatsDto {
   openPositions: number
   unrealisedPnl: string
   positionValue: string
   marginUsed: string
+  realizedPnl: string
+  totalPnl: string
 }
 
 // Задача 3 (Ф4, task-3-brief.md): отложенные лимитки на вход — submitted limit-ордера
@@ -141,6 +148,56 @@ export interface PendingOrderDto {
   // limit_ttl_sec), а не голая (обычно NULL — движок никогда явно её не проставляет при
   // вставке ордера) колонка orders.ttl_expires_at. Фронт считает обратный отсчёт до этого момента.
   ttlExpiresAt: string
+}
+
+// Task 1 (мониторинг PnL/баланса, docs/superpowers/plans/2026-07-12-monitoring-pnl-balance.md):
+// строка вкладки Closed на Positions — GET /positions/history (Task 2). Источник — ЗАКРЫТЫЕ
+// `trades` (status IN ('closed','cancelled')), НЕ `positions` (те — только открытые, зеркало
+// биржи). exitPrice/closeReason nullable: закрытие может быть не до конца восстановимо
+// (напр. cancelled-сделка без исполнений вообще не имеет exitPrice/причины закрытия).
+export interface ClosedTradeDto {
+  tradeRef: string // human_ref ('TR-1042'), как и tradeRef в PositionDto/ActionRowDto
+  channelId: number
+  channelTitle: string
+  symbol: string
+  side: Side
+  avgEntry: string
+  exitPrice: string | null
+  realizedPnl: string
+  isWin: boolean | null
+  // Причина закрытия — из actions (последний закрывающий action.type по trade_id, приоритет
+  // liquidation > sl > tp > manual, см. план Task 2); 'cancelled' — отдельный статус/бейдж,
+  // не путать с причиной закрытия ОТКРЫТОЙ сделки.
+  closeReason: 'tp' | 'sl' | 'manual' | 'liquidation' | 'cancelled' | null
+  leverage: string | null
+  openedAt: string // ISO trades.opened_at
+  closedAt: string // ISO trades.closed_at
+  durationMs: number // closedAt - openedAt, посчитано на backend
+  status: 'closed' | 'cancelled'
+}
+
+// Task 1: PnL по одному каналу — GET /positions/stats/by-channel (Task 2), строка мини-таблицы
+// PnL-панели (Task 4). winRate — тот же формат, что и ChannelDto.winRate ('73%' / '—').
+export interface ChannelPnlDto {
+  channelId: number
+  channelTitle: string
+  openPositions: number
+  unrealisedPnl: string
+  realizedPnl: string
+  totalPnl: string
+  winRate: string
+}
+
+// Task 1: баланс demo-аккаунта — GET /account/wallet (Task 2), источник — последний
+// `wallet_snapshots` (channel_id IS NULL), который пишет движок (Task 3). asOf=null — движок
+// ещё не записал ни одного снапшота (напр. только что переключились на live) — фронт должен
+// показать состояние "нет данных", а не нулевой баланс.
+export interface AccountWalletDto {
+  totalEquity: string
+  availableBalance: string
+  currency: string
+  asOf: string | null // ISO wallet_snapshots.created_at последнего снапшота
+  perChannel: ChannelPnlDto[]
 }
 
 // Ф4 задача 5 (метрики/наблюдаемость, p4-task5-brief.md): GET /api/metrics/ai
