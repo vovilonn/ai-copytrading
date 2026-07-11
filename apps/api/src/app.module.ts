@@ -13,6 +13,7 @@ import { MetricsModule } from './metrics/metrics.module.js'
 import { OrdersModule } from './orders/orders.module.js'
 import { PositionsModule } from './positions/positions.module.js'
 import { RealtimeModule } from './realtime/realtime.module.js'
+import { WalletModule } from './wallet/wallet.module.js'
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { RealtimeModule } from './realtime/realtime.module.js'
     RealtimeModule,
     HealthModule,
     MetricsModule,
+    WalletModule,
   ],
   providers: [
     // Все роуты закрыты JwtGuard, кроме помеченных @Public() (сейчас — только POST /auth/login).

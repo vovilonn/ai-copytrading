@@ -92,6 +92,11 @@ export interface ActionRowDto {
 // Задача 8: строка таблицы Positions (design/project/Admin.dc.html:394-475) — зеркало
 // Bybit /v5/position/list (таблица `positions`, size<>0). Деньги/цены — строки.
 export interface PositionDto {
+  // Task 2 (мониторинг): синтетический курсор keyset-пагинации `${channelId}:${symbol}` —
+  // таблица positions не имеет одноколоночного PK (составной (channel_id, symbol)), поэтому
+  // id собирается на backend из пары-ключа. Фронт передаёт его как ?before= для продолжения
+  // страницы (та же роль, что и id у ActionRowDto). Не отображается в UI.
+  id: string
   symbol: string
   side: Side
   size: string

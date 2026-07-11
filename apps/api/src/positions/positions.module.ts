@@ -7,5 +7,8 @@ import { PositionsService } from './positions.service.js'
   imports: [DbModule],
   controllers: [PositionsController],
   providers: [PositionsService],
+  // WalletModule (GET /account/wallet) переиспользует getStatsByChannel — экспортируем сервис,
+  // чтобы не дублировать per-channel SQL (Task 2).
+  exports: [PositionsService],
 })
 export class PositionsModule {}

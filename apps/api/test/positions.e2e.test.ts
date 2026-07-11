@@ -3,7 +3,7 @@ import request from 'supertest'
 import type { Kysely } from 'kysely'
 import type { INestApplication } from '@nestjs/common'
 import { resetTestSchema } from 'test-db'
-import type { PositionDto, PositionStatsDto } from 'shared/dto.js'
+import type { ChannelPnlDto, ClosedTradeDto, PositionDto, PositionStatsDto } from 'shared/dto.js'
 import { CHANNEL_SOURCES } from 'shared/sources.js'
 import { createDb, type DB } from '../src/db/database.js'
 import { migrateToLatest } from '../src/db/migrate.js'
@@ -121,6 +121,153 @@ beforeAll(async () => {
     })
     .execute()
 
+  // --- Task 2: закрытые/отменённые сделки для /history, расширенной stats и by-channel ---
+  const seedMsg = await db
+    .insertInto('messages')
+    .values({
+      channel_id: CHANNEL_A_ID,
+      tg_message_id: 7000,
+      is_topic_message: false,
+      text: 'closed-trades seed',
+      has_media: false,
+      msg_ts: new Date(Date.UTC(2026, 6, 10, 8, 0, 0)),
+      raw: JSON.stringify({}),
+    })
+    .returning('id')
+    .executeTakeFirstOrThrow()
+
+  // TR-7001 (channel A, BTC long, closed, WIN): tp_hit-action -> closeReason 'tp';
+  // два reduce-only исполнения -> exitPrice = взвеш. средняя (61000·0.3 + 61500·0.2)/0.5 = 61200.
+  const tr7001 = await db
+    .insertInto('trades')
+    .values({
+      human_ref: 'TR-7001',
+      seq: 7001,
+      channel_id: CHANNEL_A_ID,
+      symbol: 'BTCUSDT',
+      side: 'long',
+      status: 'closed',
+      avg_entry: '60000',
+      realized_pnl: '150.50',
+      is_win: true,
+      leverage: '10',
+      opened_at: new Date(Date.UTC(2026, 6, 11, 9, 0, 0)),
+      closed_at: new Date(Date.UTC(2026, 6, 11, 10, 0, 0)),
+    })
+    .returning('id')
+    .executeTakeFirstOrThrow()
+  const act7001 = await db
+    .insertInto('actions')
+    .values({
+      message_id: seedMsg.id,
+      channel_id: CHANNEL_A_ID,
+      action_index: 10,
+      type: 'tp_hit',
+      side: 'long',
+      symbol: 'BTCUSDT',
+      pair: 'BTCUSDT',
+      method: 'auto',
+      status: 'executed',
+      trade_id: tr7001.id,
+      created_at: new Date(Date.UTC(2026, 6, 11, 10, 0, 0)),
+    })
+    .returning('id')
+    .executeTakeFirstOrThrow()
+  const ord7001 = await db
+    .insertInto('orders')
+    .values({
+      action_id: act7001.id,
+      trade_id: tr7001.id,
+      channel_id: CHANNEL_A_ID,
+      symbol: 'BTCUSDT',
+      order_link_id: 'CT-7001-close',
+      purpose: 'close',
+      side: 'short',
+      order_type: 'market',
+      reduce_only: true,
+    })
+    .returning('id')
+    .executeTakeFirstOrThrow()
+  await db
+    .insertInto('executions')
+    .values([
+      {
+        order_id: ord7001.id,
+        trade_id: tr7001.id,
+        bybit_exec_id: 'EX-7001-a',
+        symbol: 'BTCUSDT',
+        side: 'short',
+        exec_qty: '0.3',
+        exec_price: '61000',
+        exec_ts: new Date(Date.UTC(2026, 6, 11, 10, 0, 0)),
+      },
+      {
+        order_id: ord7001.id,
+        trade_id: tr7001.id,
+        bybit_exec_id: 'EX-7001-b',
+        symbol: 'BTCUSDT',
+        side: 'short',
+        exec_qty: '0.2',
+        exec_price: '61500',
+        exec_ts: new Date(Date.UTC(2026, 6, 11, 10, 0, 1)),
+      },
+    ])
+    .execute()
+
+  // TR-7002 (channel A, ETH short, closed, LOSS): sl_hit-action -> closeReason 'sl';
+  // исполнений нет -> exitPrice null (dry-run-хвост).
+  const tr7002 = await db
+    .insertInto('trades')
+    .values({
+      human_ref: 'TR-7002',
+      seq: 7002,
+      channel_id: CHANNEL_A_ID,
+      symbol: 'ETHUSDT',
+      side: 'short',
+      status: 'closed',
+      avg_entry: '3000',
+      realized_pnl: '-40.25',
+      is_win: false,
+      leverage: '5',
+      opened_at: new Date(Date.UTC(2026, 6, 10, 8, 0, 0)),
+      closed_at: new Date(Date.UTC(2026, 6, 10, 10, 0, 0)),
+    })
+    .returning('id')
+    .executeTakeFirstOrThrow()
+  await db
+    .insertInto('actions')
+    .values({
+      message_id: seedMsg.id,
+      channel_id: CHANNEL_A_ID,
+      action_index: 11,
+      type: 'sl_hit',
+      side: 'short',
+      symbol: 'ETHUSDT',
+      pair: 'ETHUSDT',
+      method: 'auto',
+      status: 'executed',
+      trade_id: tr7002.id,
+      created_at: new Date(Date.UTC(2026, 6, 10, 10, 0, 0)),
+    })
+    .execute()
+
+  // TR-7003 (channel A, SOL long, CANCELLED без closed_at/opened_at) — отменённая лимитка:
+  // closeReason 'cancelled', durationMs 0, avgEntry '0'. Исключена из status=closed и из realized.
+  await db
+    .insertInto('trades')
+    .values({
+      human_ref: 'TR-7003',
+      seq: 7003,
+      channel_id: CHANNEL_A_ID,
+      symbol: 'SOLUSDT',
+      side: 'long',
+      status: 'cancelled',
+      avg_entry: null,
+      realized_pnl: '0',
+      leverage: '3',
+    })
+    .execute()
+
   agent = request.agent(app.getHttpServer())
   await agent.post('/api/auth/login').send({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }).expect(204)
 })
@@ -224,6 +371,120 @@ describe('GET /api/positions', () => {
     const rows = res.body as PositionDto[]
     expect(rows).toHaveLength(0)
   })
+
+  it('id позиции — синтетический курсор `${channelId}:${symbol}`', async () => {
+    const res = await agent.get('/api/positions').expect(200)
+    const rows = res.body as PositionDto[]
+    const btc = rows.find((p) => p.symbol === 'BTCUSDT')!
+    expect(btc.id).toBe(`${CHANNEL_A_ID}:BTCUSDT`)
+  })
+
+  it('?limit=2 усекает список позиций (3 открытые -> 2)', async () => {
+    const res = await agent.get('/api/positions?limit=2').expect(200)
+    const rows = res.body as PositionDto[]
+    expect(rows).toHaveLength(2)
+  })
+
+  it('?before=<id первой страницы> отдаёт keyset-продолжение без пересечения и без пропусков', async () => {
+    const page1 = (await agent.get('/api/positions?limit=2').expect(200)).body as PositionDto[]
+    expect(page1).toHaveLength(2)
+    const cursor = page1[1]!.id
+
+    const page2 = (await agent.get(`/api/positions?limit=2&before=${encodeURIComponent(cursor)}`).expect(200))
+      .body as PositionDto[]
+    expect(page2).toHaveLength(1) // всего 3 открытых -> после 2 остаётся 1
+
+    const allIds = [...page1, ...page2].map((p) => p.id)
+    expect(new Set(allIds).size).toBe(3) // ни дублей, ни пропусков
+  })
+
+  it('?before=<мусорный курсор без ":"> тихо игнорируется (не 500)', async () => {
+    const res = await agent.get('/api/positions?before=garbage').expect(200)
+    const rows = res.body as PositionDto[]
+    expect(rows).toHaveLength(3) // курсор проигнорирован — как будто before не передавали
+  })
+})
+
+describe('GET /api/positions/history', () => {
+  it('без куки -> 401', async () => {
+    const res = await request(app.getHttpServer()).get('/api/positions/history')
+    expect(res.status).toBe(401)
+  })
+
+  it('по умолчанию (status=closed) отдаёт закрытые сделки, cancelled исключены', async () => {
+    const res = await agent.get('/api/positions/history').expect(200)
+    const rows = res.body as ClosedTradeDto[]
+    const refs = rows.map((r) => r.tradeRef)
+    expect(refs).toContain('TR-7001')
+    expect(refs).toContain('TR-7002')
+    expect(refs).not.toContain('TR-7003') // cancelled
+    expect(rows.every((r) => r.status === 'closed')).toBe(true)
+  })
+
+  it('TR-7001: closeReason tp (из tp_hit), exitPrice — взвеш. средняя reduce-only филлов', async () => {
+    const res = await agent.get(`/api/positions/history?channel=${CHANNEL_A_ID}`).expect(200)
+    const rows = res.body as ClosedTradeDto[]
+    const t = rows.find((r) => r.tradeRef === 'TR-7001')!
+    expect(t.closeReason).toBe('tp')
+    expect(t.exitPrice).toBe('61200')
+    expect(t.avgEntry).toBe('60000')
+    expect(t.realizedPnl).toBe('+$150.50')
+    expect(t.isWin).toBe(true)
+    expect(t.leverage).toBe('10x')
+    expect(t.side).toBe('long')
+    expect(t.symbol).toBe('BTCUSDT')
+    expect(t.durationMs).toBe(3_600_000) // 1 час
+    expect(t.status).toBe('closed')
+    expect(t.channelId).toBe(CHANNEL_A_ID)
+  })
+
+  it('TR-7002: closeReason sl (из sl_hit), exitPrice null (нет исполнений), realized со знаком', async () => {
+    const res = await agent.get(`/api/positions/history?channel=${CHANNEL_A_ID}`).expect(200)
+    const rows = res.body as ClosedTradeDto[]
+    const t = rows.find((r) => r.tradeRef === 'TR-7002')!
+    expect(t.closeReason).toBe('sl')
+    expect(t.exitPrice).toBeNull()
+    expect(t.realizedPnl).toBe('-$40.25')
+    expect(t.isWin).toBe(false)
+  })
+
+  it('status=cancelled отдаёт только отменённые — closeReason cancelled, durationMs 0, avgEntry 0', async () => {
+    const res = await agent.get('/api/positions/history?status=cancelled').expect(200)
+    const rows = res.body as ClosedTradeDto[]
+    expect(rows.length).toBeGreaterThan(0)
+    expect(rows.every((r) => r.status === 'cancelled')).toBe(true)
+    const t = rows.find((r) => r.tradeRef === 'TR-7003')!
+    expect(t.closeReason).toBe('cancelled')
+    expect(t.durationMs).toBe(0)
+    expect(t.avgEntry).toBe('0')
+  })
+
+  it('status=all включает и closed, и cancelled', async () => {
+    const res = await agent.get('/api/positions/history?status=all').expect(200)
+    const refs = (res.body as ClosedTradeDto[]).map((r) => r.tradeRef)
+    expect(refs).toContain('TR-7001')
+    expect(refs).toContain('TR-7003')
+  })
+
+  it('keyset по human_ref: limit=1 + before отдаёт следующую страницу (channel A, closed)', async () => {
+    const page1 = (await agent.get(`/api/positions/history?channel=${CHANNEL_A_ID}&limit=1`).expect(200))
+      .body as ClosedTradeDto[]
+    expect(page1).toHaveLength(1)
+    expect(page1[0]!.tradeRef).toBe('TR-7001') // closed_at 07-11 свежее 07-10
+
+    const page2 = (
+      await agent.get(`/api/positions/history?channel=${CHANNEL_A_ID}&limit=1&before=${page1[0]!.tradeRef}`).expect(200)
+    ).body as ClosedTradeDto[]
+    expect(page2).toHaveLength(1)
+    expect(page2[0]!.tradeRef).toBe('TR-7002')
+  })
+
+  it('фильтр channel сужает историю по каналу', async () => {
+    const res = await agent.get(`/api/positions/history?channel=${CHANNEL_A_ID}`).expect(200)
+    const rows = res.body as ClosedTradeDto[]
+    expect(rows.every((r) => r.channelId === CHANNEL_A_ID)).toBe(true)
+    expect(rows.some((r) => r.tradeRef === 'TR-9103')).toBe(false) // это channel B (SOL closed)
+  })
 })
 
 describe('GET /api/positions/stats', () => {
@@ -239,5 +500,39 @@ describe('GET /api/positions/stats', () => {
     expect(stats.unrealisedPnl).toBe('+$500.00')
     expect(stats.positionValue).toBe('$39,220')
     expect(stats.marginUsed).toBe('$4,760')
+  })
+
+  it('realizedPnl = SUM(realized closed), totalPnl = unrealised(open) + realized', async () => {
+    const res = await agent.get('/api/positions/stats').expect(200)
+    const stats = res.body as PositionStatsDto
+    // closed: TR-9103(0) + TR-7001(150.50) + TR-7002(-40.25) = 110.25; cancelled TR-7003 не в сумме.
+    expect(stats.realizedPnl).toBe('+$110.25')
+    // 500 (unrealised open) + 110.25 (realized) = 610.25.
+    expect(stats.totalPnl).toBe('+$610.25')
+  })
+})
+
+describe('GET /api/positions/stats/by-channel', () => {
+  it('без куки -> 401', async () => {
+    const res = await request(app.getHttpServer()).get('/api/positions/stats/by-channel')
+    expect(res.status).toBe(401)
+  })
+
+  it('группирует PnL по каналам с winRate по решённым исходам', async () => {
+    const res = await agent.get('/api/positions/stats/by-channel').expect(200)
+    const rows = res.body as ChannelPnlDto[]
+
+    const a = rows.find((r) => r.channelId === CHANNEL_A_ID)!
+    expect(a.openPositions).toBe(2) // BTC + ETH открыты
+    expect(a.unrealisedPnl).toBe('+$500.00')
+    expect(a.realizedPnl).toBe('+$110.25') // TR-7001 + TR-7002
+    expect(a.totalPnl).toBe('+$610.25')
+    expect(a.winRate).toBe('50%') // 1 win / 2 decided (TR-7001 win, TR-7002 loss)
+
+    const b = rows.find((r) => r.channelId === CHANNEL_B_ID)!
+    expect(b.openPositions).toBe(1) // XRP (SOL size=0 не в счёте)
+    expect(b.unrealisedPnl).toBe('+$0.00')
+    expect(b.realizedPnl).toBe('+$0.00') // TR-9103 closed realized 0
+    expect(b.winRate).toBe('—') // is_win null -> исход неизвестен
   })
 })

@@ -53,6 +53,7 @@ const CHANNELS: ChannelDto[] = [
 
 function positionFixture(overrides: Partial<PositionDto> = {}): PositionDto {
   return {
+    id: '1:BTCUSDT',
     symbol: 'BTCUSDT',
     side: 'long',
     size: '0.42',
