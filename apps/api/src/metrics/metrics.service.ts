@@ -46,6 +46,7 @@ interface TradesRow {
   open: number
   closed: number
   cancelled: number
+  decided: number
   wins: number
 }
 
@@ -159,23 +160,27 @@ export class MetricsService {
 
   /** Win Rate по ВСЕМ каналам сразу (без фильтра channel_id) — та же формула/хелпер
    *  (formatWinRate), что и ChannelStatsService.winRateFor, переиспользованная не через сервис
-   *  (тот скоупит по одному каналу), а напрямую: разница только в отсутствии WHERE channel_id. */
+   *  (тот скоупит по одному каналу), а напрямую: разница только в отсутствии WHERE channel_id.
+   *  Знаменатель winRate — `decided` (closed AND is_win IS NOT NULL), а не `closed` (адверсариал-
+   *  ревью I1): dry-run-закрытия с is_win=NULL исключаются, иначе winRate завышенно показывал бы
+   *  «0%» — расходясь с колонкой Win Rate в списке каналов (stats.service.ts). `closed` остаётся
+   *  в ответе как отдельная метрика (сколько всего закрыто). */
   private async getTradesMetrics(): Promise<TradesMetricsDto> {
     const { rows } = await sql<TradesRow>`
       SELECT
         count(*) FILTER (WHERE status = 'open') AS open,
         count(*) FILTER (WHERE status = 'closed') AS closed,
         count(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+        count(*) FILTER (WHERE status = 'closed' AND is_win IS NOT NULL) AS decided,
         count(*) FILTER (WHERE status = 'closed' AND is_win) AS wins
       FROM trades
     `.execute(this.database.db)
     const row = rows[0]
-    const closed = row?.closed ?? 0
     return {
       open: row?.open ?? 0,
-      closed,
+      closed: row?.closed ?? 0,
       cancelled: row?.cancelled ?? 0,
-      winRate: formatWinRate(closed, row?.wins ?? 0),
+      winRate: formatWinRate(row?.decided ?? 0, row?.wins ?? 0),
     }
   }
 }

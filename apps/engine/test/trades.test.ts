@@ -149,16 +149,18 @@ describe('closeTrade', () => {
     expect(row.is_win).toBe(true)
   })
 
-  it('realizedPnl отрицателен ИЛИ ровно ноль -> is_win = false (ноль — не выигрыш)', async () => {
+  it('realizedPnl отрицателен -> is_win = false; ровно ноль -> is_win = null (исход неизвестен, ревью I1)', async () => {
     const lossTrade = await openTrade(db, { channelId: 2, symbol: 'LOSSUSDT', side: 'long' })
     await closeTrade(db, { tradeId: lossTrade.tradeId, realizedPnl: '-10' })
     const lossRow = await db.selectFrom('trades').select('is_win').where('id', '=', lossTrade.tradeId).executeTakeFirstOrThrow()
     expect(lossRow.is_win).toBe(false)
 
+    // realized_pnl == 0 в dry-run означает «PnL не считался», а не «безубыток» — is_win остаётся
+    // NULL, чтобы такая сделка не попала в знаменатель winRate как поражение (см. computeIsWin).
     const zeroTrade = await openTrade(db, { channelId: 2, symbol: 'ZEROUSDT', side: 'long' })
     await closeTrade(db, { tradeId: zeroTrade.tradeId, realizedPnl: '0' })
     const zeroRow = await db.selectFrom('trades').select('is_win').where('id', '=', zeroTrade.tradeId).executeTakeFirstOrThrow()
-    expect(zeroRow.is_win).toBe(false)
+    expect(zeroRow.is_win).toBeNull()
   })
 
   it('realizedPnl НЕ передан в этом вызове -> is_win выводится из уже посчитанного значения колонки (private-ws.ts-путь)', async () => {
@@ -236,8 +238,8 @@ describe('computeIsWin', () => {
     expect(computeIsWin('-1')).toBe(false)
   })
 
-  it('ровно ноль -> false (ноль — не выигрыш, строго ">")', () => {
-    expect(computeIsWin('0')).toBe(false)
-    expect(computeIsWin('0.0000000000')).toBe(false)
+  it('ровно ноль -> null (исход неизвестен: безубыток либо dry-run без расчёта PnL)', () => {
+    expect(computeIsWin('0')).toBeNull()
+    expect(computeIsWin('0.0000000000')).toBeNull()
   })
 })

@@ -179,11 +179,20 @@ export interface CloseTradeParams {
 }
 
 /**
- * Win Rate (Ф4, task-2-brief.md): «win» ⟺ реализованный PnL положителен. Ровно ноль — НЕ
- * выигрыш (строго `>`, не `>=`). Деньги/PnL — Decimal/строка (CLAUDE.md), никогда JS number.
+ * Win Rate (Ф4, task-2-brief.md; адверсариал-ревью I1): исход сделки по реализованному PnL.
+ *  - PnL > 0 → true (победа)
+ *  - PnL < 0 → false (поражение)
+ *  - PnL == 0 → null (исход НЕИЗВЕСТЕН): либо истинный безубыток, либо — что важнее для текущего
+ *    demo-деплоя — dry-run, где realized_pnl вообще не считается и всегда 0. Возвращать здесь
+ *    `false` означало бы записать в БД «поражение» для сделки, по которой мы не знаем результата,
+ *    и получить лживый «0% win rate» на канале с реальными закрытыми сделками. null → is_win
+ *    остаётся неопределённым, сделка выпадает из знаменателя winRate (formatWinRate).
+ * Деньги/PnL — Decimal/строка (CLAUDE.md), никогда JS number.
  */
-export function computeIsWin(realizedPnl: string): boolean {
-  return new Decimal(realizedPnl).greaterThan(0)
+export function computeIsWin(realizedPnl: string): boolean | null {
+  const pnl = new Decimal(realizedPnl)
+  if (pnl.isZero()) return null
+  return pnl.greaterThan(0)
 }
 
 /**
@@ -252,12 +261,13 @@ export async function closeTrade(tx: Kysely<DB>, params: CloseTradeParams): Prom
  *  крэше между UPDATE trades и коммитом). cancelled сознательно исключён из WHERE — та же
  *  формула, что и apps/api/src/channels/stats.service.ts (не дублируем округление отдельно). */
 async function emitChannelStats(tx: Kysely<DB>, channelId: number): Promise<void> {
-  const { rows } = await sql<{ closed_trades: string; wins: string }>`
-    SELECT count(*)::text AS closed_trades, count(*) FILTER (WHERE is_win)::text AS wins
+  const { rows } = await sql<{ decided: string; wins: string }>`
+    SELECT count(*) FILTER (WHERE is_win IS NOT NULL)::text AS decided,
+           count(*) FILTER (WHERE is_win)::text AS wins
     FROM trades WHERE channel_id = ${channelId} AND status = 'closed'
   `.execute(tx)
   const row = rows[0]
-  const winRate = formatWinRate(Number(row?.closed_trades ?? 0), Number(row?.wins ?? 0))
+  const winRate = formatWinRate(Number(row?.decided ?? 0), Number(row?.wins ?? 0))
 
   await tx
     .insertInto('domain_events')

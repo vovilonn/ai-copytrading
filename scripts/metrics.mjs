@@ -104,6 +104,7 @@ async function main() {
         count(*) FILTER (WHERE status = 'open') AS open,
         count(*) FILTER (WHERE status = 'closed') AS closed,
         count(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+        count(*) FILTER (WHERE status = 'closed' AND is_win IS NOT NULL) AS decided,
         count(*) FILTER (WHERE status = 'closed' AND is_win) AS wins
       FROM trades
     `),
@@ -148,8 +149,10 @@ async function main() {
     )
   }
 
-  const trades = tradesRes.rows[0] ?? { open: 0, closed: 0, cancelled: 0, wins: 0 }
-  const winRate = trades.closed > 0 ? `${Math.round((trades.wins / trades.closed) * 100)}%` : '—'
+  const trades = tradesRes.rows[0] ?? { open: 0, closed: 0, cancelled: 0, decided: 0, wins: 0 }
+  // Знаменатель — decided (исход известен), а не closed (ревью I1): dry-run-закрытия с is_win=NULL
+  // не считаются поражениями. Согласовано с metrics.service.ts / stats.service.ts.
+  const winRate = trades.decided > 0 ? `${Math.round((trades.wins / trades.decided) * 100)}%` : '—'
   console.log(
     `\n=== Сделки ===\n\nOpen: ${trades.open} | Closed: ${trades.closed} | Cancelled: ${trades.cancelled} | Win Rate: ${winRate}\n`,
   )

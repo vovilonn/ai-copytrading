@@ -464,4 +464,13 @@ describe('Win Rate — статистика закрытых сделок (за�
     const ch2 = channels.find((c) => c.id === CHANNEL_2_ID)!
     expect(ch2.winRate).toBe('67%')
   })
+
+  // Адверсариал-ревью I1: закрытая сделка с is_win=NULL (dry-run не считает realized_pnl —
+  // исход НЕИЗВЕСТЕН) не должна тянуть winRate вниз. Со старой формулой (знаменатель = все
+  // закрытые) стало бы 2/4=50%; с исправленной (знаменатель = только решённые) остаётся 2/3=67%.
+  it('closed-сделка с is_win=NULL исключена из знаменателя — winRate остаётся 67%, а не падает до 50%', async () => {
+    await seedClosedTrade('closed', null)
+    const res = await agent.get(`/api/channels/${CHANNEL_2_ID}`).expect(200)
+    expect((res.body as ChannelDto).winRate).toBe('67%')
+  })
 })

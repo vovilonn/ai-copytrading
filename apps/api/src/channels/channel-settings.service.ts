@@ -37,6 +37,33 @@ function toChannelSettingsDto(row: ChannelSettingsRow): ChannelSettingsDto {
   }
 }
 
+// Строгий формат неотрицательного десятичного числа: только цифры и одна точка. Сознательно
+// НЕ полагаемся на Number() как на первичную проверку (адверсариал-ревью M1): Number('0x10')=16,
+// Number('1e3')=1000, Number(' 5 ')=5 прошли бы валидацию, а затем ИСХОДНАЯ строка ('0x10'/'1e3')
+// пишется в NUMERIC-колонку → Postgres её отвергает → 500 вместо 400. Regex отсекает hex/экспоненту/
+// знак/пробелы ДО записи; Number() ниже безопасен только для проверки диапазона.
+const DECIMAL_RE = /^\d+(?:\.\d+)?$/
+
+// Разбирает поле-число с проверкой формата и диапазона. Верхние границы — не косметика:
+// max_leverage/default_leverage это NUMERIC(6,2) (max 9999.99), '100000' дало бы numeric overflow
+// → 500; плюс плечо >125 бессмысленно (предел биржи). trade_size — NUMERIC(20,8), кап 1e9 отсекает
+// абсурд, оставаясь далеко внутри колонки.
+function parseDecimalField(
+  raw: string,
+  field: string,
+  { min, max, minInclusive = true }: { min: number; max: number; minInclusive?: boolean },
+): void {
+  if (typeof raw !== 'string' || !DECIMAL_RE.test(raw)) {
+    throw new BadRequestException(`${field}: ожидается десятичное число без знака (например "300" или "10.5")`)
+  }
+  const n = Number(raw)
+  const belowMin = minInclusive ? n < min : n <= min
+  if (!Number.isFinite(n) || belowMin || n > max) {
+    const lo = minInclusive ? `>= ${min}` : `> ${min}`
+    throw new BadRequestException(`${field}: должно быть ${lo} и <= ${max}`)
+  }
+}
+
 // Валидирует ТОЛЬКО переданные поля (частичный PATCH) — отсутствующее поле в теле запроса
 // не трогает существующее значение в БД и не проверяется здесь. Бросает BadRequestException
 // (-> 400) на первое найденное нарушение, а не собирает список ошибок — форма на фронте
@@ -44,22 +71,13 @@ function toChannelSettingsDto(row: ChannelSettingsRow): ChannelSettingsDto {
 // валидные данные, либо намеренно некорректный запрос (curl/тест).
 function assertValid(input: UpdateChannelSettingsInput): void {
   if (input.tradeSize !== undefined) {
-    const n = Number(input.tradeSize)
-    if (!Number.isFinite(n) || n <= 0) {
-      throw new BadRequestException('tradeSize должен быть числом больше 0')
-    }
+    parseDecimalField(input.tradeSize, 'tradeSize', { min: 0, max: 1_000_000_000, minInclusive: false })
   }
   if (input.maxLeverage !== undefined) {
-    const n = Number(input.maxLeverage)
-    if (!Number.isFinite(n) || n < 1) {
-      throw new BadRequestException('maxLeverage должен быть числом >= 1')
-    }
+    parseDecimalField(input.maxLeverage, 'maxLeverage', { min: 1, max: 125 })
   }
   if (input.defaultLeverage !== undefined && input.defaultLeverage !== null) {
-    const n = Number(input.defaultLeverage)
-    if (!Number.isFinite(n) || n < 1) {
-      throw new BadRequestException('defaultLeverage должен быть числом >= 1 или null')
-    }
+    parseDecimalField(input.defaultLeverage, 'defaultLeverage', { min: 1, max: 125 })
   }
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') {
     throw new BadRequestException('enabled должен быть boolean')

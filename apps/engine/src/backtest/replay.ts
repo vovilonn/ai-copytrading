@@ -171,7 +171,22 @@ async function insertBatched<T extends keyof DB & string>(
   }
 }
 
-const PUBLIC_COUNT_TABLES = ['messages', 'actions', 'trades', 'orders', 'positions', 'executions'] as const
+// Таблицы, в которые пишет processMessage, — самопроверка «public не изменён» (адверсариал-ревью
+// M3). Включает не только очевидные (trades/orders/…), но и parse_results/trade_legs/
+// symbol_ownership/domain_events: если бы search_path-гвард дал течь только по ним, старый список
+// дал бы ложно-зелёную проверку. search_path остаётся основным гвардом, это — страховка.
+const PUBLIC_COUNT_TABLES = [
+  'messages',
+  'actions',
+  'trades',
+  'orders',
+  'positions',
+  'executions',
+  'parse_results',
+  'trade_legs',
+  'symbol_ownership',
+  'domain_events',
+] as const
 
 async function countPublic(db: Kysely<DB>): Promise<Record<string, number>> {
   const out: Record<string, number> = {}
@@ -349,13 +364,22 @@ export async function replay(options: ReplayOptions): Promise<BacktestReport> {
     report.notes.push(...notes)
     return report
   } finally {
-    if (schemaDb) await schemaDb.destroy()
+    // Очистка устойчива к сбою любого шага (адверсариал-ревью M4): если schemaDb.destroy()
+    // реджектит, DROP SCHEMA и adminDb.destroy() всё равно выполнятся — иначе утекли бы и пул
+    // adminDb, и сама схема backtest_run (подчистилась бы лишь на следующем прогоне).
+    if (schemaDb) {
+      await schemaDb.destroy().catch((err) => {
+        console.error(`[backtest] не удалось закрыть пул схемы ${SCHEMA}: ${(err as Error).message}`)
+      })
+    }
     if (!options.keepSchema) {
       await sql`DROP SCHEMA IF EXISTS ${sql.ref(SCHEMA)} CASCADE`.execute(adminDb).catch((err) => {
         console.error(`[backtest] не удалось дропнуть схему ${SCHEMA}: ${(err as Error).message}`)
       })
     }
-    await adminDb.destroy()
+    await adminDb.destroy().catch((err) => {
+      console.error(`[backtest] не удалось закрыть adminDb: ${(err as Error).message}`)
+    })
   }
 }
 

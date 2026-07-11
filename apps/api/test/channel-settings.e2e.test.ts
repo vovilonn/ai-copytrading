@@ -104,6 +104,22 @@ it('defaultLeverage не-null и < 1 -> 400', async () => {
   await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ defaultLeverage: '0' }).expect(400)
 })
 
+// Адверсариал-ревью M1: значения, которые Number() «понимает», но NUMERIC-колонка отвергает,
+// должны давать 400 (валидатор), а не 500 (ошибка Postgres при записи мусора/переполнении).
+it('нечисловой мусор, hex и экспонента -> 400 (не 500)', async () => {
+  await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ tradeSize: '0x10' }).expect(400)
+  await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ tradeSize: '1e3' }).expect(400)
+  await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ tradeSize: 'abc' }).expect(400)
+  await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ tradeSize: ' 5 ' }).expect(400)
+  await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ maxLeverage: '0x0A' }).expect(400)
+})
+
+it('maxLeverage сверх диапазона колонки NUMERIC(6,2) -> 400 (не numeric overflow / 500)', async () => {
+  await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ maxLeverage: '100000' }).expect(400)
+  await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ maxLeverage: '126' }).expect(400)
+  await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ defaultLeverage: '100000' }).expect(400)
+})
+
 it('неизвестный канал -> 404', async () => {
   await agent.patch('/api/channels/999999/settings').send({ enabled: true }).expect(404)
 })
