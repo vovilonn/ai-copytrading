@@ -277,24 +277,36 @@ export function usePositionsStream(channelIds: readonly number[]): void {
     function onPositionUpsert(payload: PositionUpsertPayload): void {
       let matched = false
 
-      queryClient.setQueriesData<PositionDto[]>({ queryKey: [POSITIONS_LIST_KEY], exact: false }, (old) => {
-        if (!old) return old
-        const idx = old.findIndex((p) => p.channelId === payload.channelId && p.symbol === payload.symbol)
-        if (idx === -1) return old
-        matched = true
+      // Task 4: список Positions теперь пагинирован (useCursorList) — кэш это InfiniteData<
+      // PositionDto[]>, а не голый массив. Патчим строку ВНУТРИ той страницы, где она лежит
+      // (совпадение по channelId+symbol), не трогая порядок и границы страниц.
+      queryClient.setQueriesData<InfiniteData<PositionDto[]>>(
+        { queryKey: [POSITIONS_LIST_KEY], exact: false },
+        (old) => {
+          if (!old) return old
+          let matchedHere = false
+          const pages = old.pages.map((page) => {
+            const idx = page.findIndex((p) => p.channelId === payload.channelId && p.symbol === payload.symbol)
+            if (idx === -1) return page
+            matchedHere = true
 
-        // size=0 — позиция закрылась: GET /api/positions её больше не вернёт (size<>0 —
-        // фильтр backend'а, positions.service.ts), убираем строку сразу, не дожидаясь рефетча.
-        if (Number(payload.size) === 0) {
-          return old.filter((_, i) => i !== idx)
-        }
+            // size=0 — позиция закрылась: GET /api/positions её больше не вернёт (size<>0 —
+            // фильтр backend'а, positions.service.ts), убираем строку сразу, не дожидаясь рефетча.
+            if (Number(payload.size) === 0) {
+              return page.filter((_, i) => i !== idx)
+            }
 
-        const current = old[idx]
-        if (!current) return old
-        const copy = old.slice()
-        copy[idx] = patchPositionRow(current, payload)
-        return copy
-      })
+            const current = page[idx]
+            if (!current) return page
+            const copy = page.slice()
+            copy[idx] = patchPositionRow(current, payload)
+            return copy
+          })
+          if (!matchedHere) return old
+          matched = true
+          return { ...old, pages }
+        },
+      )
 
       if (!matched) listFallback.trigger()
       statsThrottle.trigger()

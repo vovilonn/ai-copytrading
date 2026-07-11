@@ -1,4 +1,4 @@
-import { useInfiniteQuery, type QueryKey } from '@tanstack/react-query'
+import { type QueryKey } from '@tanstack/react-query'
 import { ArrowUpRight, Image as ImageIcon, Sparkles } from 'lucide-react'
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
@@ -6,7 +6,9 @@ import { actionIconColor, actionSummary } from 'shared/action-meta.js'
 import type { MessageActionDto, MessageDto } from 'shared/dto.js'
 import { getActionIcon, isNeedsReviewReason, normalizeTradeRef } from '../lib/action-display.js'
 import { apiFetch } from '../lib/api.js'
+import { useCursorList } from '../lib/use-cursor-list.js'
 import { useChannelStream } from '../lib/ws.js'
+import { LoadMore } from './LoadMore.js'
 
 const PAGE_SIZE = 50
 
@@ -43,15 +45,15 @@ interface MessageTimelineProps {
 export function MessageTimeline({ channelId }: MessageTimelineProps) {
   useChannelStream(channelId)
 
-  const { data, fetchNextPage, hasNextPage, isFetchingNextPage } = useInfiniteQuery({
+  // Курсор — tgMessageId последней строки страницы (см. fetchMessages). Общий помощник
+  // useCursorList (lib/use-cursor-list.ts) вынесен из этого же компонента — та же логика
+  // infinite-пагинации теперь переиспользуется на Positions/Actions/истории закрытых сделок.
+  const { items: messages, fetchNextPage, hasNextPage, isFetchingNextPage } = useCursorList<MessageDto>({
     queryKey: messagesQueryKey(channelId),
-    queryFn: ({ pageParam }: { pageParam: number | undefined }) => fetchMessages(channelId, pageParam),
-    initialPageParam: undefined as number | undefined,
-    getNextPageParam: (lastPage) =>
-      lastPage.length < PAGE_SIZE ? undefined : lastPage[lastPage.length - 1]?.tgMessageId,
+    fetchPage: (before) => fetchMessages(channelId, before as number | undefined),
+    getCursor: (m) => m.tgMessageId,
+    pageSize: PAGE_SIZE,
   })
-
-  const messages = data?.pages.flat() ?? []
 
   return (
     <div className="relative max-w-[720px]">
@@ -59,20 +61,12 @@ export function MessageTimeline({ channelId }: MessageTimelineProps) {
       {messages.map((message) => (
         <MessageRow key={message.id} message={message} />
       ))}
-      {/* Загрузка по кнопке, а не по скроллу: детерминированное поведение без
-          IntersectionObserver (не тривиально мокается в jsdom-тестах) — обоснование в отчёте. */}
-      {hasNextPage ? (
-        <div className="relative flex justify-center pb-[26px] pl-[50px]">
-          <button
-            type="button"
-            onClick={() => void fetchNextPage()}
-            disabled={isFetchingNextPage}
-            className="cursor-pointer rounded-md border border-white/10 bg-transparent px-4 py-2 font-sans text-[12.5px] font-medium text-secondary-2 hover:bg-white/5 hover:text-fg disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {isFetchingNextPage ? 'Loading…' : 'Load more'}
-          </button>
-        </div>
-      ) : null}
+      <LoadMore
+        hasNextPage={hasNextPage}
+        isFetchingNextPage={isFetchingNextPage}
+        onLoadMore={() => void fetchNextPage()}
+        className="relative pb-[26px] pl-[50px]"
+      />
     </div>
   )
 }

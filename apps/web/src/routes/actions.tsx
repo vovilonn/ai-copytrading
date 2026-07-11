@@ -3,6 +3,7 @@ import { Search } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { ActionRowDto, ChannelDto } from 'shared/dto.js'
+import { LoadMore } from '../components/LoadMore.js'
 import { SegmentedControl, type SegmentOption } from '../components/SegmentedControl.js'
 import { TableStateRow } from '../components/TableStateRow.js'
 import { Card } from '../components/ui/card.js'
@@ -10,13 +11,14 @@ import { Input } from '../components/ui/input.js'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table.js'
 import { getActionIcon, isNeedsReviewReason, normalizeTradeRef } from '../lib/action-display.js'
 import { apiFetch } from '../lib/api.js'
+import { type Cursor, useCursorList } from '../lib/use-cursor-list.js'
 import { cn } from '../lib/utils.js'
 import { useActionsStream } from '../lib/ws.js'
 
-// Финальное ревью Ф1, Important #2: без LIMIT GET /api/actions рос бы вечно. Бэкенд сам
-// дефолтит/clamp'ит (apps/api/src/actions/actions.service.ts: DEFAULT_LIMIT/MAX_LIMIT), фронт
-// здесь явно запрашивает первую страницу тем же числом — "показать ещё" оставлено на будущее.
-const PAGE_LIMIT = 200
+// Task 4 (мониторинг): keyset-пагинация «load more» — первая страница PAGE_SIZE строк, курсор
+// before=<последний action.id> (GET /api/actions уже курсорный, actions.service.ts). Бэкенд
+// сам clamp'ит limit (DEFAULT_LIMIT/MAX_LIMIT), фронт передаёт PAGE_SIZE явно.
+const PAGE_SIZE = 50
 
 // Ровно списки сегментов из design/project/Admin.dc.html:708-710 (periodOpts/typeOpts/dirOpts) —
 // Type сознательно НЕ покрывает все 12 ActionType (шире, чем 4 варианта дизайна): бэкенд отдаёт
@@ -54,16 +56,16 @@ interface ActionsFilters {
   q: string
 }
 
-async function fetchActions(filters: ActionsFilters): Promise<ActionRowDto[]> {
+async function fetchActions(filters: ActionsFilters, before: Cursor | undefined): Promise<ActionRowDto[]> {
   const params = new URLSearchParams()
   if (filters.channel !== 'all') params.set('channel', filters.channel)
   if (filters.period !== 'all') params.set('period', filters.period)
   if (filters.type !== 'all') params.set('type', filters.type)
   if (filters.side !== 'all') params.set('side', filters.side)
   if (filters.q.trim()) params.set('q', filters.q.trim())
-  params.set('limit', String(PAGE_LIMIT))
-  const qs = params.toString()
-  return apiFetch<ActionRowDto[]>(`/actions${qs ? `?${qs}` : ''}`)
+  params.set('limit', String(PAGE_SIZE))
+  if (before !== undefined) params.set('before', String(before))
+  return apiFetch<ActionRowDto[]>(`/actions?${params.toString()}`)
 }
 
 // Страница Actions (design/project/Admin.dc.html:306-392) — плоский список действий across всех
@@ -114,11 +116,19 @@ export default function ActionsPage() {
   useActionsStream(channels.map((c) => c.id))
 
   const filters: ActionsFilters = { channel, period, type, side, q }
-  const { data, isPending, isError } = useQuery({
+  const {
+    items: actions,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isPending,
+    isError,
+  } = useCursorList<ActionRowDto>({
     queryKey: ['actions', filters],
-    queryFn: () => fetchActions(filters),
+    fetchPage: (before) => fetchActions(filters, before),
+    getCursor: (a) => a.id,
+    pageSize: PAGE_SIZE,
   })
-  const actions = data ?? []
 
   const channelOptions: SegmentOption[] = [
     { value: 'all', label: 'All channels' },
@@ -193,6 +203,11 @@ export default function ActionsPage() {
           errorMessage="Failed to load actions. Please try again."
         />
       </Card>
+      <LoadMore
+        hasNextPage={hasNextPage}
+        isFetchingNextPage={isFetchingNextPage}
+        onLoadMore={() => void fetchNextPage()}
+      />
     </div>
   )
 }

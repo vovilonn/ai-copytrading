@@ -6,6 +6,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import ActionsPage from '../src/routes/actions.js'
 import { apiFetch } from '../src/lib/api.js'
 
+const PAGE_SIZE = 50
+
 // apiFetch замокан целиком — тест проверяет только рендер/фильтры/навигацию, без реальной сети.
 vi.mock('../src/lib/api.js', () => ({ apiFetch: vi.fn() }))
 // useActionsStream открывает реальный socket.io-client (lib/ws.ts) — здесь это нерелевантно
@@ -114,9 +116,9 @@ describe('ActionsPage', () => {
         .mocked(apiFetch)
         .mock.calls.map((c) => c[0] as string)
         .findLast((p) => p.startsWith('/actions'))
-      // limit=200 — теперь всегда в запросе (Important #2 финального ревью Ф1: GET /api/actions
-      // без LIMIT рос бы вечно, фронт явно просит первую страницу тем же дефолтом, что и бэкенд).
-      expect(lastActionsCall).toBe('/actions?type=open&limit=200')
+      // Task 4: keyset-пагинация — первая страница просит limit=PAGE_SIZE (курсор before
+      // добавляется только при подгрузке следующей).
+      expect(lastActionsCall).toBe('/actions?type=open&limit=50')
     })
   })
 
@@ -198,6 +200,41 @@ describe('ActionsPage', () => {
   it('пустой список рендерит "No actions match the selected filters."', async () => {
     renderActions([])
     expect(await screen.findByText('No actions match the selected filters.')).toBeInTheDocument()
+  })
+
+  // Task 4: infinite «load more» — полная первая страница (PAGE_SIZE строк) показывает кнопку,
+  // клик подгружает вторую по курсору before=<id последней строки>.
+  it('«Load more» подгружает вторую страницу actions по курсору before', async () => {
+    const page1 = Array.from({ length: PAGE_SIZE }, (_, i) =>
+      actionFixture({ id: `a-${i}`, pair: `SYM${i}USDT` }),
+    )
+    const page2 = [actionFixture({ id: 'a-last', pair: 'LASTUSDT' })]
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/channels') return CHANNELS
+      if (path.startsWith('/actions')) {
+        const before = new URL(`http://x${path}`).searchParams.get('before')
+        return before ? page2 : page1
+      }
+      throw new Error(`неожиданный путь в моке apiFetch: ${path}`)
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/actions']}>
+          <Routes>
+            <Route path="/actions" element={<ActionsPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+
+    await screen.findByText('SYM0USDT')
+    expect(screen.queryByText('LASTUSDT')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load more' }))
+
+    await screen.findByText('LASTUSDT')
+    expect(screen.getByText('SYM0USDT')).toBeInTheDocument()
   })
 
   // Important #4 финального ревью Ф1: до фикса `data ?? []` не отличал упавший запрос от

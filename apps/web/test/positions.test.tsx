@@ -1,7 +1,14 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useParams } from 'react-router-dom'
-import type { ChannelDto, PositionDto, PositionStatsDto } from 'shared/dto.js'
+import type {
+  AccountWalletDto,
+  ChannelDto,
+  ChannelPnlDto,
+  ClosedTradeDto,
+  PositionDto,
+  PositionStatsDto,
+} from 'shared/dto.js'
 import type { PositionUpsertPayload } from 'shared/ws-events.js'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import PositionsPage from '../src/routes/positions.js'
@@ -79,10 +86,49 @@ function statsFixture(overrides: Partial<PositionStatsDto> = {}): PositionStatsD
     unrealisedPnl: '+$327.60',
     positionValue: '$26,535',
     marginUsed: '$5,307',
-    // Task 1 (мониторинг PnL/баланса): поля добавлены в PositionStatsDto ради компиляции;
-    // buildStats() их пока не читает — реальный рендер добавит Task 4.
-    realizedPnl: '0',
-    totalPnl: '0',
+    realizedPnl: '+$120.00',
+    totalPnl: '+$447.60',
+    ...overrides,
+  }
+}
+
+const WALLET: AccountWalletDto = {
+  totalEquity: '$10,000.00',
+  availableBalance: '$8,500.00',
+  currency: 'USDT',
+  asOf: '2026-07-12T10:00:00.000Z',
+  perChannel: [],
+}
+
+const BY_CHANNEL: ChannelPnlDto[] = [
+  {
+    channelId: 1,
+    channelTitle: 'Crypto Signals VIP',
+    openPositions: 1,
+    unrealisedPnl: '+$327.60',
+    realizedPnl: '+$120.00',
+    totalPnl: '+$447.60',
+    winRate: '68%',
+  },
+]
+
+function closedTradeFixture(overrides: Partial<ClosedTradeDto> = {}): ClosedTradeDto {
+  return {
+    tradeRef: 'TR-2001',
+    channelId: 1,
+    channelTitle: 'Crypto Signals VIP',
+    symbol: 'ETHUSDT',
+    side: 'long',
+    avgEntry: '3180',
+    exitPrice: '3260',
+    realizedPnl: '+$240.00',
+    isWin: true,
+    closeReason: 'tp',
+    leverage: '5x',
+    openedAt: '2026-07-11T08:00:00.000Z',
+    closedAt: '2026-07-11T10:14:00.000Z',
+    durationMs: 2 * 60 * 60 * 1000 + 14 * 60 * 1000,
+    status: 'closed',
     ...overrides,
   }
 }
@@ -92,15 +138,32 @@ function ChannelProbe() {
   return <div data-testid="channel-probe">{`channel:${id}`}</div>
 }
 
-function mockApiByPath(positions: PositionDto[], stats: PositionStatsDto) {
+interface MockOpts {
+  history?: ClosedTradeDto[]
+  wallet?: AccountWalletDto
+  byChannel?: ChannelPnlDto[]
+  /** Постраничный ответ /positions по курсору before — иначе один и тот же массив на все страницы. */
+  positionsByCursor?: (before: string | null) => PositionDto[]
+}
+
+function mockApiByPath(positions: PositionDto[], stats: PositionStatsDto, opts: MockOpts = {}) {
   vi.mocked(apiFetch).mockImplementation(async (path: string) => {
     if (path === '/channels') return CHANNELS
     if (path === '/positions/stats') return stats
+    if (path === '/positions/stats/by-channel') return opts.byChannel ?? BY_CHANNEL
+    if (path === '/account/wallet') return opts.wallet ?? WALLET
+    if (path.startsWith('/positions/history')) return opts.history ?? []
     // Секция Pending (задача 3, Ф4) живёт на этой же странице и шлёт свой GET независимо от
     // фильтров Positions — этот файл её не тестирует (см. pending.test.tsx), поэтому пустой
     // список по умолчанию, чтобы не мешать существующим ассертам Positions.
     if (path === '/orders/pending') return []
-    if (path.startsWith('/positions')) return positions
+    if (path === '/positions' || path.startsWith('/positions?')) {
+      if (opts.positionsByCursor) {
+        const before = new URL(`http://x${path}`).searchParams.get('before')
+        return opts.positionsByCursor(before)
+      }
+      return positions
+    }
     throw new Error(`неожиданный путь в моке apiFetch: ${path}`)
   })
 }
@@ -109,8 +172,9 @@ function renderPositions(
   positions: PositionDto[],
   stats: PositionStatsDto = statsFixture(),
   initialEntry = '/positions',
+  opts: MockOpts = {},
 ) {
-  mockApiByPath(positions, stats)
+  mockApiByPath(positions, stats, opts)
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   render(
     <QueryClientProvider client={queryClient}>
@@ -132,10 +196,12 @@ function getPositionUpsertHandler(): (payload: PositionUpsertPayload) => void {
   return call[1]
 }
 
-function positionsCallCount(): number {
+// Считает ТОЛЬКО обращения к списку открытых позиций (эндпоинт /positions), не путая их с
+// /positions/stats, /positions/stats/by-channel и /positions/history (тоже начинаются с /positions).
+function positionsListCallCount(): number {
   return vi
     .mocked(apiFetch)
-    .mock.calls.filter(([p]) => typeof p === 'string' && p.startsWith('/positions') && p !== '/positions/stats').length
+    .mock.calls.filter(([p]) => typeof p === 'string' && (p === '/positions' || p.startsWith('/positions?'))).length
 }
 
 describe('PositionsPage', () => {
@@ -146,7 +212,7 @@ describe('PositionsPage', () => {
     mockSocket.emit.mockClear()
   })
 
-  it('рендерит 4 стат-карточки из stats, PnL зелёный при плюсе', async () => {
+  it('рендерит стат-карточки из stats, PnL зелёный при плюсе', async () => {
     renderPositions([positionFixture()], statsFixture({ unrealisedPnl: '+$327.60' }))
     await screen.findByText('BTCUSDT')
 
@@ -159,6 +225,20 @@ describe('PositionsPage', () => {
     expect(pnlValue).toHaveTextContent('+$327.60')
     expect(pnlValue).toHaveClass('text-long')
     expect(pnlValue).not.toHaveClass('text-short')
+  })
+
+  // Task 4: глобальные PnL-карточки realized/total добавлены поверх исходной четвёрки.
+  it('рендерит карточки Realized PnL и Total PnL, красит по знаку', async () => {
+    renderPositions([positionFixture()], statsFixture({ realizedPnl: '-$50.00', totalPnl: '+$277.60' }))
+    await screen.findByText('BTCUSDT')
+
+    const realized = screen.getByTestId('stat-value-Realized PnL')
+    expect(realized).toHaveTextContent('-$50.00')
+    expect(realized).toHaveClass('text-short')
+
+    const total = screen.getByTestId('stat-value-Total PnL')
+    expect(total).toHaveTextContent('+$277.60')
+    expect(total).toHaveClass('text-long')
   })
 
   it('PnL красный при минусе', async () => {
@@ -174,12 +254,11 @@ describe('PositionsPage', () => {
   it('рендерит все десять заголовков колонок таблицы', async () => {
     renderPositions([positionFixture()])
     await screen.findByText('BTCUSDT')
-    // Секция Pending (задача 3, Ф4) добавляет свою таблицу на ту же страницу — с частично
-    // совпадающими названиями колонок (Symbol/Side тоже есть у Pending), поэтому скоупим
-    // поиск именно на таблицу Positions (первая в DOM), а не на весь screen.
-    const [positionsTable] = screen.getAllByRole('table')
+    // Несколько таблиц на странице (PnL по каналам, Positions, Pending) — скоупим поиск на
+    // таблицу Positions по её уникальному заголовку 'Liq. price'.
+    const positionsTable = screen.getByRole('columnheader', { name: 'Liq. price' }).closest('table')!
     for (const header of HEADERS) {
-      expect(within(positionsTable!).getByRole('columnheader', { name: header })).toBeInTheDocument()
+      expect(within(positionsTable).getByRole('columnheader', { name: header })).toBeInTheDocument()
     }
   })
 
@@ -193,12 +272,53 @@ describe('PositionsPage', () => {
     })
   })
 
+  // Task 4: infinite «load more» — первая страница (50 строк) + кнопка подгружает вторую по
+  // курсору before=<id последней строки>, без перезагрузки первой.
+  it('«Load more» подгружает вторую страницу позиций по курсору before', async () => {
+    const page1 = Array.from({ length: 50 }, (_, i) =>
+      positionFixture({ id: `1:SYM${i}`, symbol: `SYM${i}`, channelId: 1 }),
+    )
+    const page2 = [positionFixture({ id: '1:LASTCOIN', symbol: 'LASTCOIN', channelId: 1 })]
+    renderPositions([], statsFixture(), '/positions', {
+      positionsByCursor: (before) => (before ? page2 : page1),
+    })
+
+    await screen.findByText('SYM0')
+    expect(screen.queryByText('LASTCOIN')).not.toBeInTheDocument()
+    expect(positionsListCallCount()).toBe(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load more' }))
+
+    await screen.findByText('LASTCOIN')
+    // Первая страница осталась на месте, вторая догрузилась — всего два обращения к списку.
+    expect(screen.getByText('SYM0')).toBeInTheDocument()
+    expect(positionsListCallCount()).toBe(2)
+  })
+
+  // Task 4: вкладка Closed — клик по сегменту переключает на таблицу закрытых сделок.
+  it('вкладка Closed рендерит закрытые сделки из /positions/history', async () => {
+    renderPositions([positionFixture()], statsFixture(), '/positions', {
+      history: [closedTradeFixture()],
+    })
+    await screen.findByText('BTCUSDT')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Closed' }))
+
+    // Открытая позиция ушла, показана закрытая сделка с realized PnL, бейджем причины и Win.
+    await screen.findByText('ETHUSDT')
+    expect(screen.queryByText('BTCUSDT')).not.toBeInTheDocument()
+    expect(screen.getByText('+$240.00')).toBeInTheDocument()
+    expect(screen.getByText('TP')).toBeInTheDocument()
+    expect(screen.getByText('Win')).toBeInTheDocument()
+    expect(screen.getByText('2h 14m')).toBeInTheDocument()
+  })
+
   it('position.upsert точечно обновляет mark/PnL строки без нового GET /api/positions', async () => {
     renderPositions([positionFixture()])
     await screen.findByText('BTCUSDT')
     expect(screen.getByText('63180')).toBeInTheDocument()
 
-    const callsBefore = positionsCallCount()
+    const callsBefore = positionsListCallCount()
 
     const handler = getPositionUpsertHandler()
     handler({
@@ -222,7 +342,7 @@ describe('PositionsPage', () => {
     expect(screen.queryByText('63180')).not.toBeInTheDocument()
 
     // Точечный патч — ни одного дополнительного GET /api/positions после события сокета.
-    expect(positionsCallCount()).toBe(callsBefore)
+    expect(positionsListCallCount()).toBe(callsBefore)
   })
 
   it('position.upsert с size=0 убирает закрытую позицию из таблицы', async () => {
@@ -266,8 +386,10 @@ describe('PositionsPage', () => {
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
       if (path === '/channels') return CHANNELS
       if (path === '/positions/stats') return statsFixture()
+      if (path === '/positions/stats/by-channel') return BY_CHANNEL
+      if (path === '/account/wallet') return WALLET
       if (path === '/orders/pending') return []
-      if (path.startsWith('/positions')) throw new Error('boom')
+      if (path === '/positions' || path.startsWith('/positions?')) throw new Error('boom')
       throw new Error(`неожиданный путь в моке apiFetch: ${path}`)
     })
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
