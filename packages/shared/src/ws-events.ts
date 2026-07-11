@@ -64,10 +64,33 @@ export interface PositionUpsertPayload {
   tradeId: string | null
 }
 
+/**
+ * Задача 3 (Ф3, приватный WS-мост Bybit apps/engine/src/bybit/private-ws.ts) — ПЕРВЫЙ реальный
+ * продюсер этого события (тип существовал с задачи 8 как целевая форма для фронта, но до этой
+ * задачи никто его не публиковал). `channelId` ДОБАВЛЕН здесь (в исходном черновике задачи 8 его
+ * не было): apps/api/src/realtime/outbox.publisher.ts::publishRow ЖЁСТКО требует числовой
+ * `payload.channelId`, иначе тихо пропускает рассылку строки (см. комментарий в файле) — без
+ * этого поля position.close НИКОГДА не доехал бы до фронта.
+ */
 export interface PositionClosePayload {
+  channelId: number
   symbol: string
   tradeRef: string | null
   realizedPnl: string
+}
+
+/**
+ * Задача 3 (Ф3): приватный WS-мост Bybit публикует это на каждый пуш `order.linear` — статус
+ * конкретного локального `orders` (entry/add/tp/sl/close), найденного по `orderLinkId`. Фронт
+ * может точечно обновить бейдж статуса ордера без перезапроса всего списка.
+ */
+export interface OrderResolvedPayload {
+  channelId: number
+  tradeId: string | null
+  symbol: string
+  orderLinkId: string
+  bybitOrderId: string | null
+  status: string
 }
 
 export interface ServerToClientEvents {
@@ -78,6 +101,7 @@ export interface ServerToClientEvents {
   'action.skipped': (payload: ActionSkippedPayload) => void
   'position.upsert': (payload: PositionUpsertPayload) => void
   'position.close': (payload: PositionClosePayload) => void
+  'order.resolved': (payload: OrderResolvedPayload) => void
 }
 
 export interface ClientToServerEvents {
