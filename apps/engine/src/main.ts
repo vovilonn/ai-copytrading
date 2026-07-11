@@ -1,11 +1,17 @@
 import { fileURLToPath } from 'node:url'
 import { config as loadDotenv } from 'dotenv'
 import pg from 'pg'
-import type { Kysely } from 'kysely'
+import { sql, type Kysely } from 'kysely'
 import { loadConfig } from 'api/config/config.schema.js'
 import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
-import { createExecutionPort } from './execution/port.js'
+import type { Network } from 'shared/domain.js'
+import { createExecutionPort, type ExecutionPort } from './execution/port.js'
+import { BybitRestClient } from './bybit/rest-client.js'
+import { BybitPrivateWs } from './bybit/private-ws.js'
+import { reconcileOnStart, type ReconcileResult } from './bybit/reconcile.js'
+import { getEquity } from './state/equity.js'
+import { getChannelKeys } from './bybit/channel-keys.js'
 import { TickersFeed } from './market-data/tickers-feed.js'
 import { processMessage, type PipelineDeps, type PipelineMessage } from './pipeline.js'
 
@@ -31,6 +37,18 @@ const BATCH_SIZE = 50
 const NOTIFY_CHANNEL = 'domain_events'
 const RECONNECT_BASE_MS = 1000
 const RECONNECT_MAX_MS = 30_000
+
+// Задача 5 (Ф3, live-режим): интервалы планировщика. TTL-свип — "раз в час" (бриф задачи,
+// защитный потолок §9 — не основной механизм отмены, спешить некуда); реконсиляция дрейфа и
+// рефреш equity — только в live, "раз в ~10 мин"/по TTL кэша getEquity соответственно.
+const TTL_SWEEP_INTERVAL_MS = 60 * 60 * 1000
+const RECONCILE_INTERVAL_MS = 10 * 60 * 1000
+// Совпадает с DEFAULT_TTL_MS кэша state/equity.ts — рефреш чаще бессмысленен (getEquity вернул бы
+// то же кэшированное значение), реже — equity в сайзинге отставал бы от биржи дольше, чем нужно.
+const EQUITY_REFRESH_INTERVAL_MS = 30_000
+// dry_run-заглушка equity (см. PipelineDeps.equity в pipeline.ts — "совпадает с суммой, которой
+// реально пополнен testnet-аккаунт"); live использует реальный getEquity(rest) ниже.
+const DRY_RUN_EQUITY = '1000'
 
 /**
  * Держит `pg_advisory_lock` (сессионный, НЕ транзакционный) на отдельном соединении на всё время
@@ -91,13 +109,114 @@ async function processChannel(db: Kysely<DB>, channelId: number, deps: PipelineD
   }
 }
 
+export interface LiveRuntime {
+  executionPort: ExecutionPort
+  privateWs: BybitPrivateWs
+  reconcileResult: ReconcileResult
+}
+
+/**
+ * Единая точка ветвления EXECUTION_MODE внутри main.ts (design spec §14: "EXECUTION_MODE —
+ * единственная точка ветвления... никаких if(dryRun) по коду"): main() (ниже) — ЕДИНСТВЕННЫЙ
+ * `if` по режиму в этом файле, а эта функция поднимает live-ресурсы в порядке брифа задачи 5 —
+ * реконсиляция → приватный WS → ExecutionPort. dry_run вообще не заходит сюда. Второе (парное)
+ * место ветвления — фабрика `createExecutionPort` (execution/port.ts): pipeline.ts и сами адаптеры
+ * не содержат ни одного `if` по режиму.
+ *
+ * `rest` конструируется ВЫЗЫВАЮЩЕЙ стороной (main() — реальным `BybitRestClient` с ключами канала/
+ * env; тесты — мок-объектом с приведением типа `as unknown as BybitRestClient`, тот же приём, что
+ * и `createExecutionPort` в bybit-adapter.test.ts) — так реконсиляция и фабрика тестируются без
+ * реальной сети. `privateWs.start()` (реальный WebSocket-коннект) сознательно ОСТАЁТСЯ ЗА
+ * пределами этой функции — вызывается отдельно в main() СРАЗУ после — тесты этой функции поэтому
+ * не открывают сокет (private-ws.ts: `connect()` вызывается только из `start()`, конструктор сам
+ * по себе безопасен).
+ */
+export async function initLiveRuntime(
+  db: Kysely<DB>,
+  rest: BybitRestClient,
+  network: Network,
+  keys: { apiKey: string; apiSecret: string },
+): Promise<LiveRuntime> {
+  const reconcileResult = await reconcileOnStart(db, rest)
+  console.log(
+    `[engine] reconcileOnStart: opened=${reconcileResult.opened} closed=${reconcileResult.closed} flagged=${reconcileResult.flagged}`,
+  )
+  const privateWs = new BybitPrivateWs({ apiKey: keys.apiKey, apiSecret: keys.apiSecret, network, db, rest })
+  const executionPort = createExecutionPort('live', { rest, network })
+  return { executionPort, privateWs, reconcileResult }
+}
+
+/**
+ * TTL-свип отложенных лимиток (design spec §9 / research bybit-execution.md §9, task-5-brief.md):
+ * entry/add-лимитка в статусе 'submitted' старше `ttl_expires_at` (если явно проставлен) ИЛИ
+ * `created_at + channel_settings.limit_ttl_sec` (дефолт 604800с = 7 дней) — отменяется.
+ * TTL — "защитный потолок, а не основной механизм" (design spec §9): явное «лимитка не
+ * актуальна» (delta-op `cancel_pending`, уже реализован в pipeline.ts::handleDelta) отменяет
+ * РАНЬШЕ этого срока — эта функция ловит только то, что НЕ было отменено явно.
+ *
+ * TP/SL/close НЕ входят в выборку (`purpose IN ('entry','add')`) — это не "отложенные лимитки"
+ * §9, а протекторы уже открытой позиции, TTL на них design spec не распространяет.
+ *
+ * НИКАКОГО ветвления по режиму здесь — `executionPort.cancelOrder` уже сам по себе делает
+ * правильную вещь в обоих режимах (единая точка ветвления — фабрика createExecutionPort):
+ * DryRunAdapter молча помечает cancelled в БД (биржи нет), BybitAdapter реально зовёт
+ * `rest.cancelOrder` и только потом помечает БД. Поэтому TTL-свип вызывается из main() БЕЗУСЛОВНО,
+ * не только в live-ветке (см. бриф задачи: "в dry_run — просто помечать cancelled в БД").
+ *
+ * @returns число отменённых ордеров (для лога планировщика).
+ */
+export async function sweepExpiredLimitOrders(db: Kysely<DB>, executionPort: ExecutionPort, now: Date = new Date()): Promise<number> {
+  const expired = await db
+    .selectFrom('orders')
+    .innerJoin('channel_settings', 'channel_settings.channel_id', 'orders.channel_id')
+    .select(['orders.order_link_id as orderLinkId'])
+    .where('orders.purpose', 'in', ['entry', 'add'])
+    .where('orders.order_type', '=', 'limit')
+    .where('orders.status', '=', 'submitted')
+    .where(
+      sql<boolean>`COALESCE(orders.ttl_expires_at, orders.created_at + make_interval(secs => channel_settings.limit_ttl_sec)) <= ${now}`,
+    )
+    .execute()
+
+  for (const row of expired) {
+    // Один ордер — одна транзакция (не пачкой): cancelOrder(tx,...) сам решает, filled/cancelled
+    // ли уже ордер (идемпотентно) — крэш посреди свипа отменяет то, что успел, остальное подхватит
+    // следующий тик планировщика, не оставляя "половину" эффекта одной строки.
+    await db.transaction().execute((trx) => executionPort.cancelOrder(trx, { orderLinkId: row.orderLinkId }))
+  }
+  return expired.length
+}
+
 async function main(): Promise<void> {
   const config = loadConfig(process.env)
   const db = createDb(config.databaseUrl)
   await migrateToLatest(db)
 
-  const executionPort = createExecutionPort(config.executionMode)
-  const deps: PipelineDeps = { executionPort, network: config.bybitNetwork, equity: '1000' }
+  // EXECUTION_MODE — единственная точка ветвления в этом файле (design spec §14): live поднимает
+  // реальный REST-клиент/реконсиляцию/приватный WS ДО первого тика пайплайна; dry_run — как раньше,
+  // без единого сетевого похода к Bybit (задача не должна ничего сломать в dry_run пути).
+  let executionPort: ExecutionPort
+  let liveRest: BybitRestClient | null = null
+  let privateWs: BybitPrivateWs | null = null
+  let initialEquity = DRY_RUN_EQUITY
+
+  if (config.executionMode === 'live') {
+    // Ф3: одно окружение → все каналы (channels.bybit_api_key_enc/secret_enc сегодня всегда NULL,
+    // channel-seed.service.ts) — getChannelKeys(db, null) сразу берёт BYBIT_API_KEY/SECRET из env,
+    // не угадывая "какой канал главный". Per-channel субаккаунты — готовая структура, не мандат Ф3.
+    const keys = await getChannelKeys(db, null)
+    liveRest = new BybitRestClient({ apiKey: keys.apiKey, apiSecret: keys.apiSecret, network: config.bybitNetwork })
+    const live = await initLiveRuntime(db, liveRest, config.bybitNetwork, keys)
+    executionPort = live.executionPort
+    privateWs = live.privateWs
+    privateWs.start()
+    initialEquity = (await getEquity(liveRest)).toString()
+    console.log(`[engine] equity (wallet-balance totalEquity): ${initialEquity}`)
+  } else {
+    executionPort = createExecutionPort('dry_run')
+  }
+
+  const deps: PipelineDeps = { executionPort, network: config.bybitNetwork, equity: initialEquity }
 
   // Задача 10: публичный WS-фид mark price для символов с открытыми позициями — независим от
   // пайплайна разбора выше (не участвует в EXECUTION_MODE, публичный поток доступен без ключа
@@ -110,6 +229,10 @@ async function main(): Promise<void> {
   let listenClient: pg.Client | null = null
   let reconnectTimer: NodeJS.Timeout | null = null
   let reconnectDelayMs = RECONNECT_BASE_MS
+  // Планировщик задачи 5: TTL-свип — оба режима; реконсиляция дрейфа/рефреш equity — только live.
+  let ttlSweepTimer: NodeJS.Timeout | null = null
+  let reconcileTimer: NodeJS.Timeout | null = null
+  let equityTimer: NodeJS.Timeout | null = null
 
   async function tick(): Promise<void> {
     if (draining) return
@@ -174,6 +297,40 @@ async function main(): Promise<void> {
   }, POLL_INTERVAL_MS)
   tickersFeed.start()
 
+  // TTL-свип — оба режима безусловно (sweepExpiredLimitOrders сам не ветвится по режиму, см.
+  // комментарий над функцией выше).
+  ttlSweepTimer = setInterval(() => {
+    sweepExpiredLimitOrders(db, executionPort)
+      .then((n) => {
+        if (n > 0) console.log(`[engine] TTL-свип: отменено лимиток ${n}`)
+      })
+      .catch((err) => console.error('[engine] TTL-свип лимиток:', err))
+  }, TTL_SWEEP_INTERVAL_MS)
+
+  if (liveRest) {
+    // Захват в const: `liveRest` объявлен как `let` выше, TS не сужает такую переменную внутри
+    // замыканий setInterval (могла бы быть переприсвоена между определением и вызовом) — локальная
+    // const убирает необходимость в `!`-assertion и гарантированно не null внутри таймеров.
+    const rest = liveRest
+    reconcileTimer = setInterval(() => {
+      reconcileOnStart(db, rest)
+        .then((result) =>
+          console.log(
+            `[engine] периодическая реконсиляция: opened=${result.opened} closed=${result.closed} flagged=${result.flagged}`,
+          ),
+        )
+        .catch((err) => console.error('[engine] периодическая реконсиляция:', err))
+    }, RECONCILE_INTERVAL_MS)
+
+    equityTimer = setInterval(() => {
+      getEquity(rest, { forceRefresh: true })
+        .then((value) => {
+          deps.equity = value.toString()
+        })
+        .catch((err) => console.error('[engine] рефреш equity:', err))
+    }, EQUITY_REFRESH_INTERVAL_MS)
+  }
+
   console.log(`[engine] воркер запущен: пайплайн разбора и исполнения (${config.executionMode}) активен`)
 
   let shuttingDown = false
@@ -184,7 +341,11 @@ async function main(): Promise<void> {
     console.log(`[engine] получен ${signal}, завершаюсь...`)
     if (pollTimer) clearInterval(pollTimer)
     if (reconnectTimer) clearTimeout(reconnectTimer)
+    if (ttlSweepTimer) clearInterval(ttlSweepTimer)
+    if (reconcileTimer) clearInterval(reconcileTimer)
+    if (equityTimer) clearInterval(equityTimer)
     tickersFeed.stop()
+    privateWs?.stop()
     const closeListener = listenClient ? listenClient.end().catch(() => {}) : Promise.resolve()
     closeListener
       .then(() => db.destroy())
@@ -207,7 +368,15 @@ process.on('unhandledRejection', (reason) => {
   console.error('[engine] unhandledRejection:', reason)
 })
 
-main().catch((err) => {
-  console.error('[engine] фатальная ошибка при старте:', err)
-  process.exitCode = 1
-})
+// Автозапуск ТОЛЬКО когда файл выполняется как entrypoint (`tsx src/main.ts` / `tsx watch ...`) —
+// НЕ когда main-live.test.ts импортирует именованные экспорты (initLiveRuntime/sweepExpiredLimitOrders)
+// этого же модуля: без этой проверки сам факт импорта поднимал бы весь движок (LISTEN/pollTimer/
+// tickersFeed/live-подключение к Bybit) как побочный эффект юнит-теста. Стандартный ESM-приём
+// "является ли этот модуль главным" — сравнение import.meta.url с process.argv[1].
+const isMainModule = import.meta.url === `file://${process.argv[1]}`
+if (isMainModule) {
+  main().catch((err) => {
+    console.error('[engine] фатальная ошибка при старте:', err)
+    process.exitCode = 1
+  })
+}
