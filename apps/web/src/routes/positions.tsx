@@ -38,7 +38,9 @@ const VIEW_OPTIONS: SegmentOption[] = [
 ]
 
 // Task 4: первая страница keyset-пагинации Positions (useCursorList, курсор before=PositionDto.id).
-const POSITIONS_PAGE_SIZE = 50
+// Экспортирован: lib/ws.ts (F7-фикс) должен знать точный pageSize, чтобы решить, могло ли
+// локальное удаление строки (size=0) срезать последнюю страницу ровно с границы hasNextPage.
+export const POSITIONS_PAGE_SIZE = 50
 
 export interface PositionsFilters {
   channel: string

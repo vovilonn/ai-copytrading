@@ -367,6 +367,77 @@ describe('PositionsPage', () => {
     })
   })
 
+  // F7 (адверсариал-ревью): страница ровно из pageSize (50) строк, hasNextPage=true. Одна из
+  // строк ЭТОЙ (последней загруженной) страницы закрывается (size=0) и удаляется из кэша
+  // локально — без рефетча длина страницы упала бы до 49 и useCursorList::getNextPageParam
+  // (page.length < pageSize) ошибочно решил бы, что дальше страниц нет: кнопка «Load more»
+  // пропала бы, а вторая, ещё не загруженная страница стала бы недостижимой.
+  it('F7: size=0 на последней полной странице не прячет «Load more» — рефетч восстанавливает границу', async () => {
+    const page1 = Array.from({ length: 50 }, (_, i) =>
+      positionFixture({ id: `1:SYM${i}`, symbol: `SYM${i}`, channelId: 1 }),
+    )
+    renderPositions([], statsFixture(), '/positions', {
+      // Сервер уже отражает закрытие; в этом тесте страница остаётся полной (например, её
+      // «дозаполнила» соседняя строка) — так асерт про «Load more» бьёт именно по логике
+      // hasNextPage, а не по случайному совпадению длины.
+      positionsByCursor: (before) => (before ? [] : page1),
+    })
+
+    await screen.findByText('SYM0')
+    expect(screen.getByRole('button', { name: 'Load more' })).toBeInTheDocument()
+    expect(positionsListCallCount()).toBe(1)
+
+    const handler = getPositionUpsertHandler()
+    handler({
+      channelId: 1,
+      symbol: 'SYM0',
+      side: 'long',
+      size: '0',
+      avgPrice: '62400',
+      markPrice: '64000',
+      leverage: '5',
+      stopLoss: null,
+      tradeId: 'trade-1',
+    })
+
+    // Троттлленный рефетч списка сработал (F7-фикс) — второй GET /api/positions.
+    await waitFor(() => {
+      expect(positionsListCallCount()).toBe(2)
+    })
+    // ...и после него граница страниц восстановлена — «Load more» всё ещё на месте.
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Load more' })).toBeInTheDocument()
+    })
+  })
+
+  // F9 (адверсариал-ревью): вкладка Open, активный фильтр side=long; прилетает upsert, который
+  // разворачивает строку в short. patchPositionRow патчит строку НА МЕСТЕ внутри уже
+  // отфильтрованной (по side=long) страницы, не проверяя фильтр — без фикса строка осталась бы
+  // висеть под неверным фильтром. Фикс дёргает тот же listFallback, что и unmatched-тики —
+  // проверяем именно это (доп. GET /api/positions), а не полный набор поведений бэкенд-фильтра.
+  it('F9: реверс side у строки под активным фильтром side=long триггерит рефетч списка', async () => {
+    renderPositions([positionFixture({ side: 'long' })], statsFixture(), '/positions?side=long')
+    await screen.findByText('BTCUSDT')
+    const callsBefore = positionsListCallCount()
+
+    const handler = getPositionUpsertHandler()
+    handler({
+      channelId: 1,
+      symbol: 'BTCUSDT',
+      side: 'short',
+      size: '0.42',
+      avgPrice: '62400',
+      markPrice: '64000',
+      leverage: '5',
+      stopLoss: '61500',
+      tradeId: 'trade-1',
+    })
+
+    await waitFor(() => {
+      expect(positionsListCallCount()).toBeGreaterThan(callsBefore)
+    })
+  })
+
   it('пустой список рендерит "No positions match the selected filters."', async () => {
     renderPositions([])
     expect(await screen.findByText('No positions match the selected filters.')).toBeInTheDocument()

@@ -318,7 +318,9 @@ describe('reconcileOnStart', () => {
   })
 
   it("TR открыт в журнале без позиции на бирже -> closed по бирже; dry-run сделка НЕ трогается", async () => {
-    const live = await seedTrade({ symbol: 'CLOSEUSDT', side: 'long', live: true, status: 'open' })
+    // openedAt заведомо СТАРШЕ recency-гейта F2 (снапшот getPositions) — иначе свежая сделка была
+    // бы защищена от закрытия (см. отдельный блок F2/F8 ниже); здесь проверяем именно устаревшую.
+    const live = await seedTrade({ symbol: 'CLOSEUSDT', side: 'long', live: true, status: 'open', openedAt: new Date(Date.now() - 10 * 60_000) })
     const dryRun = await seedTrade({ symbol: 'DRYUSDT', side: 'long', live: false, status: 'open' })
 
     const { rest } = makeRest([]) // на бирже вообще ничего не открыто
@@ -485,6 +487,82 @@ describe('reconcileOnStart — M1 (Minor адверсариального рев
     const result = await reconcileOnStart(db, rest)
 
     expect(result.orphansCancelled).toBe(0)
+  })
+})
+
+// F2/F8 (адверсариальное ревью): getPositions() читается ДО транзакции (снапшот T0), а localLiveTrades
+// — внутри неё (READ COMMITTED). Сделку, только что открытую параллельным пайплайном (opened_at>T0),
+// снапшот не застал -> без recency-гейта шаг Б закрыл бы её без close-ордера (осиротив живую позицию),
+// а шаг Г снял бы её защитный reduceOnly. Гейт (tradeOpenedAfterSnapshot, ТА ЖЕ CREATED_TIME_TOLERANCE_MS,
+// что и createdTime-защита шага А) пропускает свежие сделки и продолжает закрывать/чистить устаревшие.
+describe('reconcileOnStart — F2/F8 (адверсариальное ревью): recency-гейт против устаревшего снапшота', () => {
+  it('F2: свежая LIVE-сделка (opened_at ~ сейчас) без позиции на бирже -> НЕ закрывается (снапшот T0 мог её не застать)', async () => {
+    const fresh = await seedTrade({ symbol: 'FRESHUSDT', side: 'long', live: true, status: 'open', openedAt: new Date() })
+
+    const { rest } = makeRest([]) // на бирже пусто — но сделка только что открыта параллельным пайплайном
+
+    const result = await reconcileOnStart(db, rest)
+    expect(result.closed).toBe(0)
+
+    const trade = await db.selectFrom('trades').selectAll().where('id', '=', fresh.tradeId).executeTakeFirstOrThrow()
+    expect(trade.status).toBe('open')
+    expect(trade.closed_at).toBeNull()
+  })
+
+  it('F2: реально УСТАРЕВШАЯ LIVE-сделка (opened_at 10 мин назад) без позиции на бирже -> закрывается по бирже', async () => {
+    const stale = await seedTrade({
+      symbol: 'STALEUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      openedAt: new Date(Date.now() - 10 * 60_000),
+    })
+
+    const { rest } = makeRest([])
+
+    const result = await reconcileOnStart(db, rest)
+    expect(result.closed).toBe(1)
+
+    const trade = await db.selectFrom('trades').selectAll().where('id', '=', stale.tradeId).executeTakeFirstOrThrow()
+    expect(trade.status).toBe('closed')
+    expect(trade.closed_at).not.toBeNull()
+  })
+
+  it('F8: reduceOnly-остаток символа СВЕЖЕЙ LIVE-сделки -> НЕ отменяется (защитный TP только что открытой позиции, лаг биржи)', async () => {
+    const fresh = await seedTrade({ symbol: 'FRESHTPUSDT', side: 'long', live: true, status: 'open', openedAt: new Date() })
+
+    const { rest, cancelOrderCalls } = makeRest(
+      [], // позиция ещё не попала в снапшот getPositions(T0)
+      [makeOrder({ symbol: 'FRESHTPUSDT', orderLinkId: 'K01-9-00-T0', reduceOnly: true, orderType: 'Limit' })],
+    )
+
+    const result = await reconcileOnStart(db, rest)
+
+    expect(result.orphansCancelled).toBe(0)
+    expect(cancelOrderCalls).toEqual([])
+    // и сама свежая сделка не закрыта (F2, симметрично)
+    const trade = await db.selectFrom('trades').selectAll().where('id', '=', fresh.tradeId).executeTakeFirstOrThrow()
+    expect(trade.status).toBe('open')
+  })
+
+  it('F8: reduceOnly-остаток символа УСТАРЕВШЕЙ LIVE-сделки без позиции -> отменяется (реальный осиротевший TP)', async () => {
+    await seedTrade({
+      symbol: 'STALETPUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      openedAt: new Date(Date.now() - 10 * 60_000),
+    })
+
+    const { rest, cancelOrderCalls } = makeRest(
+      [],
+      [makeOrder({ symbol: 'STALETPUSDT', orderLinkId: 'K01-8-00-T0', reduceOnly: true, orderType: 'Limit' })],
+    )
+
+    const result = await reconcileOnStart(db, rest)
+
+    expect(result.orphansCancelled).toBe(1)
+    expect(cancelOrderCalls).toEqual([{ symbol: 'STALETPUSDT', orderLinkId: 'K01-8-00-T0' }])
   })
 })
 

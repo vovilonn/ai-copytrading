@@ -70,11 +70,26 @@ function mapFor<V>(store: WeakMap<EquityRestClient, Map<string, V>>, rest: Equit
  * процесса) throw — совсем без разумного дефолта на равно пустом аккаунте лучше явная ошибка при
  * старте, чем тихий Decimal(NaN) в сайзинге живых денег.
  */
-function resolveEquityValue(balance: WalletBalance, cached: CacheEntry | undefined): Decimal {
-  if (balance.totalEquity !== '') return new Decimal(balance.totalEquity)
+/**
+ * Общее ядро деградации пустого баланса (Minor M3 / F4 адверсариального ревью): первое НЕПУСТОЕ
+ * из totalEquity -> totalAvailableBalance, либо null, если оба пусты. Вынесено сюда, чтобы одну и
+ * ту же деградацию переиспользовали И getEquity (кэш/throw поверх этого ядра), И writeWalletSnapshot
+ * (пропуск тика поверх) — единая точка правды «что берём вместо пустого equity» (DRY).
+ */
+export function pickNonEmptyEquity(balance: WalletBalance): string | null {
+  if (balance.totalEquity !== '') return balance.totalEquity
+  if (balance.totalAvailableBalance !== '') return balance.totalAvailableBalance
+  return null
+}
 
-  console.warn('[equity] totalEquity пуст в ответе wallet-balance — fallback на totalAvailableBalance')
-  if (balance.totalAvailableBalance !== '') return new Decimal(balance.totalAvailableBalance)
+function resolveEquityValue(balance: WalletBalance, cached: CacheEntry | undefined): Decimal {
+  const picked = pickNonEmptyEquity(balance)
+  if (picked !== null) {
+    if (balance.totalEquity === '') {
+      console.warn('[equity] totalEquity пуст в ответе wallet-balance — fallback на totalAvailableBalance')
+    }
+    return new Decimal(picked)
+  }
 
   if (cached) {
     console.warn(`[equity] totalAvailableBalance тоже пуст — использую прошлое кэшированное значение ${cached.value.toString()}`)

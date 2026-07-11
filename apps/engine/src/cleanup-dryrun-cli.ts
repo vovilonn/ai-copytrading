@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url'
 import { config as loadDotenv } from 'dotenv'
 import { createDb } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
-import { cleanupDryRunPositions } from './state/cleanup-dryrun.js'
+import { checkCleanupLiveGuard, cleanupDryRunPositions } from './state/cleanup-dryrun.js'
 
 // .env лежит в корне репозитория — тот же приём, что main.ts/backtest/cli.ts.
 loadDotenv({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) })
@@ -22,6 +22,15 @@ async function main(): Promise<void> {
   const databaseUrl = process.env.DATABASE_URL
   if (!databaseUrl) {
     console.error('[cleanup-dryrun] DATABASE_URL не задан — скопируйте .env.example в .env')
+    process.exitCode = 1
+    return
+  }
+
+  // F5 (адверсариальное ревью): в live-окружении чистка «только в БД» осиротила бы реальные
+  // позиции на Bybit — отказываемся до подключения к БД, требуя явный флаг --force-live.
+  const guard = checkCleanupLiveGuard(process.env.EXECUTION_MODE, process.argv.slice(2))
+  if (!guard.allowed) {
+    console.error(`[cleanup-dryrun] ОТКАЗ: ${guard.reason}`)
     process.exitCode = 1
     return
   }

@@ -16,7 +16,7 @@ import type {
 } from 'shared/ws-events.js'
 import { messagesQueryKey } from '../components/MessageTimeline.js'
 import { pendingOrdersQueryKey } from '../components/PendingOrders.js'
-import { POSITIONS_LIST_KEY, positionsStatsQueryKey } from '../routes/positions.js'
+import { POSITIONS_LIST_KEY, POSITIONS_PAGE_SIZE, positionsStatsQueryKey } from '../routes/positions.js'
 
 let socket: Socket<ServerToClientEvents, ClientToServerEvents> | null = null
 
@@ -276,6 +276,22 @@ export function usePositionsStream(channelIds: readonly number[]): void {
 
     function onPositionUpsert(payload: PositionUpsertPayload): void {
       let matched = false
+      // Ревью (F7/F9): точечный патч ниже иногда всё равно должен уступить обычному рефетчу
+      // списка, даже когда строка найдена (matched=true) — в двух случаях:
+      //  F7 — size=0 удаляет строку ИЗ КЭША; если это ПОСЛЕДНЯЯ загруженная страница И она была
+      //      РОВНО из pageSize строк, удаление срезает её длину ниже pageSize —
+      //      useCursorList::getNextPageParam (кэш этого не знает) решит, что дальше страниц нет —
+      //      кнопка «Load more» пропадёт, а ещё не загруженные страницы станут недостижимы.
+      //      Рефетч подтянет с сервера актуальные границы страниц. Условие сужено ИМЕННО до этого
+      //      случая (не любое size=0) — иначе локальное удаление всегда немедленно перебивалось бы
+      //      рефетчем, из-за чего страница закрытой позиции могла бы на миг «вернуться» назад, если
+      //      бы GET ответил ещё не актуальными данными (гонка, которой раньше не было).
+      //  F9 — side пришёл ИЗМЕНИВШИМСЯ (реверс long⇄short); side — фильтруемое поле
+      //      (SIDE_OPTIONS в routes/positions.tsx), а updater setQueriesData видит только
+      //      данные кэша, не сам queryKey/filters конкретного запроса — здесь нет способа
+      //      узнать, матчит ли обновлённая строка активный фильтр. Рефетч — самый дешёвый
+      //      способ привести список в соответствие с сервером.
+      let needsFallback = false
 
       // Task 4: список Positions теперь пагинирован (useCursorList) — кэш это InfiniteData<
       // PositionDto[]>, а не голый массив. Патчим строку ВНУТРИ той страницы, где она лежит
@@ -285,7 +301,8 @@ export function usePositionsStream(channelIds: readonly number[]): void {
         (old) => {
           if (!old) return old
           let matchedHere = false
-          const pages = old.pages.map((page) => {
+          const lastPageIndex = old.pages.length - 1
+          const pages = old.pages.map((page, pageIndex) => {
             const idx = page.findIndex((p) => p.channelId === payload.channelId && p.symbol === payload.symbol)
             if (idx === -1) return page
             matchedHere = true
@@ -293,11 +310,16 @@ export function usePositionsStream(channelIds: readonly number[]): void {
             // size=0 — позиция закрылась: GET /api/positions её больше не вернёт (size<>0 —
             // фильтр backend'а, positions.service.ts), убираем строку сразу, не дожидаясь рефетча.
             if (Number(payload.size) === 0) {
+              // F7: считаем границу задетой, только если удаление произошло именно из последней
+              // загруженной, полностью заполненной (pageSize) страницы — единственный случай,
+              // когда getNextPageParam мог опереться на её длину и ошибиться.
+              if (pageIndex === lastPageIndex && page.length === POSITIONS_PAGE_SIZE) needsFallback = true
               return page.filter((_, i) => i !== idx)
             }
 
             const current = page[idx]
             if (!current) return page
+            if (payload.side !== null && payload.side !== current.side) needsFallback = true // F9
             const copy = page.slice()
             copy[idx] = patchPositionRow(current, payload)
             return copy
@@ -308,7 +330,7 @@ export function usePositionsStream(channelIds: readonly number[]): void {
         },
       )
 
-      if (!matched) listFallback.trigger()
+      if (!matched || needsFallback) listFallback.trigger()
       statsThrottle.trigger()
     }
 

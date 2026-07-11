@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, vi } from 'vitest'
 import { createHmac } from 'node:crypto'
-import { BybitApiError, BybitRestClient, TokenBucket, signPayload } from '../src/bybit/rest-client.js'
+import { BybitApiError, BybitRestClient, MAX_PAGINATION_PAGES, TokenBucket, signPayload } from '../src/bybit/rest-client.js'
 
 // Тесты Bybit REST-клиента (Ф3, задача 1). Группы:
 //  1) ЖИВЫЕ (READ-only + идемпотентный setLeverage) против testnet — гейт BYBIT_LIVE_TESTS=1
@@ -336,6 +336,83 @@ describe('BybitRestClient — идемпотентные/ошибочные retC
         () => client.getTicker('NOSUCHUSDT'),
       ),
     ).rejects.toThrow(/пустой list/)
+  })
+
+  it('getPositions: прокручивает nextPageCursor и собирает ОБЕ страницы (F1: limit=200, cursor 2-й страницы)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    const urls: string[] = []
+    let call = 0
+    const positions = await withMockFetch(
+      (async (url: unknown) => {
+        urls.push(String(url))
+        call++
+        if (call === 1) {
+          return mockResponse({ retCode: 0, retMsg: 'OK', result: { list: [{ symbol: 'AAAUSDT' }], nextPageCursor: 'CURSOR_2' } })
+        }
+        return mockResponse({ retCode: 0, retMsg: 'OK', result: { list: [{ symbol: 'BBBUSDT' }], nextPageCursor: '' } })
+      }) as typeof fetch,
+      () => client.getPositions(),
+    )
+
+    expect(positions.map((p) => p.symbol)).toEqual(['AAAUSDT', 'BBBUSDT'])
+    expect(call).toBe(2)
+    expect(urls[0]).toContain('limit=200')
+    expect(urls[0]).not.toContain('cursor=') // первая страница — без курсора
+    expect(urls[1]).toContain('cursor=CURSOR_2') // вторая — прокручен nextPageCursor
+  })
+
+  it('getPositions: пустой nextPageCursor -> ровно один запрос (одна страница, F1)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    let call = 0
+    const positions = await withMockFetch(
+      (async () => {
+        call++
+        return mockResponse({ retCode: 0, retMsg: 'OK', result: { list: [{ symbol: 'AAAUSDT' }], nextPageCursor: '' } })
+      }) as typeof fetch,
+      () => client.getPositions(),
+    )
+    expect(positions.map((p) => p.symbol)).toEqual(['AAAUSDT'])
+    expect(call).toBe(1)
+  })
+
+  it('getPositions: защита от бесконечного цикла — вечно меняющийся курсор ограничен MAX_PAGINATION_PAGES (F1)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    let call = 0
+    const positions = await withMockFetch(
+      // Каждый ответ несёт НОВЫЙ (никогда не пустой) курсор — единственный стоп остаётся счётчик страниц.
+      (async () => {
+        call++
+        return mockResponse({ retCode: 0, retMsg: 'OK', result: { list: [{ symbol: `S${call}USDT` }], nextPageCursor: `CURSOR_${call}` } })
+      }) as typeof fetch,
+      () => client.getPositions(),
+    )
+    expect(call).toBe(MAX_PAGINATION_PAGES)
+    expect(positions).toHaveLength(MAX_PAGINATION_PAGES)
+  })
+
+  it('getOpenOrders: прокручивает nextPageCursor и собирает ОБЕ страницы (F1: limit=50)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    const urls: string[] = []
+    let call = 0
+    const orders = await withMockFetch(
+      (async (url: unknown) => {
+        urls.push(String(url))
+        call++
+        if (call === 1) {
+          return mockResponse({
+            retCode: 0,
+            retMsg: 'OK',
+            result: { list: [{ symbol: 'AAAUSDT', orderLinkId: 'K-1' }], nextPageCursor: 'PAGE2' },
+          })
+        }
+        return mockResponse({ retCode: 0, retMsg: 'OK', result: { list: [{ symbol: 'BBBUSDT', orderLinkId: 'K-2' }], nextPageCursor: '' } })
+      }) as typeof fetch,
+      () => client.getOpenOrders(),
+    )
+    expect(orders.map((o) => o.orderLinkId)).toEqual(['K-1', 'K-2'])
+    expect(call).toBe(2)
+    expect(urls[0]).toContain('limit=50')
+    expect(urls[1]).toContain('cursor=PAGE2')
   })
 
   it('retCode 10006 (rate limit UID) → ждёт до X-Bapi-Limit-Reset-Timestamp и повторяет успешно', async () => {

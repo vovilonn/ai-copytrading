@@ -72,3 +72,40 @@ describe('writeWalletSnapshot', () => {
     expect(rows).toHaveLength(0)
   })
 })
+
+// F4 (адверсариальное ревью): Bybit документированно отдаёт totalEquity='' (сразу после депозита/
+// переброса маржи). Вставка '' в NUMERIC(30,10) NOT NULL уронила бы INSERT и потеряла снапшот —
+// writeWalletSnapshot переиспользует деградацию getEquity (pickNonEmptyEquity) и НИКОГДА не пишет ''.
+describe('writeWalletSnapshot — F4: пустой equity не роняет INSERT', () => {
+  it('totalEquity="" -> fallback на totalAvailableBalance, строка вставлена (не "" в NUMERIC)', async () => {
+    const { rest, fn } = createMockRest('', '9000.5')
+
+    await writeWalletSnapshot(db, rest)
+
+    expect(fn).toHaveBeenCalledTimes(1)
+    const rows = await db.selectFrom('wallet_snapshots').selectAll().execute()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.total_equity).toBe('9000.5000000000')
+    expect(rows[0]!.available_balance).toBe('9000.5000000000')
+  })
+
+  it('totalEquity и totalAvailableBalance ОБА "" -> строка НЕ вставлена, не бросает (тик пропущен)', async () => {
+    const { rest } = createMockRest('', '')
+
+    await expect(writeWalletSnapshot(db, rest)).resolves.toBeUndefined()
+
+    const rows = await db.selectFrom('wallet_snapshots').selectAll().execute()
+    expect(rows).toHaveLength(0)
+  })
+
+  it('totalAvailableBalance="" но totalEquity задан -> available_balance берёт totalEquity (не "" в NUMERIC)', async () => {
+    const { rest } = createMockRest('12345.6789', '')
+
+    await writeWalletSnapshot(db, rest)
+
+    const rows = await db.selectFrom('wallet_snapshots').selectAll().execute()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.total_equity).toBe('12345.6789000000')
+    expect(rows[0]!.available_balance).toBe('12345.6789000000')
+  })
+})

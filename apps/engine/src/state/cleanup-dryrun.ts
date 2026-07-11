@@ -50,6 +50,33 @@ export interface CleanupReport {
 
 const EMPTY_REPORT: CleanupReport = { tradesClosed: 0, positionsZeroed: 0, ownershipReleased: 0, ordersCancelled: 0 }
 
+export interface LiveGuardDecision {
+  /** true — чистку выполнять можно; false — CLI обязан отказать (live без явного подтверждения). */
+  allowed: boolean
+  /** Причина отказа для лога CLI (null, когда allowed=true). */
+  reason: string | null
+}
+
+/**
+ * F5 (адверсариальное ревью): чистая, тестируемая проверка для CLI-обёртки (cleanup-dryrun-cli.ts).
+ * Скрипт закрывает open/partially_closed сделки ТОЛЬКО в БД, не запрашивая биржу — запуск при
+ * EXECUTION_MODE=live на БД с ЖИВЫМИ позициями закрыл бы их лишь в журнале, осиротив реальные
+ * позиции на Bybit. Поэтому при EXECUTION_MODE=live чистка требует явного флага `--force-live`.
+ * Сама cleanupDryRunPositions гейтом НЕ обвешивается (dry_run-путь/тесты не меняются) — enforcement
+ * (отказ + ненулевой exit) делает CLI по этому решению.
+ */
+export function checkCleanupLiveGuard(executionMode: string | undefined, argv: readonly string[]): LiveGuardDecision {
+  if (executionMode === 'live' && !argv.includes('--force-live')) {
+    return {
+      allowed: false,
+      reason:
+        'EXECUTION_MODE=live: чистка закрывает сделки ТОЛЬКО в БД (не спрашивая биржу) и осиротит реальные позиции на Bybit. ' +
+        'Если это действительно dry_run-фантомы в live-окружении — повторите с флагом --force-live.',
+    }
+  }
+  return { allowed: true, reason: null }
+}
+
 /**
  * Чистая (тестируемая без CLI) логика разовой чистки — вызывающий CLI-скрипт
  * (`scripts/cleanup-dryrun-positions.mjs` -> `src/cleanup-dryrun-cli.ts`) только печатает отчёт.

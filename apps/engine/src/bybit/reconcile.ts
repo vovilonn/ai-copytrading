@@ -98,12 +98,22 @@ interface LocalTrade {
  * оставляет "половину" исправлений). Сетевые READ-вызовы — ДО транзакции (не держат её открытой).
  */
 export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient): Promise<ReconcileResult> {
+  // F2/F8 (адверсариальное ревью): момент снапшота getPositions (T0). getPositions() читается ДО
+  // транзакции; localLiveTrades — внутри неё (READ COMMITTED), поэтому reconcile может увидеть
+  // только что открытую параллельным пайплайном сделку (opened_at>T0), которой ещё нет в снапшоте.
+  // Фиксируем T0, чтобы recency-гейт (tradeOpenedAfterSnapshot) отличил такую свежую сделку от
+  // реально устаревшей и не закрыл/не разоружил её по устаревшему снапшоту.
+  const snapshotAtMs = Date.now()
   const allPositions = await rest.getPositions()
   const positions = allPositions.filter((p) => new Decimal(p.size).gt(0))
   const openOrders = await rest.getOpenOrders()
   // M1: нужен и внутри транзакции (шаг Б), и ПОСЛЕ её коммита (шаг В, orphan-очистка ниже) —
   // вынесен наружу, а не в двух местах отдельно (DRY).
   const positionSymbols = new Set(positions.map((p) => p.symbol))
+  // F8: символы LIVE-сделок, открытых в момент снапшота или позже — их reduceOnly-остатки (шаг Г,
+  // ПОСЛЕ транзакции) НЕ отменяем по устаревшему/лагающему снапшоту (симметрично F2 шага Б).
+  // Наполняется внутри транзакции (из localLiveTrades.opened_at), читается снаружи в шаге Г.
+  const freshlyOpenedSymbols = new Set<string>()
 
   let opened = 0
   let closed = 0
@@ -131,6 +141,8 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
       const arr = bySymbol.get(t.symbol)
       if (arr) arr.push(t)
       else bySymbol.set(t.symbol, [t])
+      // F8: собираем «свежие» символы здесь же (один проход), используются в шаге Г вне транзакции.
+      if (tradeOpenedAfterSnapshot(t.opened_at, snapshotAtMs)) freshlyOpenedSymbols.add(t.symbol)
     }
 
     // --- Шаг А: что реально открыто на бирже -> сверка/атрибуция/needs_review-флаг. ---
@@ -184,6 +196,10 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
     for (const t of localLiveTrades) {
       if (!OPEN_STATUSES.has(t.status)) continue
       if (positionSymbols.has(t.symbol)) continue // уже обработана в шаге А (синк или ambiguous)
+      // F2: свежая сделка (opened_at в момент снапшота T0 или позже, с допуском на лаг биржи/
+      // рассинхрон часов) могла ещё не попасть в снапшот getPositions — НЕ закрываем её без
+      // close-ордера по устаревшему снапшоту (иначе осиротим только что открытую живую позицию).
+      if (tradeOpenedAfterSnapshot(t.opened_at, snapshotAtMs)) continue
       await closeTrade(trx, { tradeId: t.id, status: 'closed' })
       await zeroPositionRow(trx, t.channel_id, t.symbol)
       closed++
@@ -197,7 +213,12 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
   // транзакции, тот же приём "сеть не держит транзакцию БД", что и cancelAll в
   // private-ws.ts::applyPositionPush. Только reduceOnly (TP/SL/close) — entry/add лимитки того
   // же "бессимвольного" положения НЕ трогаем, они законно ждут первого филла.
-  const orphans = openOrders.filter((o) => o.reduceOnly && !positionSymbols.has(o.symbol))
+  // F8 (адверсариальное ревью): дополнительно НЕ трогаем reduceOnly-остаток символа свежей
+  // LIVE-сделки (freshlyOpenedSymbols) — позиция могла быть открыта в момент снапшота или позже,
+  // её защитный TP/SL легитимен, снапшот getPositions(T0) просто ещё не застал позицию (лаг биржи).
+  const orphans = openOrders.filter(
+    (o) => o.reduceOnly && !positionSymbols.has(o.symbol) && !freshlyOpenedSymbols.has(o.symbol),
+  )
   let orphansCancelled = 0
   for (const order of orphans) {
     try {
@@ -229,6 +250,18 @@ function positionPredatesLocalOpen(pos: Position, tradeOpenedAt: Date | null): b
   const posCreatedMs = Number(pos.createdTime)
   if (!Number.isFinite(posCreatedMs)) return false
   return posCreatedMs < tradeOpenedAt.getTime() - CREATED_TIME_TOLERANCE_MS
+}
+
+/**
+ * F2/F8 (адверсариальное ревью): recency-гейт, симметричный createdTime-защите шага А
+ * (positionPredatesLocalOpen, ТА ЖЕ CREATED_TIME_TOLERANCE_MS). Сделка, открытая в момент снапшота
+ * getPositions (snapshotAtMs) или позже — с допуском на лаг биржи/рассинхрон часов — могла ещё не
+ * попасть в снапшот: её НЕЛЬЗЯ закрывать (шаг Б) или снимать её защитный reduceOnly (шаг Г) по
+ * устаревшему снапшоту. opened_at=null — гейт неприменим (как и в positionPredatesLocalOpen).
+ */
+function tradeOpenedAfterSnapshot(tradeOpenedAt: Date | null, snapshotAtMs: number): boolean {
+  if (tradeOpenedAt === null) return false
+  return tradeOpenedAt.getTime() >= snapshotAtMs - CREATED_TIME_TOLERANCE_MS
 }
 
 /** Совпадение по символу (единственный открытый LIVE-кандидат, прошедший createdTime-защиту):

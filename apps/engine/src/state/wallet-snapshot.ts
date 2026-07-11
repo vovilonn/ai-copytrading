@@ -13,6 +13,7 @@
 import type { Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 import type { BybitRestClient, WalletBalance } from '../bybit/rest-client.js'
+import { pickNonEmptyEquity } from './equity.js'
 
 /** Узкий срез BybitRestClient — тот же приём сужения типа мока, что и EquityRestClient
  *  (state/equity.ts) и BybitAdapterRestClient (execution/bybit.adapter.ts). */
@@ -30,12 +31,29 @@ export type WalletSnapshotRestClient = Pick<BybitRestClient, 'getWalletBalance'>
  */
 export async function writeWalletSnapshot(db: Kysely<DB>, rest: WalletSnapshotRestClient): Promise<void> {
   const balance: WalletBalance = await rest.getWalletBalance()
+
+  // F4 (адверсариальное ревью): Bybit документированно возвращает totalEquity='' (сразу после
+  // депозита/переброса маржи, см. equity.ts::resolveEquityValue) — вставка '' в NUMERIC(30,10)
+  // NOT NULL уронила бы INSERT и потеряла снапшот. Переиспользуем ту же деградацию, что getEquity
+  // (pickNonEmptyEquity: totalEquity -> totalAvailableBalance). Если ОБА поля пусты — НЕ вставляем
+  // строку, логируем и пропускаем тик (следующий через ~30с). Никогда не пишем '' в NUMERIC.
+  const totalEquity = pickNonEmptyEquity(balance)
+  if (totalEquity === null) {
+    console.warn(
+      '[wallet-snapshot] totalEquity и totalAvailableBalance оба пусты в ответе Bybit — пропускаю снапшот, строку не вставляю (следующий тик через ~30с)',
+    )
+    return
+  }
+  // available_balance тоже NOT NULL: если totalAvailableBalance пуст, а totalEquity нет — берём
+  // непустой totalEquity, чтобы и в эту колонку не попала пустая строка.
+  const availableBalance = balance.totalAvailableBalance !== '' ? balance.totalAvailableBalance : totalEquity
+
   await db
     .insertInto('wallet_snapshots')
     .values({
       channel_id: null,
-      total_equity: balance.totalEquity,
-      available_balance: balance.totalAvailableBalance,
+      total_equity: totalEquity,
+      available_balance: availableBalance,
       currency: 'USDT',
     })
     .execute()

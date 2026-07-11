@@ -403,6 +403,29 @@ describe('GET /api/positions', () => {
     const rows = res.body as PositionDto[]
     expect(rows).toHaveLength(3) // курсор проигнорирован — как будто before не передавали
   })
+
+  it('пагинация стабильна при бампе updated_at (mark-тик) — ключ opened_at, а не volatile updated_at (F6)', async () => {
+    const page1 = (await agent.get('/api/positions?limit=2').expect(200)).body as PositionDto[]
+    expect(page1).toHaveLength(2)
+    const cursor = page1[1]!.id
+
+    // Симулируем mark-тик apply-tick.ts: бампаем updated_at СТРОКИ-КУРСОРА "в будущее". Со старым
+    // ключом (updated_at) подзапрос курсора резолвил бы это новое значение → граница страницы
+    // уезжала → дубли/пропуски. С opened_at (неизменен) граница стабильна.
+    const [curChan, curSym] = cursor.split(':')
+    await db
+      .updateTable('positions')
+      .set({ updated_at: new Date(Date.UTC(2027, 0, 1)) })
+      .where('channel_id', '=', Number(curChan))
+      .where('symbol', '=', curSym!)
+      .execute()
+
+    const page2 = (await agent.get(`/api/positions?limit=2&before=${encodeURIComponent(cursor)}`).expect(200))
+      .body as PositionDto[]
+    expect(page2).toHaveLength(1) // граница не поехала: остаётся ровно 1 непоказанная
+    const allIds = [...page1, ...page2].map((p) => p.id)
+    expect(new Set(allIds).size).toBe(3) // ни дублей, ни пропусков несмотря на бамп updated_at
+  })
 })
 
 describe('GET /api/positions/history', () => {

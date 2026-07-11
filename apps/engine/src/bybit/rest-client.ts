@@ -45,6 +45,18 @@ const GET_BUCKET_REFILL_PER_SEC = 50
 const MUTATE_BUCKET_CAPACITY = 5
 const MUTATE_BUCKET_REFILL_PER_SEC = 5
 
+// F1 (адверсариальное ревью): Bybit V5 read-эндпоинты (position/list, order/realtime) — cursor-
+// пагинация. Без прокрутки `result.nextPageCursor` они отдают лишь ПЕРВУЮ страницу (~дефолтные 20
+// записей), и reconcile.ts принял бы всё за 20-й позицией/ордером за «нет на бирже» → закрыл бы
+// реальные LIVE-сделки без close-ордера и отменил их TP/SL. Лимиты страниц — максимумы Bybit V5:
+// position/list поддерживает limit до 200, order/realtime — до 50 (меньше запросов на полный список).
+const POSITIONS_PAGE_LIMIT = 200
+const OPEN_ORDERS_PAGE_LIMIT = 50
+// Жёсткий потолок числа страниц за один вызов — предохранитель от бесконечного цикла, если биржа
+// отдаёт бесконечно меняющийся (баг/аномальный ответ) nextPageCursor. 200×50=10000 позиций /
+// 50×50=2500 ордеров — заведомо выше любого реалистичного объёма demo-аккаунта.
+export const MAX_PAGINATION_PAGES = 50
+
 const RATE_LIMIT_RETCODES = new Set([10006, 10018])
 // "Set leverage has not been modified" (research §2) — идемпотентный успех setLeverage.
 const LEVERAGE_NOT_MODIFIED_RETCODE = 110043
@@ -344,6 +356,34 @@ export class BybitRestClient {
     return this.execute<T>('GET', path, params, { signed: true })
   }
 
+  /**
+   * F1 (адверсариальное ревью): прокрутка cursor-пагинации Bybit V5. `signedGet` отдаёт лишь
+   * `result.list` одной страницы + `result.nextPageCursor`; полный список собирается повторными
+   * запросами с `cursor=<nextPageCursor>`, пока курсор не опустеет. `limit` — максимум эндпоинта
+   * (меньше запросов). MAX_PAGINATION_PAGES — жёсткий потолок против бесконечного цикла на
+   * неопустевающем/повторяющемся курсоре.
+   */
+  private async signedGetAllPages<T>(
+    path: string,
+    baseParams: Record<string, string | number | boolean | undefined>,
+    pageLimit: number,
+  ): Promise<T[]> {
+    const items: T[] = []
+    let cursor: string | undefined
+    for (let page = 0; page < MAX_PAGINATION_PAGES; page++) {
+      const params: Record<string, string | number | boolean | undefined> = { ...baseParams, limit: pageLimit }
+      if (cursor !== undefined && cursor !== '') params.cursor = cursor
+      const result = await this.signedGet<{ list: T[]; nextPageCursor?: string }>(path, params)
+      items.push(...result.list)
+      const next = result.nextPageCursor
+      // Пустой/отсутствующий курсор — последняя страница. Курсор, равный текущему — тоже стоп
+      // (иначе застрянем на месте); окончательный предохранитель — счётчик страниц выше.
+      if (next === undefined || next === '' || next === cursor) break
+      cursor = next
+    }
+    return items
+  }
+
   private async signedPost<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
     return this.execute<T>('POST', path, body, { signed: true })
   }
@@ -466,22 +506,22 @@ export class BybitRestClient {
     return { totalEquity: account.totalEquity, totalAvailableBalance: account.totalAvailableBalance, coins: account.coin }
   }
 
-  /** `GET /v5/position/list category=linear` — `settleCoin=USDT`, если `symbol` не задан (research §14). */
+  /** `GET /v5/position/list category=linear` — `settleCoin=USDT`, если `symbol` не задан (research §14).
+   *  F1: cursor-пагинация прокручивается ПОЛНОСТЬЮ (signedGetAllPages), не только первая страница. */
   async getPositions(symbol?: string): Promise<Position[]> {
     const params: Record<string, string> = { category: 'linear' }
     if (symbol) params.symbol = symbol
     else params.settleCoin = 'USDT'
-    const result = await this.signedGet<{ list: Position[] }>('/v5/position/list', params)
-    return result.list
+    return this.signedGetAllPages<Position>('/v5/position/list', params, POSITIONS_PAGE_LIMIT)
   }
 
-  /** `GET /v5/order/realtime category=linear openOnly=0` — `settleCoin=USDT`, если `symbol` не задан (research §9). */
+  /** `GET /v5/order/realtime category=linear openOnly=0` — `settleCoin=USDT`, если `symbol` не задан (research §9).
+   *  F1: cursor-пагинация прокручивается ПОЛНОСТЬЮ (signedGetAllPages), не только первая страница. */
   async getOpenOrders(symbol?: string): Promise<Order[]> {
     const params: Record<string, string | number> = { category: 'linear', openOnly: 0 }
     if (symbol) params.symbol = symbol
     else params.settleCoin = 'USDT'
-    const result = await this.signedGet<{ list: Order[] }>('/v5/order/realtime', params)
-    return result.list
+    return this.signedGetAllPages<Order>('/v5/order/realtime', params, OPEN_ORDERS_PAGE_LIMIT)
   }
 
   /**

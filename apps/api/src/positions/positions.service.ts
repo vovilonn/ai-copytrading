@@ -16,9 +16,10 @@ export interface PositionsFilter {
    *  конвенция, что и ActionsFilter — apps/api/src/actions/actions.service.ts). */
   limit?: string
   /** Keyset-курсор пагинации — синтетический id `${channelId}:${symbol}` ранее полученной строки
-   *  (см. PositionDto.id): отдаёт строки СТРОГО ПОСЛЕ неё в порядке updated_at DESC, channel_id
-   *  DESC, symbol DESC. У positions нет одноколоночного PK (составной (channel_id, symbol)),
-   *  поэтому курсор — пара-ключ, а не uuid. */
+   *  (см. PositionDto.id): отдаёт строки СТРОГО ПОСЛЕ неё в порядке opened_at DESC, channel_id DESC,
+   *  symbol DESC. Ключ — СТАБИЛЬНЫЙ trades.opened_at (не volatile positions.updated_at, который
+   *  бампается mark-тиками — адверсариал-ревью F6). У positions нет одноколоночного PK (составной
+   *  (channel_id, symbol)), поэтому курсор — пара-ключ, а не uuid. */
   before?: string
 }
 
@@ -230,8 +231,8 @@ export class PositionsService {
   /** GET /api/positions — зеркало Bybit /v5/position/list (design/project/Admin.dc.html:394-475),
    *  только реально открытые (size<>0). LEFT JOIN trades — margin_mode/tradeRef (trade_id может
    *  быть не заведён, если позиция создана вне пайплайна — в Ф1 такого не бывает, но FK nullable).
-   *  Keyset-пагинация по (updated_at, channel_id, symbol) — та же конвенция bare-array, что и
-   *  actions.service.ts (Task 2). */
+   *  Keyset-пагинация по СТАБИЛЬНОМУ (trades.opened_at, channel_id, symbol) — та же конвенция
+   *  bare-array, что и actions.service.ts (Task 2). opened_at, а не volatile updated_at (F6). */
   async listPositions(filter: PositionsFilter): Promise<PositionDto[]> {
     let query = this.database.db
       .selectFrom('positions as p')
@@ -280,18 +281,22 @@ export class PositionsService {
     if (filter.before) {
       const cursor = parsePositionCursor(filter.before.trim())
       if (cursor) {
-        // Keyset по (updated_at, channel_id, symbol) — строго "старше" курсора в том же порядке,
-        // что и ORDER BY ниже. Все три колонки DESC → row-tuple `<` даёт "строго после" (как в
-        // actions.service.ts). Ссылаемся на курсор подзапросом по составному ключу (channel_id,
-        // symbol) = PK: если строка исчезла, подзапрос вернёт NULL → пустая страница, не крэш.
+        // Keyset по СТАБИЛЬНОМУ ключу (trades.opened_at, channel_id, symbol) — строго "старше"
+        // курсора в том же порядке, что и ORDER BY ниже. Адверсариал-ревью F6: раньше ключом был
+        // p.updated_at, но apply-tick.ts бампает positions.updated_at на КАЖДЫЙ mark-тик (~2с) →
+        // граница страницы уезжала под курсором между загрузкой и «Load more», давая дубли/пропуски.
+        // opened_at (момент открытия сделки) неизменен → границы страниц стабильны. COALESCE(...,
+        // 'epoch') — позиции без trade/opened_at (edge) сортируются последними, не роняя ключ.
+        // Подзапрос резолвит ключ курсора по (channel_id, symbol) = PK: строка исчезла → NULL →
+        // пустая страница, не крэш.
         query = query.where(
-          sql<boolean>`(p.updated_at, p.channel_id, p.symbol) < (SELECT updated_at, channel_id, symbol FROM positions WHERE channel_id = ${cursor.channelId} AND symbol = ${cursor.symbol})`,
+          sql<boolean>`(coalesce(t.opened_at, 'epoch'::timestamptz), p.channel_id, p.symbol) < (SELECT coalesce(t2.opened_at, 'epoch'::timestamptz), p2.channel_id, p2.symbol FROM positions p2 LEFT JOIN trades t2 ON t2.id = p2.trade_id WHERE p2.channel_id = ${cursor.channelId} AND p2.symbol = ${cursor.symbol})`,
         )
       }
     }
 
     const rows = await query
-      .orderBy('p.updated_at', 'desc')
+      .orderBy(sql`coalesce(t.opened_at, 'epoch'::timestamptz)`, 'desc')
       .orderBy('p.channel_id', 'desc')
       .orderBy('p.symbol', 'desc')
       .limit(clampLimit(filter.limit))

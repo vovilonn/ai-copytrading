@@ -4,7 +4,7 @@ import { resetTestSchema } from 'test-db'
 import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
 import { openTrade, acquireSymbol, closeTrade } from '../src/state/trades.js'
-import { cleanupDryRunPositions } from '../src/state/cleanup-dryrun.js'
+import { checkCleanupLiveGuard, cleanupDryRunPositions } from '../src/state/cleanup-dryrun.js'
 
 // Разовая чистка фантомных dry_run позиций (задача 3, план 2026-07-12-monitoring-pnl-balance.md,
 // Task 3/Task 5: "перед первым live-стартом — разовая чистка 76 фантомных dry_run позиций").
@@ -200,5 +200,39 @@ describe('cleanupDryRunPositions', () => {
     expect(report.ordersCancelled).toBe(1) // только submitted-ордер phantom, не filled
     const filledOrder = await db.selectFrom('orders').select('status').where('order_link_id', '=', 'ALREADY-FILLED-ORDER').executeTakeFirstOrThrow()
     expect(filledOrder.status).toBe('filled')
+  })
+})
+
+// F5 (адверсариальное ревью): CLI-обёртка закрывает open/partially_closed сделки ТОЛЬКО в БД, не
+// спрашивая биржу. Запуск при EXECUTION_MODE=live на БД с живыми позициями осиротил бы реальные
+// позиции на Bybit — гейт требует явный флаг --force-live. Проверяем чистое решение (enforcement —
+// в CLI по этому решению); сама cleanupDryRunPositions гейтом не обвешивается (dry_run-путь не тронут).
+describe('checkCleanupLiveGuard — F5: гейт live-окружения', () => {
+  it('EXECUTION_MODE=live без --force-live -> отказ (allowed=false, есть reason про --force-live)', () => {
+    const decision = checkCleanupLiveGuard('live', [])
+    expect(decision.allowed).toBe(false)
+    expect(decision.reason).toMatch(/--force-live/)
+  })
+
+  it('EXECUTION_MODE=live С --force-live -> разрешено (осознанное подтверждение)', () => {
+    const decision = checkCleanupLiveGuard('live', ['--force-live'])
+    expect(decision.allowed).toBe(true)
+    expect(decision.reason).toBeNull()
+  })
+
+  it('EXECUTION_MODE=dry_run -> разрешено без флага', () => {
+    expect(checkCleanupLiveGuard('dry_run', []).allowed).toBe(true)
+  })
+
+  it('EXECUTION_MODE не задан -> разрешено (дефолт не live)', () => {
+    expect(checkCleanupLiveGuard(undefined, []).allowed).toBe(true)
+  })
+
+  it('cleanupDryRunPositions сама гейтом НЕ обвешана — работает в тестовом (dry_run) окружении как прежде', async () => {
+    const phantom = await seedOpenPhantom('GUARDUSDT')
+    const report = await cleanupDryRunPositions(db)
+    expect(report.tradesClosed).toBe(1)
+    const tradeRow = await db.selectFrom('trades').select('status').where('id', '=', phantom.tradeId).executeTakeFirstOrThrow()
+    expect(tradeRow.status).toBe('closed')
   })
 })
