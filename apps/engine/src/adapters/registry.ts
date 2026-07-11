@@ -1,5 +1,6 @@
 import type { ParseContext, ParsedResult } from 'shared/domain.js'
 import { parseCh1 } from './ch1.adapter.js'
+import { parseCh2 } from './ch2.adapter.js'
 
 /** Единственный контракт между ядром и адаптером конкретного Telegram-канала (research §10). */
 export interface ChannelAdapter {
@@ -12,17 +13,17 @@ const ch1Adapter: ChannelAdapter = {
   parse: parseCh1,
 }
 
-// Заглушка канала CH2 (форум, свободный формат) — реализация в фазе 2.
-// Всегда уходит в AI-роут: у CH2 половина actionable-сообщений не имеет
-// символа в тексте (research §0/§2), детерминированный парсинг не покрывает их.
-const ch2Stub: ChannelAdapter = {
+// Канал CH2 (форум 1962583820, свободный формат) — задача 3 Ф2: детерминированные правила
+// A-D (structured signal, limit_entry, market_entry, delta_sl с тикером) + маршрут E/F в AI
+// для символ-less дельт и свободного текста (research §0/§2).
+const ch2Adapter: ChannelAdapter = {
   id: 'ch2-freeform',
-  parse: () => ({ route: 'ai', confidence: 0.5, intents: [] }),
+  parse: parseCh2,
 }
 
 const registry = new Map<string, ChannelAdapter>([
   [ch1Adapter.id, ch1Adapter],
-  [ch2Stub.id, ch2Stub],
+  [ch2Adapter.id, ch2Adapter],
 ])
 
 export function getAdapter(adapterId: string): ChannelAdapter {
