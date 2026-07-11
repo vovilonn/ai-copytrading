@@ -9,9 +9,10 @@ const schema = z.object({
   TG_APP_API_ID: z.coerce.number().int().positive(),
   TG_APP_API_HASH: z.string().min(1),
   TG_SESSION: z.string().min(1),
-  // Активная сеть Bybit (задача 1, Ф1): выбирает хост testnet/mainnet для публичных
-  // market-эндпоинтов (instruments-info, risk-limit) — см. instruments.service.ts.
-  BYBIT_NETWORK: z.enum(['testnet', 'mainnet']).default('testnet'),
+  // Активная сеть Bybit (задача 1, Ф1; 'demo' добавлен в p3-task6-demo): выбирает хост
+  // testnet/mainnet/demo для публичных market-эндпоинтов (instruments-info, risk-limit) — см.
+  // instruments.service.ts. 'demo' — Bybit DEMO TRADING (api-demo.bybit.com), НЕ testnet.
+  BYBIT_NETWORK: z.enum(['testnet', 'mainnet', 'demo']).default('testnet'),
 })
 
 export type AppConfig = {
@@ -19,7 +20,7 @@ export type AppConfig = {
   adminUsername: string; adminPassword: string
   executionMode: 'dry_run' | 'live'
   tgApiId: number; tgApiHash: string; tgSession: string
-  bybitNetwork: 'testnet' | 'mainnet'
+  bybitNetwork: 'testnet' | 'mainnet' | 'demo'
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {

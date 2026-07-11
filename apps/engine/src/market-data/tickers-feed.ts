@@ -6,9 +6,16 @@ import { parseMarkPriceTick } from './ticker-message.js'
 
 // Публичный WS (без ключа) — testnet/mainnet строго разные хосты (research bybit-execution.md
 // §12/§13, тот же приём разделения сетей, что и apps/api/src/instruments/bybit-client.ts).
+//
+// 'demo' (p3-task6-demo) — грабли: у Bybit DEMO TRADING НЕТ СВОЕГО публичного WS
+// (stream-demo.bybit.com/v5/public/linear проверен вживую — не работает). Demo-аккаунт торгует по
+// РЕАЛЬНЫМ рыночным ценам биржи (виртуальный баланс, реальные котировки) — поэтому для demo
+// намеренно используем MAINNET публичный WS: mark price оттуда корректен для demo-позиций,
+// собственного источника всё равно не существует.
 const WS_HOSTS: Record<Network, string> = {
   testnet: 'wss://stream-testnet.bybit.com/v5/public/linear',
   mainnet: 'wss://stream.bybit.com/v5/public/linear',
+  demo: 'wss://stream.bybit.com/v5/public/linear',
 }
 
 const THROTTLE_MS = 1000

@@ -35,9 +35,13 @@ import { closeTrade, releaseSymbol } from '../state/trades.js'
 import { emitPositionUpsert } from '../pipeline.js'
 import type { BybitRestClient } from './rest-client.js'
 
+// 'demo' — Bybit DEMO TRADING (p3-task6-demo): приватный WS demo проверен вживую (auth success)
+// на своём хосте stream-demo.bybit.com — в отличие от ПУБЛИЧНОГО WS (market-data/tickers-feed.ts),
+// у demo private WS СВОЙ есть.
 const WS_HOSTS: Record<Network, string> = {
   testnet: 'wss://stream-testnet.bybit.com/v5/private',
   mainnet: 'wss://stream.bybit.com/v5/private',
+  demo: 'wss://stream-demo.bybit.com/v5/private',
 }
 
 // §11: "expires = now + 10000ms" — проверено вживую в research.
@@ -119,7 +123,7 @@ export function parseFrame(raw: string): TopicFrame | null {
  *  data-пуши на пустом testnet-аккаунте получить не удалось). */
 export interface PositionPush {
   symbol: string
-  side: string // 'Buy' | 'Sell' | 'None'
+  side: string // 'Buy' | 'Sell' | '' (плоская позиция — Bybit шлёт ИМЕННО пустую строку, не 'None')
   size: string
   entryPrice: string | null
   markPrice: string | null
@@ -133,13 +137,28 @@ export interface PositionPush {
   seq: number | null
 }
 
+/** `side` пуша `position.linear` — в отличие от остальных полей (asNonEmptyString), '' здесь
+ *  ЗНАЧИМОЕ значение ("плоская позиция", а НЕ "поле отсутствует"): фикс p3-task6-demo, найдено
+ *  живьём при ручном закрытии позиции на demo — Bybit шлёт финальный пуш `position size→0` с
+ *  `side=""` (подтверждено и REST `position/list` для той же стаб-позиции, и живым WS-пушем).
+ *  Старый `asNonEmptyString(o.side)` трактовал '' как "поле отсутствует" -> toPositionPush()
+ *  целиком возвращал null -> applyPositionPush() НИКОГДА не вызывался для события закрытия ->
+ *  positions.size навсегда застревал на последнем ненулевом значении, closeTrade/releaseSymbol/
+ *  cancelAll (R8) не срабатывали по WS вовсе (отказоустойчивость задачи 5 не работала бы).
+ *  mapSide() ниже уже трактует '' как null (флет) — эта функция лишь перестаёт её отбрасывать
+ *  на входе.
+ */
+function asStringField(v: unknown): string | null {
+  return typeof v === 'string' ? v : null
+}
+
 export function toPositionPush(item: unknown): PositionPush | null {
   const o = asRecord(item)
   if (!o) return null
   const symbol = asNonEmptyString(o.symbol)
-  const side = asNonEmptyString(o.side)
+  const side = asStringField(o.side)
   const size = asNonEmptyString(o.size)
-  if (!symbol || !side || size === null) return null
+  if (!symbol || side === null || size === null) return null
   return {
     symbol,
     side,
@@ -240,7 +259,7 @@ export function toWalletPush(item: unknown): WalletPush | null {
 function mapSide(raw: string): Side | null {
   if (raw === 'Buy') return 'long'
   if (raw === 'Sell') return 'short'
-  return null // 'None' — плоская позиция без стороны
+  return null // '' (или 'None') — плоская позиция без стороны, см. asStringField выше
 }
 
 // Bybit orderStatus (V5 docs) → наш order_status (миграция 001_initial.ts). Untriggered/Triggered —
@@ -328,15 +347,26 @@ export async function applyPositionPush(
 
   await db.transaction().execute(async (trx) => {
     if (push.seq !== null) {
-      // Водяной знак (§14): пуш не новее уже сохранённого seq — переупорядочен реконнектом,
+      // Водяной знак (§14): пуш СТРОГО СТАРШЕ уже сохранённого seq — переупорядочен реконнектом,
       // применять нельзя (откатил бы состояние назад).
+      //
+      // СТРОГО `<`, а НЕ `<=` (фикс p3-task6-demo, найдено живьём на demo): Bybit НЕ бампает
+      // `seq` позиции на `position/trading-stop` (перенос SL/перенастройка TP без исполнения) —
+      // seq двигают только реальные исполнения (открытие/добор/частичное или полное закрытие).
+      // Живой прогон Ф3 задачи 6 (accept-приёмка UI): вход дал seq=N, ЛЮБОЙ последующий перенос
+      // SL приходил новым пушем с ТЕМ ЖЕ seq=N (другой stopLoss, тот же seq) — со старым `<=`
+      // такой пуш молча трактовался как "не новее" и отбрасывался НАВСЕГДА, стоп-лосс в UI
+      // (positions.stop_loss) замирал на значении входа и никогда не обновлялся после переноса,
+      // хотя на бирже SL реально менялся. `<` по-прежнему отбраковывает переупорядоченный СТАРЫЙ
+      // пуш (тест "устаревший seq" ниже: seq=3 после seq=5 — отброшен), но пропускает повторный
+      // пуш С ТЕМ ЖЕ seq, несущий свежие несвязанные с исполнением поля (stopLoss/takeProfit).
       const current = await trx
         .selectFrom('positions')
         .select('bybit_seq')
         .where('channel_id', '=', channelId)
         .where('symbol', '=', push.symbol)
         .executeTakeFirst()
-      if (current && current.bybit_seq !== null && push.seq <= current.bybit_seq) return
+      if (current && current.bybit_seq !== null && push.seq < current.bybit_seq) return
     }
 
     await sql`

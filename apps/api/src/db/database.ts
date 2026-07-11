@@ -129,8 +129,9 @@ export interface DB {
   }
   instruments: {
     symbol: string
-    // net_t — тот же enum, что и остальная схема (001_initial.ts): 'testnet' | 'mainnet'.
-    network: 'testnet' | 'mainnet'
+    // net_t — тот же enum, что и остальная схема (001_initial.ts + 005_demo_network.ts):
+    // 'testnet' | 'mainnet' | 'demo'.
+    network: 'testnet' | 'mainnet' | 'demo'
     base_coin: string
     status: string
     // NUMERIC-колонки — string (см. комментарий выше про точность).

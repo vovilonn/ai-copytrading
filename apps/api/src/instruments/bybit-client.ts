@@ -2,10 +2,12 @@ import type { Network } from 'shared/domain.js'
 
 // Тонкий клиент к ПУБЛИЧНЫМ market-эндпоинтам Bybit V5 (instruments-info, risk-limit) — ключ не
 // нужен (docs/superpowers/research/bybit-execution.md §7). Раздельные хосты по сети — testnet
-// и mainnet держат независимые листинги/лимиты (§13 того же дока).
+// и mainnet держат независимые листинги/лимиты (§13 того же дока). 'demo' (p3-task6-demo) —
+// Bybit DEMO TRADING, публичные market-эндпоинты на api-demo.bybit.com проверены вживую (retCode=0).
 const HOSTS: Record<Network, string> = {
   testnet: 'https://api-testnet.bybit.com',
   mainnet: 'https://api.bybit.com',
+  demo: 'https://api-demo.bybit.com',
 }
 
 interface BybitEnvelope<T> {

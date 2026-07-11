@@ -12,9 +12,13 @@
 import { createHmac } from 'node:crypto'
 import type { Network } from 'shared/domain.js'
 
-const HOSTS: Record<Network, string> = {
+// 'demo' — Bybit DEMO TRADING (p3-task6-demo): отдельный хост, НЕ testnet и НЕ mainnet.
+// Проверено вживую: order/create, wallet-balance, position/list, order/realtime, а также
+// публичные market/instruments-info, market/tickers, market/risk-limit — все retCode=0.
+export const HOSTS: Record<Network, string> = {
   testnet: 'https://api-testnet.bybit.com',
   mainnet: 'https://api.bybit.com',
+  demo: 'https://api-demo.bybit.com',
 }
 
 const RECV_WINDOW = '5000'

@@ -142,6 +142,16 @@ describe('toPositionPush / toExecutionPush / toOrderPush / toWalletPush', () => 
     expect(toPositionPush({ side: 'Buy', size: '0.5' })).toBeNull()
   })
 
+  it('toPositionPush: side="" (плоская позиция — реальный формат Bybit на закрытии) -> объект, НЕ null', () => {
+    // Фикс p3-task6-demo (найдено живьём: ручное закрытие позиции на demo НИКОГДА не долетало
+    // до closeTrade/releaseSymbol/cancelAll через приватный WS). Bybit шлёт финальный пуш
+    // `position size→0` с side="" (пустая строка, не 'None') — старый asNonEmptyString(o.side)
+    // трактовал '' как "поле отсутствует" и ронял ВЕСЬ объект в null, событие закрытия молча
+    // терялось целиком (в отличие от markPrice="" выше — там '' ЗАКОННО означает "поле не пришло").
+    const push = toPositionPush({ symbol: 'SOLUSDT', side: '', size: '0' })
+    expect(push).toMatchObject({ symbol: 'SOLUSDT', side: '', size: '0' })
+  })
+
   it('toExecutionPush: обязательные поля есть -> объект', () => {
     const push = toExecutionPush({
       symbol: 'BTCUSDT',
@@ -398,6 +408,30 @@ describe('applyPositionPush', () => {
     expect(row.size).toBe('10.0000000000')
   })
 
+  it('пуш с ТЕМ ЖЕ seq, что уже сохранён (перенос SL/TP не бампает seq биржи) -> всё равно применяется', async () => {
+    // Фикс p3-task6-demo (найдено живьём на demo, приёмка UI задачи 6): Bybit не увеличивает
+    // seq позиции на переносе SL/TP (`position/trading-stop`) — только на реальных исполнениях.
+    // Со старым водяным знаком (`<=`) повторный пуш с ТЕМ ЖЕ seq после переноса SL молча
+    // отбрасывался бы как "не новее", и stopLoss в UI навсегда замирал на значении входа.
+    // LTCUSDT — свой символ (не переиспользует SOLUSDT/BTCUSDT/... соседних тестов этого файла):
+    // resetTestSchema вызывается один раз на весь describe, а не на каждый тест, поэтому
+    // acquireSymbol на уже занятом соседним тестом символе тихо провалился бы (false).
+    const symbol = 'LTCUSDT'
+    await setupTrade(symbol, 'long')
+    const { rest } = mockCancelAllRest()
+
+    await applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '10', markPrice: '150', stopLoss: '140', seq: 5 }), rest)
+    await applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '10', markPrice: '150', stopLoss: '145', seq: 5 }), rest)
+
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(row.stop_loss).toBe('145.0000000000')
+  })
+
   it('символ без владения в БД -> предупреждение, без записи в positions, cancelAll не вызван', async () => {
     const { rest, calls } = mockCancelAllRest()
     const notified = await applyPositionPush(db, buildPositionPush({ symbol: 'UNKNOWNUSDT', side: 'Buy', size: '1' }), rest)
@@ -574,6 +608,27 @@ describe('BybitPrivateWs — диспетчеризация сырых фрей�
     // execution.linear/wallet — те же apply*Push уже покрыты выше на bare-имени; здесь
     // достаточно подтвердить, что ".linear" не ломает диспетчеризацию ни для одного из четырёх.
     await expect(dispatch.handleMessage(JSON.stringify({ topic: 'wallet', data: [{ accountType: 'UNIFIED', totalEquity: '500' }] }))).resolves.toBeUndefined()
+  })
+
+  it('фикс p3-task6-demo: РЕАЛЬНЫЙ сырой фрейм закрытия (side="", size="0") реально закрывает #TR-x', async () => {
+    // Найдено живьём при ручном закрытии позиции на demo (задача 5, отказоустойчивость):
+    // Bybit шлёт финальный `position.linear` пуш с side="" (НЕ 'None' и НЕ отсутствием поля) —
+    // до фикса toPositionPush() ронял весь пуш в null на этом самом месте, closeTrade/
+    // releaseSymbol/cancelAll (R8) не срабатывали НИКОГДА через реальный WS-путь целиком.
+    const symbol = 'MATICUSDT'
+    const { tradeId } = await setupTrade(symbol, 'long')
+    const { rest, calls } = mockCancelAllRest()
+
+    const ws = new BybitPrivateWs({ apiKey: 'k', apiSecret: 's', network: 'testnet', db, rest })
+    const dispatch = ws as unknown as { handleMessage(raw: string): Promise<void> }
+
+    await dispatch.handleMessage(
+      JSON.stringify({ topic: 'position.linear', data: [{ symbol, side: '', size: '0', seq: 99 }] }),
+    )
+
+    expect(calls).toEqual([symbol]) // cancelAll реально вызван по живому сырому фрейму закрытия
+    const trade = await db.selectFrom('trades').select(['status']).where('id', '=', tradeId).executeTakeFirstOrThrow()
+    expect(trade.status).toBe('closed')
   })
 
   it('Important I3: неизвестный topic логируется (warn), а не тихо дропается', async () => {

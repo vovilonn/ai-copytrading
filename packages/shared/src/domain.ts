@@ -2,7 +2,11 @@
 // (задача 1: кэш instruments-info + risk-limit, см. apps/api/src/instruments/instruments.service.ts),
 // сюда же по мере задач Ф1 добавятся Action/Trade/Order и т.п.
 
-export type Network = 'testnet' | 'mainnet'
+// Ф3 задача p3-task6-demo: 'demo' — Bybit DEMO TRADING (api-demo.bybit.com), НЕ testnet и НЕ
+// mainnet. Testnet блокирует order/create regulatory-кодом 10024 (не наш регион) — demo
+// торгует реальными рыночными ценами виртуальным балансом, ордера проходят. У demo НЕТ
+// собственного публичного WS (market-data/tickers-feed.ts использует для него mainnet public WS).
+export type Network = 'testnet' | 'mainnet' | 'demo'
 
 /**
  * Строка кэша инструментов Bybit (таблица `instruments`, apps/api/src/db/migrations/001_initial.ts

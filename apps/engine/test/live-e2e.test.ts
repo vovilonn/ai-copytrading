@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { Decimal } from 'decimal.js'
-import { BybitRestClient } from '../src/bybit/rest-client.js'
+import { BybitRestClient, HOSTS } from '../src/bybit/rest-client.js'
 import { orderLinkId } from '../src/execution/order-link-id.js'
 import { floorTo } from '../src/risk/leverage.js'
+import type { Network } from 'shared/domain.js'
 
 // Живой e2e-сценарий Ф3 задачи 6 (task-6-brief.md): реальные ордера на Bybit testnet малым
 // notional (~$10-20) через BybitRestClient НАПРЯМУЮ (брифом разрешено "BybitAdapter +
@@ -12,12 +13,19 @@ import { floorTo } from '../src/risk/leverage.js'
 // исполненным ордером), TP-лесенку, перенос SL, частичное/полное закрытие и идемпотентность
 // 110072 (research bybit-execution.md §16 отмечал оба этих факта как "непроверяемо без мутаций").
 //
-// Символ SOLUSDT (не BTCUSDT): цена ~$78 на testnet -> qty=0.2 (qtyStep=0.1) даёт notional
-// ~$15.6 — комфортно в целевом диапазоне $10-20 и выше minNotional=5. qtyStep/tickSize/
-// minNotional сверены и с локальной таблицей instruments, и напрямую с живым
-// GET /v5/market/instruments-info?symbol=SOLUSDT перед написанием теста (см. p3-task6-report.md).
+// p3-task6-demo: заказчик переключил ключи с testnet на Bybit DEMO TRADING — testnet блокирует
+// order/create regulatory-кодом 10024 (не наш регион), demo торгует реальными рыночными ценами
+// виртуальным балансом (~165k USDT). Тест теперь ходит на demo (BYBIT_NETWORK=demo в .env);
+// testnet оставлен как fallback-опция сети (не единственная разрешённая), mainnet по-прежнему
+// заблокирован явно ниже — тест НЕ имеет права случайно поставить реальный ордер на mainnet.
 //
-// Тест устойчив к тому, что testnet может двигаться/флейкать: каждый шаг ПЕРЕЧИТЫВАЕТ живое
+// Символ SOLUSDT (не BTCUSDT): цена ~$78 -> qty=0.2 (qtyStep=0.1) даёт notional ~$15.6 —
+// комфортно в целевом диапазоне $10-20 и выше minNotional=5. qtyStep/tickSize/minNotional сверены
+// и с локальной таблицей instruments, и напрямую с живым GET /v5/market/instruments-info?
+// symbol=SOLUSDT перед написанием теста (см. p3-task6-report.md); на demo SOLUSDT status=Trading
+// подтверждено отдельно (p3-task6-demo).
+//
+// Тест устойчив к тому, что рынок может двигаться/флейкать: каждый шаг ПЕРЕЧИТЫВАЕТ живое
 // состояние (getPositions/getOpenOrders) вместо того, чтобы полагаться на значение из прошлого
 // шага (TP теоретически мог исполниться раньше срока при движении рынка) — CLEANUP в afterAll
 // выполняется ВСЕГДА, каждый его сетевой вызов обёрнут в try/catch и только логирует, никогда
@@ -25,7 +33,7 @@ import { floorTo } from '../src/risk/leverage.js'
 
 const BYBIT_LIVE_TESTS = process.env.BYBIT_LIVE_TESTS === '1'
 if (!BYBIT_LIVE_TESTS) {
-  console.warn('[live-e2e.test] живой e2e пропущен; задайте BYBIT_LIVE_TESTS=1 для запуска (СТАВИТ РЕАЛЬНЫЕ ОРДЕРА на testnet)')
+  console.warn('[live-e2e.test] живой e2e пропущен; задайте BYBIT_LIVE_TESTS=1 для запуска (СТАВИТ РЕАЛЬНЫЕ ОРДЕРА на testnet/demo)')
 }
 const describeLive = BYBIT_LIVE_TESTS ? describe : describe.skip
 
@@ -53,14 +61,40 @@ function linkId(purpose: 'entry' | 'tp' | 'close', legIndex: number): string {
 
 /**
  * Живая цена символа через ПУБЛИЧНЫЙ (без подписи) `GET /v5/market/tickers` — обнаружено при
- * подготовке этого теста: `position/list` стаб-позиция (size=0) в ТЕКУЩЕМ состоянии testnet-
+ * подготовке этого теста: `position/list` стаб-позиция (size=0) в ТЕКУЩЕМ состоянии
  * аккаунта отдаёт markPrice='' (пустую строку), а НЕ живую цену, вопреки допущению research
  * bybit-execution.md §1 (на которое опирается и main.ts::getMarkPrice гейта slippage — см.
  * список сомнений в p3-task6-report.md). Публичный тикер не требует API-ключа и надёжно отдаёт
- * markPrice независимо от того, есть ли позиция/история по символу на аккаунте.
+ * markPrice независимо от того, есть ли позиция/история по символу на аккаунте. Хост берётся из
+ * того же `HOSTS` (rest-client.ts), что и подписанные запросы этого же клиента — на demo рыночные
+ * данные (в отличие от публичного WS) работают на api-demo.bybit.com (p3-task6-demo, проверено
+ * вживую), отдельного маппинга здесь заводить не нужно (DRY).
  */
-async function fetchPublicMarkPrice(symbol: string): Promise<Decimal> {
-  const res = await fetch(`https://api-testnet.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`)
+/**
+ * `GET /v5/execution/list` на demo пишется в биржевой журнал с заметно бОльшей задержкой, чем на
+ * testnet (обнаружено при прогоне этого теста на demo, p3-task6-demo): фиксированный `sleep(2000)`,
+ * которого хватало на testnet, здесь стабильно возвращал ПУСТОЙ список сразу после исполнения
+ * ордера (ручная проверка ТЕМ ЖЕ запросом ~30-60с спустя находила исполнения без проблем — сам
+ * ордер/позиция уже отражены верно, отстаёт именно execution-журнал). Поэтому вместо гадания с
+ * ещё одним фиксированным таймаутом — короткий поллинг: не бросает при таймауте (пустой список —
+ * legitimate исход для вызывающей стороны решить), просто отдаёт последний ответ биржи.
+ */
+async function waitForExecutions(
+  client: BybitRestClient,
+  params: { orderLinkId: string; symbol: string },
+  timeoutMs = 15_000,
+  intervalMs = 1_000,
+): Promise<Awaited<ReturnType<BybitRestClient['getExecutions']>>> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const executions = await client.getExecutions(params)
+    if (executions.length > 0 || Date.now() >= deadline) return executions
+    await sleep(intervalMs)
+  }
+}
+
+async function fetchPublicMarkPrice(symbol: string, network: Network): Promise<Decimal> {
+  const res = await fetch(`${HOSTS[network]}/v5/market/tickers?category=linear&symbol=${symbol}`)
   const body = (await res.json()) as { retCode: number; retMsg: string; result: { list: Array<{ markPrice: string }> } }
   if (body.retCode !== 0) throw new Error(`fetchPublicMarkPrice(${symbol}): retCode=${body.retCode} (${body.retMsg})`)
   const markPrice = body.result.list[0]?.markPrice
@@ -68,7 +102,7 @@ async function fetchPublicMarkPrice(symbol: string): Promise<Decimal> {
   return new Decimal(markPrice)
 }
 
-describeLive('Живой E2E на Bybit testnet (Ф3, задача 6, требует BYBIT_LIVE_TESTS=1)', () => {
+describeLive('Живой E2E на Bybit testnet/demo (Ф3, задача 6, требует BYBIT_LIVE_TESTS=1)', () => {
   let client: BybitRestClient
   let markPrice: Decimal
   let entrySizeAfterEntry = '0'
@@ -82,18 +116,20 @@ describeLive('Живой E2E на Bybit testnet (Ф3, задача 6, требу
   beforeAll(async () => {
     const apiKey = process.env.BYBIT_API_KEY
     const apiSecret = process.env.BYBIT_API_SECRET
-    const network = process.env.BYBIT_NETWORK === 'mainnet' ? 'mainnet' : 'testnet'
+    const envNetwork = process.env.BYBIT_NETWORK
+    const network: Network = envNetwork === 'demo' ? 'demo' : envNetwork === 'mainnet' ? 'mainnet' : 'testnet'
     if (!apiKey || !apiSecret) {
       throw new Error('BYBIT_LIVE_TESTS=1, но BYBIT_API_KEY/BYBIT_API_SECRET не заданы в .env')
     }
-    if (network !== 'testnet') {
-      // Защита от несчастного случая: этот файл ставит РЕАЛЬНЫЕ ордера, отказ работать не на testnet.
-      throw new Error('live-e2e.test: BYBIT_NETWORK должен быть testnet — отказ ставить ордера иначе')
+    if (network === 'mainnet') {
+      // Защита от несчастного случая: этот файл ставит РЕАЛЬНЫЕ ордера, отказ работать на mainnet
+      // (единственные допустимые сети — testnet и demo, обе безопасны для реальных денег).
+      throw new Error('live-e2e.test: BYBIT_NETWORK не должен быть mainnet — отказ ставить ордера иначе')
     }
     client = new BybitRestClient({ apiKey, apiSecret, network })
 
-    markPrice = await fetchPublicMarkPrice(SYMBOL)
-    console.log(`[live-e2e][setup] markPrice(${SYMBOL})=${markPrice.toString()} RUN_ID=${RUN_ID} entryLinkId=${entryLinkId}`)
+    markPrice = await fetchPublicMarkPrice(SYMBOL, network)
+    console.log(`[live-e2e][setup] network=${network} markPrice(${SYMBOL})=${markPrice.toString()} RUN_ID=${RUN_ID} entryLinkId=${entryLinkId}`)
   })
 
   afterAll(async () => {
@@ -205,7 +241,7 @@ describeLive('Живой E2E на Bybit testnet (Ф3, задача 6, требу
     // Размер позиции НЕ удвоился — второго реального входа на бирже не произошло.
     expect(pos?.size).toBe(entrySizeAfterEntry)
 
-    const executions = await client.getExecutions({ orderLinkId: entryLinkId, symbol: SYMBOL })
+    const executions = await waitForExecutions(client, { orderLinkId: entryLinkId, symbol: SYMBOL })
     const totalExecQty = executions.reduce((sum, e) => sum.plus(e.execQty), new Decimal(0))
     console.log(`[live-e2e][шаг1b] getExecutions(orderLinkId=entry) count=${executions.length} totalExecQty=${totalExecQty.toString()}`)
     expect(totalExecQty.toString()).toBe(new Decimal(entrySizeAfterEntry).toString())
@@ -312,7 +348,7 @@ describeLive('Живой E2E на Bybit testnet (Ф3, задача 6, требу
     console.log(`[live-e2e][шаг4] size до=${sizeBefore.toString()} qty=${partialQty} size после=${posAfter?.size ?? '0'}`)
     expect(new Decimal(posAfter?.size ?? '0').lt(sizeBefore)).toBe(true)
 
-    const executions = await client.getExecutions({ orderLinkId: partialCloseLinkId, symbol: SYMBOL })
+    const executions = await waitForExecutions(client, { orderLinkId: partialCloseLinkId, symbol: SYMBOL })
     const closedSize = executions.reduce((sum, e) => sum.plus(e.closedSize || '0'), new Decimal(0))
     console.log(`[live-e2e][шаг4] getExecutions(partial close) count=${executions.length} closedSize=${closedSize.toString()}`)
     expect(closedSize.gt(0)).toBe(true)
