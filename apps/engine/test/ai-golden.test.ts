@@ -6,8 +6,9 @@
 // Ф2), сравнивает извлечённые (symbol, type) с эталоном, печатает precision/recall.
 //
 // Порог (задача, "терять действия — худший исход"): recall >= 0.85 (жёстко), precision >= 0.75
-// (мягче — фолзы терпимее пропусков). Skip целиком, если ai-proxy недоступен (тот же приём,
-// что ai-client.test.ts/pipeline-ai.e2e.test.ts).
+// (мягче — фолзы терпимее пропусков). Skip целиком, если не задан AI_LIVE_TESTS=1 (Important #2
+// финального ревью Ф2, p2-final-fix-report.md) ИЛИ ai-proxy недоступен (тот же приём, что
+// ai-client.test.ts/pipeline-ai.e2e.test.ts).
 //
 // Кэш (ai/cache.ts, ai_cache) ускоряет ПОВТОРНЫЕ прогоны ЭТОГО файла (напр. при калибровке
 // промпта: `pnpm --filter engine exec vitest run test/ai-golden.test.ts` несколько раз подряд) —
@@ -33,6 +34,16 @@ import type { OpenPositionSummary, PromptImage } from '../src/ai/prompt.js'
 const AI_PROXY_URL = process.env.AI_PROXY_URL ?? 'http://127.0.0.1:8317'
 const DUMP_DIR = fileURLToPath(new URL('../../../temp/tg-dump/ch-1962583820-t173666/', import.meta.url))
 const GOLDEN_PATH = fileURLToPath(new URL('./fixtures/ch2-golden.json', import.meta.url))
+
+// Important #2 адверсариального ревью (p2-final-fix-report.md): этот файл прогоняет ДО 30
+// golden-кейсов через живой ai-proxy на каждый прогон — гейтить ТОЛЬКО на "прокси доступен"
+// (локальный ai-proxy почти всегда поднят) означало бы, что обычный `pnpm test` молча жжёт
+// платную подписку. Явный opt-in: AI_LIVE_TESTS=1. Без флага — describe.skip с понятным сообщением.
+const AI_LIVE_TESTS = process.env.AI_LIVE_TESTS === '1'
+if (!AI_LIVE_TESTS) {
+  console.warn('[ai-golden.test] живые AI-тесты пропущены; задайте AI_LIVE_TESTS=1 для запуска (жжёт платный ai-proxy, до 30 вызовов)')
+}
+const describeLive = AI_LIVE_TESTS ? describe : describe.skip
 
 // ---------------------------------------------------------------------------
 // Golden fixture + сырой дамп (для reply-parent текста — та же роль, что messages в БД у
@@ -205,7 +216,7 @@ function gradeCase(id: number, expected: GoldenAction[], extracted: Array<{ symb
 
 // ---------------------------------------------------------------------------
 
-describe('golden set CH2 — precision/recall извлечения actions (живой ai-proxy)', () => {
+describeLive('golden set CH2 — precision/recall извлечения actions (живой ai-proxy) — требует AI_LIVE_TESTS=1', () => {
   let available = false
   let db: Kysely<AiCacheSchema>
 

@@ -17,6 +17,11 @@ import { serializeOpenPosition, type OpenPositionSummary, type PromptImage } fro
 // (напр. 'var/media/ch-1962583820-t173666/221437_0.jpg'), путь считаем от расположения ЭТОГО
 // модуля, устойчиво к тому, из какого cwd запущен процесс.
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url))
+// Minor #3 адверсариального ревью (p2-final-fix-report.md): контейнмент того же поля
+// message_media.storage_path, что и apps/api/src/channels/media.controller.ts:12-13/28-29 —
+// зеркально тому же приёму (тот же REPO_ROOT-relative формат пути), чтобы кривой/злонамеренный
+// storage_path не читал произвольный файл с диска и не сливал его в тело запроса к ai-proxy.
+const MEDIA_ROOT = path.join(REPO_ROOT, 'var', 'media')
 
 /** Минимум полей сообщения, нужных buildContext — не весь `messages`-ряд (задача не должна
  *  тащить в сигнатуру всю таблицу ради 3 колонок). */
@@ -183,7 +188,17 @@ async function loadImages(db: Kysely<DB>, messageId: string): Promise<PromptImag
 
   const images: PromptImage[] = []
   for (const row of rows) {
-    const absolutePath = path.join(REPO_ROOT, row.storage_path)
+    // Minor #3 адверсариального ревью: контейнмент — тот же приём, что media.controller.ts
+    // (28-29): абсолютные пути и выход через ".." отклоняются одинаково, единственный путь
+    // наружу закрыт. storage_path пишет только воркер (tg-ingest), но отдавать содержимое файла
+    // модели без проверки нельзя: одна кривая миграция/ручной UPDATE — и loadImages прочитает
+    // /etc/passwd и отправит его в ai-proxy как "картинку".
+    const relative = row.storage_path.replace(/^var[/\\]media[/\\]/, '')
+    const absolutePath = path.resolve(MEDIA_ROOT, relative)
+    if (absolutePath !== MEDIA_ROOT && !absolutePath.startsWith(MEDIA_ROOT + path.sep)) {
+      console.warn(`[ai/context] storage_path вне var/media (контейнмент), картинка пропущена: ${row.storage_path}`)
+      continue
+    }
     try {
       const buffer = await fs.readFile(absolutePath)
       images.push({ base64: buffer.toString('base64'), mediaType: row.media_type })

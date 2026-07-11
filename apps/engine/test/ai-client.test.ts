@@ -1,18 +1,31 @@
-import { describe, it, expect, beforeAll } from 'vitest'
+import { describe, it, expect, beforeAll, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { EXTRACT_SIGNAL_TOOL } from '../src/ai/schema.js'
 import { buildUserTurn, EXTRACTOR_INSTRUCTION } from '../src/ai/prompt.js'
 import { callExtractSignal } from '../src/ai/client.js'
 
-// Тесты AI-клиента (задача 1, Ф2). Три группы:
-//  1) ЖИВОЙ тест против ai-proxy — skip, если прокси недоступен (CI/офлайн); таймаут 60с.
+// Тесты AI-клиента (задача 1, Ф2; гейт живых тестов — Important #2 финального ревью Ф2,
+// p2-final-fix-report.md). Четыре группы:
+//  1) ЖИВОЙ тест против ai-proxy — гейт AI_LIVE_TESTS=1 (явный opt-in, см. ниже) И доступность
+//     прокси (healthz-пинг); таймаут 60с.
 //  2) ЧИСТЫЙ тест сборки промпта buildUserTurn (без сети/БД).
 //  3) ЧИСТЫЙ тест схемы extract_signal.
+//  4) ЧИСТЫЙ тест таймаута зависшего fetch (Important #1) — мок fetch, без сети/БД.
 
 const AI_PROXY_URL = process.env.AI_PROXY_URL ?? 'http://127.0.0.1:8317'
 // Карточка WEEX SOLUSDT (research: терсное '2🎯', символ только на картинке).
 const SOL_CARD_PATH = fileURLToPath(new URL('../../../temp/tg-dump/ch-1962583820-t173666/media/221437.jpg', import.meta.url))
+
+// Important #2 адверсариального ревью: локальный ai-proxy почти всегда поднят (docker compose) —
+// гейтить живые AI-тесты ТОЛЬКО на "прокси доступен" означает, что обычный `pnpm test` молча жжёт
+// платный ai-proxy на каждом прогоне. Явный opt-in: AI_LIVE_TESTS=1. Без флага — describe.skip с
+// понятным сообщением, доступность прокси проверяется ТОЛЬКО когда флаг уже включён.
+const AI_LIVE_TESTS = process.env.AI_LIVE_TESTS === '1'
+if (!AI_LIVE_TESTS) {
+  console.warn('[ai-client.test] живые AI-тесты пропущены; задайте AI_LIVE_TESTS=1 для запуска (жжёт платный ai-proxy)')
+}
+const describeLive = AI_LIVE_TESTS ? describe : describe.skip
 
 /** Пробует достучаться до прокси (короткий таймаут). true — доступен, живой тест выполняется. */
 async function proxyAvailable(): Promise<boolean> {
@@ -104,7 +117,7 @@ describe('buildUserTurn (сборка промпта)', () => {
   })
 })
 
-describe('callExtractSignal (живой ai-proxy)', () => {
+describeLive('callExtractSignal (живой ai-proxy) — требует AI_LIVE_TESTS=1', () => {
   let available = false
   beforeAll(async () => {
     available = await proxyAvailable()
@@ -144,4 +157,54 @@ describe('callExtractSignal (живой ai-proxy)', () => {
     },
     60_000,
   )
+})
+
+// ---------------------------------------------------------------------------
+// Important #1 адверсариального ревью (p2-final-fix-report.md): fetch без AbortController мог
+// зависнуть неопределённо долго (дефолты undici) и держать открытой транзакцию pipeline.ts::
+// runAiBranch. ЧИСТЫЙ тест — мокаем global.fetch зависшим (никогда не резолвится САМ, реджектится
+// ТОЛЬКО при abort от AbortController — так же ведёт себя реальный fetch с переданным signal) и
+// проверяем, что callExtractSignal НЕ висит: таймаут короткий (timeoutMs, параметр, а НЕ дефолтные
+// 40с), а vi.useFakeTimers ускоряет backoff-паузы между 4 попытками (2с/4с/8с) — тест не ждёт их
+// реальным временем.
+// ---------------------------------------------------------------------------
+
+describe('callExtractSignal — таймаут зависшего fetch (Important #1)', () => {
+  it('зависший fetch (никогда не резолвится сам) не вешает callExtractSignal — abort по таймауту, throw после исчерпания ретраев', async () => {
+    vi.useFakeTimers()
+    const originalFetch = global.fetch
+
+    // Мок fetch: промис никогда не резолвится сам по себе — реджектится ТОЛЬКО когда сработает
+    // signal.abort() (ровно так себя ведёт настоящий fetch с переданным AbortSignal).
+    global.fetch = ((_url: unknown, init?: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          const err = new Error('This operation was aborted')
+          err.name = 'AbortError'
+          reject(err)
+        })
+      })) as typeof fetch
+
+    try {
+      const resultPromise = callExtractSignal({
+        text: '2🎯',
+        tMsg: '2026-06-24T20:13:11.000Z',
+        openPositions: [],
+        images: [],
+        timeoutMs: 50, // короткий таймаут для теста — НЕ дефолтные 40с (задача просит не ждать 40с×4)
+      })
+      const assertion = expect(resultPromise).rejects.toThrow()
+
+      // Продвигаем фейковое время: 4 попытки × abort-таймаут(50мс) + backoff между ними
+      // (2с/4с/8с) — суммарно ~14.2с виртуального времени, БЕЗ реального ожидания.
+      for (let i = 0; i < 20; i++) {
+        await vi.advanceTimersByTimeAsync(1000)
+      }
+
+      await assertion
+    } finally {
+      global.fetch = originalFetch
+      vi.useRealTimers()
+    }
+  }, 15_000)
 })

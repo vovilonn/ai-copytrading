@@ -333,4 +333,28 @@ describe('buildContext — картинки message_media', () => {
     const built = await buildContext(db, { id: messageId, channelId: CHANNEL_ID, replyToMsgId: null })
     expect(built.images).toEqual([])
   })
+
+  it('Minor #3 адверсариального ревью: storage_path="../../etc/passwd" (выход за var/media) -> картинка пропущена', async () => {
+    const { messageId, tgMessageId } = await seedMessage()
+    await db
+      .insertInto('message_media')
+      .values({
+        id: randomUUID(),
+        message_id: messageId,
+        tg_message_id: tgMessageId,
+        grouped_id: null,
+        order_index: 0,
+        storage_path: '../../etc/passwd',
+        media_type: 'image/jpeg',
+        width: null,
+        height: null,
+        bytes: null,
+        sha256: null,
+        created_at: new Date(),
+      })
+      .execute()
+
+    const built = await buildContext(db, { id: messageId, channelId: CHANNEL_ID, replyToMsgId: null })
+    expect(built.images).toEqual([]) // контейнмент отсёк выход за var/media — файл НЕ прочитан
+  })
 })

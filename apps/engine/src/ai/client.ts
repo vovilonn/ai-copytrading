@@ -24,6 +24,23 @@ const DEFAULT_AI_PROXY_URL = 'http://127.0.0.1:8317'
 const ANTHROPIC_VERSION = '2023-06-01'
 const MAX_TOKENS = 2048
 
+// Important #1 адверсариального ревью (p2-final-fix-report.md): fetch БЕЗ AbortController может
+// висеть неопределённо долго на дефолтах undici (нет socket-таймаута), а callOnce вызывается из
+// runAiBranch ВНУТРИ db.transaction() (pipeline.ts) — зависший ai-proxy держал бы открытой
+// транзакцию (xmin, строчные локи) на всё время зависания. 40с — дефолт (задача); переопределим
+// явным параметром (тесты) либо env AI_PROXY_TIMEOUT_MS.
+const DEFAULT_FETCH_TIMEOUT_MS = 40_000
+
+function resolveTimeoutMs(explicit?: number): number {
+  if (explicit !== undefined) return explicit
+  const envVal = process.env.AI_PROXY_TIMEOUT_MS
+  if (envVal !== undefined) {
+    const parsed = Number(envVal)
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+  }
+  return DEFAULT_FETCH_TIMEOUT_MS
+}
+
 // Ретраи (research §11): 429/500/502/503/529 ретраить с экспоненциальным backoff (4 попытки,
 // 2^att c), 400/404/413 НЕ ретраить (лог, needs_human). httpStatus=0 (сетевой сбой) — ретраить.
 const MAX_ATTEMPTS = 4
@@ -74,6 +91,10 @@ export interface CallExtractSignalParams extends Omit<BuildUserTurnParams, 'imag
   escalated?: boolean
   /** Базовый URL прокси. Дефолт — env AI_PROXY_URL, иначе http://127.0.0.1:8317. */
   baseUrl?: string
+  /** Таймаут ОДНОГО HTTP-вызова прокси, мс (Important #1 адверсариального ревью). Дефолт — env
+   *  AI_PROXY_TIMEOUT_MS, иначе 40000. Тесты передают короткий таймаут явно, чтобы не ждать
+   *  реальные 40с на попытку зависшего fetch. */
+  timeoutMs?: number
 }
 
 // Kysely-схема только для таблицы ai_calls (в api/db/database.ts она НЕ типизирована — там комментарий
@@ -172,6 +193,7 @@ async function callOnce(
   baseUrl: string,
   model: string,
   blocks: AnthropicContentBlock[],
+  timeoutMs: number,
 ): Promise<{ output: ExtractSignalOutput; usage: AiUsage; httpStatus: number }> {
   const body = {
     model,
@@ -181,41 +203,56 @@ async function callOnce(
     messages: [{ role: 'user', content: blocks }],
   }
 
-  let res: Response
+  // Important #1 адверсариального ревью: AbortController с таймаутом — без него зависший
+  // ai-proxy держал бы fetch (и открытую транзакцию pipeline.ts::runAiBranch) неопределённо
+  // долго на дефолтах undici. clearTimeout — в finally, чтобы не оставлять активный таймер
+  // после успешного (или любого другого) завершения вызова.
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+
   try {
-    res = await fetch(`${baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'anthropic-version': ANTHROPIC_VERSION },
-      body: JSON.stringify(body),
-    })
-  } catch (err) {
-    // Сетевой сбой (прокси недоступен, DNS, reset) — httpStatus=0, ретраить (research §11).
-    throw new AiProxyError(`сеть: ${(err as Error).message}`, 0, true)
-  }
+    let res: Response
+    try {
+      res = await fetch(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'anthropic-version': ANTHROPIC_VERSION },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      })
+    } catch (err) {
+      // Сетевой сбой (прокси недоступен, DNS, reset) ИЛИ таймаут (AbortError от ctrl.abort()) —
+      // оба httpStatus=0, ретраить (research §11) — таймаут трактуется как обычный сетевой сбой,
+      // не отдельный кейс: попадает в те же 4 попытки backoff, а после исчерпания — деградация
+      // (needs_review/ai_unavailable выше по стеку, reconciler.ts), НЕ вечное удержание транзакции.
+      throw new AiProxyError(`сеть: ${(err as Error).message}`, 0, true)
+    }
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    const { retryable } = classifyStatus(res.status)
-    throw new AiProxyError(`ai-proxy ${res.status}: ${text.slice(0, 300)}`, res.status, retryable)
-  }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      const { retryable } = classifyStatus(res.status)
+      throw new AiProxyError(`ai-proxy ${res.status}: ${text.slice(0, 300)}`, res.status, retryable)
+    }
 
-  const json = (await res.json()) as AnthropicMessageResponse
-  const toolUse = json.content?.find((b): b is AnthropicContentToolUse => b.type === 'tool_use')
-  if (!toolUse) {
-    // Форсированный tool_choice → ответ ОБЯЗАН содержать tool_use (0 отказов на 460 вызовах §1).
-    // Отсутствие — аномалия ответа: не ретраить бесконечно, но это ошибка формата (не наша схема).
-    throw new AiProxyError('ответ прокси без tool_use-блока', res.status, false)
-  }
+    const json = (await res.json()) as AnthropicMessageResponse
+    const toolUse = json.content?.find((b): b is AnthropicContentToolUse => b.type === 'tool_use')
+    if (!toolUse) {
+      // Форсированный tool_choice → ответ ОБЯЗАН содержать tool_use (0 отказов на 460 вызовах §1).
+      // Отсутствие — аномалия ответа: не ретраить бесконечно, но это ошибка формата (не наша схема).
+      throw new AiProxyError('ответ прокси без tool_use-блока', res.status, false)
+    }
 
-  const usageRaw = json.usage ?? {}
-  const usage: AiUsage = {
-    inputTokens: usageRaw.input_tokens ?? 0,
-    cacheCreation: usageRaw.cache_creation_input_tokens ?? 0,
-    cacheRead: usageRaw.cache_read_input_tokens ?? 0,
-    outputTokens: usageRaw.output_tokens ?? 0,
-  }
+    const usageRaw = json.usage ?? {}
+    const usage: AiUsage = {
+      inputTokens: usageRaw.input_tokens ?? 0,
+      cacheCreation: usageRaw.cache_creation_input_tokens ?? 0,
+      cacheRead: usageRaw.cache_read_input_tokens ?? 0,
+      outputTokens: usageRaw.output_tokens ?? 0,
+    }
 
-  return { output: toolUse.input as ExtractSignalOutput, usage, httpStatus: res.status }
+    return { output: toolUse.input as ExtractSignalOutput, usage, httpStatus: res.status }
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /**
@@ -237,13 +274,14 @@ export async function callExtractSignal(params: CallExtractSignalParams): Promis
     images: params.images,
   })
   const requestHash = computeRequestHash(model, blocks)
+  const timeoutMs = resolveTimeoutMs(params.timeoutMs)
 
   const startedAt = Date.now()
   let lastError: AiProxyError | Error | null = null
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const { output, usage, httpStatus } = await callOnce(baseUrl, model, blocks)
+      const { output, usage, httpStatus } = await callOnce(baseUrl, model, blocks, timeoutMs)
       const latencyMs = Date.now() - startedAt
       const cacheHit = usage.cacheRead > 0
 
@@ -299,7 +337,19 @@ interface WriteAiCallArgs {
   error: string | null
 }
 
-/** Пишет одну строку ai_calls, если db передан. Ошибку записи глотаем (учёт не должен ронять разбор). */
+/**
+ * Пишет одну строку ai_calls, если db передан. Ошибку записи глотаем (учёт не должен ронять разбор).
+ *
+ * Minor #4 адверсариального ревью (p2-final-fix-report.md): вызывающая сторона (pipeline.ts::
+ * runAiBranch) передаёт сюда `db` НЕ как trx сообщения, а как ОТДЕЛЬНОЕ соединение пула — insert
+ * ai_calls больше не часть транзакции processMessage. Поэтому: (1) упавший statement здесь НЕ
+ * отравляет транзакцию сообщения (PG аварийно завершает только СВОЁ соединение/транзакцию, а не
+ * весь пул), console.warn ниже действительно безопасен, а не маскирует откат; (2) учёт стоимости
+ * не теряется, если транзакция сообщения позже откатится по другой причине — деньги на AI-вызов
+ * уже потрачены независимо от судьбы этой транзакции. Если когда-нибудь вызовут с db=trx
+ * (например, из теста) — поведение не изменится (тот же insert), просто вернётся прежний риск
+ * поглощения ошибки на транзакции; в остальном коде так больше не делаем.
+ */
 async function writeAiCall(params: CallExtractSignalParams, args: WriteAiCallArgs): Promise<void> {
   if (!params.db) return
   try {

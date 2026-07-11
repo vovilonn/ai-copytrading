@@ -90,7 +90,12 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     const normalizedText = normalize(message.text)
     const parsed = adapter.parse(ctx)
 
-    const detParseResult = await trx
+    // Ф2-финальное ревью (Minor #4): раньше строка возвращала `.returning('id')` только затем,
+    // чтобы прокинуть detParseResult.id в runAiBranch (ai_calls.parse_result_id). Теперь ai_calls
+    // пишется на ОТДЕЛЬНОМ соединении пула (см. runAiBranch/client.ts::writeAiCall) — эта строка
+    // ещё не закоммичена на момент AI-вызова, другое соединение (READ COMMITTED) её не увидит,
+    // так что id больше никому не нужен — `.execute()` без `.returning()`.
+    await trx
       .insertInto('parse_results')
       .values({
         message_id: message.id,
@@ -102,15 +107,14 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
         reason: parsed.reason ?? null,
         needs_vision: parsed.needsVision ?? false,
       })
-      .returning('id')
-      .executeTakeFirstOrThrow()
+      .execute()
 
     // AI-ветка (research/ai-layer.md §4/§8/§10/§11, task-4-brief.md): вызываем AI, ТОЛЬКО когда
     // детерминированный адаптер сам не смог построить intent (route==='ai' — терсное/free-form/
     // картинка-only сообщение CH2). CH1 и CH2 A/B/C/D никогда не заходят сюда — деградация AI их
     // не касается (см. runAiBranch — при отказе возвращает null, а не бросает наружу).
-    const aiBranch =
-      parsed.route === 'ai' ? await runAiBranch(trx, message, normalizedText, instruments, channel.adapter_id, detParseResult.id) : null
+    // `db` (родительский пул, НЕ trx) передаётся ЕЩЁ и для ai_calls — см. Minor #4 в runAiBranch.
+    const aiBranch = parsed.route === 'ai' ? await runAiBranch(trx, db, message, normalizedText, instruments, channel.adapter_id) : null
     const aiParsed: ParsedResult | null = aiBranch?.parsed ?? null
     // НАХОДКА приёмки задачи 7 (в дополнение к находке задачи 6): extract_signal ВСЕГДА возвращает
     // `summary` (schema.ts: обязательное поле tool-вызова), но до этой правки пайплайн его нигде
@@ -246,14 +250,25 @@ interface AiBranchResult {
  * (промах) callExtractSignal(Sonnet) -> при needsEscalation ОДНИМ повтором callExtractSignal
  * (Opus) -> putCached финальным (возможно эскалированным) результатом -> normalizeAiOutput ->
  * вторая строка parse_results(parser='ai', prompt_version) для трассировки/UI.
+ *
+ * Minor #4 адверсариального ревью (p2-final-fix-report.md, выбран вариант (а)): `pool` —
+ * родительский НЕтранзакционный Kysely (тот самый `db`, который processMessage получил
+ * аргументом), отдельный от `trx` этого сообщения. ai_calls (учёт стоимости AI-вызова) пишется
+ * ИМЕННО через `pool`, а НЕ через `trx` — упавший insert в ai_calls (напр. временная проблема
+ * БД) не отравляет транзакцию сообщения (PG аварийно завершает только СВОЁ соединение), а сам
+ * учёт стоимости не теряется, если trx сообщения позже откатится по другой причине — деньги на
+ * AI уже потрачены независимо от судьбы этой транзакции. ai_cache (getCached/putCached) и вторая
+ * строка parse_results(parser='ai') ниже остаются на `trx` — это часть детерминированного эффекта
+ * сообщения (либо коммитятся вместе с остальным, либо откатываются вместе), а putCached к тому же
+ * идемпотентен (ON CONFLICT DO NOTHING, cache.ts) и не может отравить транзакцию задвоением ключа.
  */
 async function runAiBranch(
   trx: Kysely<DB>,
+  pool: Kysely<DB>,
   message: PipelineMessage,
   normalizedText: string,
   instruments: InstrumentMap,
   adapterId: string,
-  deterministicParseResultId: string,
 ): Promise<AiBranchResult | null> {
   try {
     const aiContext = await buildContext(trx, {
@@ -277,7 +292,14 @@ async function runAiBranch(
     })
 
     const cacheDb = trx as unknown as Kysely<AiCacheSchema>
-    const callsDb = trx as unknown as Kysely<AiCallsSchema>
+    // Minor #4: ai_calls — на `pool`, НЕ на `trx` (см. комментарий над функцией). Следствие:
+    // ai_calls.parse_result_id для AI-вызовов теперь всегда null — строка parse_results
+    // (parser='deterministic', выше в processMessage) ещё не закоммичена на момент этого вызова
+    // (тот же trx), а `pool` — другое соединение (READ COMMITTED) её не видит; FK на
+    // незакоммиченную строку упал бы. Поле нигде не читается (только пишется) в apps/api|apps/web
+    // (проверено ревью) — потеря линковки безопасна, ai_calls.message_id (FK на УЖЕ закоммиченную
+    // ingest'ом строку messages) остаётся и достаточен для трассировки по сообщению.
+    const callsDb = pool as unknown as Kysely<AiCallsSchema>
 
     let output = await getCached(cacheDb, key)
     if (!output) {
@@ -289,7 +311,6 @@ async function runAiBranch(
         images: aiContext.images,
         db: callsDb,
         messageId: message.id,
-        parseResultId: deterministicParseResultId,
       }
 
       const first = await callExtractSignal({ ...callBase, model: MODEL_SONNET })

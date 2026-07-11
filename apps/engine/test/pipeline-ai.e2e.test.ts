@@ -599,6 +599,18 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
 
 const AI_PROXY_URL = process.env.AI_PROXY_URL ?? 'http://127.0.0.1:8317'
 
+// Important #2 адверсариального ревью (p2-final-fix-report.md): гейт живых AI-тестов ТОЛЬКО на
+// "прокси доступен" означал, что обычный `pnpm test` молча жжёт платный ai-proxy (локальный
+// прокси почти всегда поднят docker compose). Явный opt-in: AI_LIVE_TESTS=1. Без флага —
+// describe.skip с понятным сообщением. Мок-based describe выше ('pipeline — AI-ветка (мок
+// ai-proxy)') сюда НЕ относится — он никогда не ходит в живой ai-proxy (свой http-мок сервер),
+// гейтить его флагом не нужно.
+const AI_LIVE_TESTS = process.env.AI_LIVE_TESTS === '1'
+if (!AI_LIVE_TESTS) {
+  console.warn('[pipeline-ai.e2e.test] живой e2e-тест пропущен; задайте AI_LIVE_TESTS=1 для запуска (жжёт платный ai-proxy)')
+}
+const describeLive = AI_LIVE_TESTS ? describe : describe.skip
+
 async function liveProxyAvailable(): Promise<boolean> {
   try {
     const ctrl = new AbortController()
@@ -616,7 +628,7 @@ async function liveProxyAvailable(): Promise<boolean> {
   }
 }
 
-describe('pipeline — e2e живой ai-proxy (реальные форум-сообщения CH2)', () => {
+describeLive('pipeline — e2e живой ai-proxy (реальные форум-сообщения CH2) — требует AI_LIVE_TESTS=1', () => {
   const CHANNEL_ID = 1962583820 // реальный форум (research/ai-layer.md), тема 173666
   const CHANNEL_ORD = 1
   let available = false
