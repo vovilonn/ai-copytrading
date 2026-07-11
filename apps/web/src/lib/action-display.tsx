@@ -38,3 +38,22 @@ export function getActionIcon(icon: string): LucideIcon {
 export function normalizeTradeRef(ref: string): string {
   return ref.startsWith('#') ? ref : `#${ref}`
 }
+
+// Task 6 (Ф2, task-6-brief.md): причины, которыми reconciler (apps/engine/src/reconciler.ts)
+// помечает исход needs_review (а не обычный business-skip вроде symbol_busy/no_sl) —
+// 'parser_disagreement' (rule 3: детерминированный/AI разбор разошлись), 'ai_unavailable'
+// (деградация ai-proxy), 'low_confidence' (гейт §8/§11), 'needs_human' (дефолт-фолбэк AI-причины).
+// Список вынесен сюда, а не в shared/ — задача работает только в apps/web, skipReason в DTO
+// сейчас просто `string | null`, разбор смысла причины — забота фронта этой задачи.
+const NEEDS_REVIEW_REASONS: ReadonlySet<string> = new Set([
+  'parser_disagreement',
+  'ai_unavailable',
+  'needs_human',
+  'low_confidence',
+])
+
+/** true, если skipReason — один из "требует ручной проверки" исходов реконсилера (needs_review):
+ *  бейдж должен показать текст "Needs review", а не "Skipped" (тот же skipped-стиль, design). */
+export function isNeedsReviewReason(reason: string | null): boolean {
+  return reason !== null && NEEDS_REVIEW_REASONS.has(reason)
+}

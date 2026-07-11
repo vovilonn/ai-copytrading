@@ -8,7 +8,7 @@ import { TableStateRow } from '../components/TableStateRow.js'
 import { Card } from '../components/ui/card.js'
 import { Input } from '../components/ui/input.js'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table.js'
-import { getActionIcon, normalizeTradeRef } from '../lib/action-display.js'
+import { getActionIcon, isNeedsReviewReason, normalizeTradeRef } from '../lib/action-display.js'
 import { apiFetch } from '../lib/api.js'
 import { cn } from '../lib/utils.js'
 import { useActionsStream } from '../lib/ws.js'
@@ -241,7 +241,7 @@ function ActionTableRow({ action, onChannelClick, onTradeClick }: ActionTableRow
             title={action.skipReason}
             className="inline-flex items-center rounded-[5px] bg-skipped-bg px-2 py-[3px] text-[10.5px] font-bold uppercase tracking-[.04em] text-skipped"
           >
-            Skipped
+            {isNeedsReviewReason(action.skipReason) ? 'Needs review' : 'Skipped'}
           </span>
         ) : action.tradeRef ? (
           <button

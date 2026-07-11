@@ -150,6 +150,30 @@ describe('ActionsPage', () => {
     expect(badge).toHaveAttribute('title', 'no_sl')
   })
 
+  // Task 6 (Ф2): needs_review — reconciler.ts помечает исход этими причинами (parser_disagreement/
+  // ai_unavailable/needs_human/low_confidence), design: тот же skipped-стиль, но текст «Needs review».
+  it('task-6: needs_review-причина (parser_disagreement) рендерит бейдж "Needs review" вместо "Skipped"', async () => {
+    renderActions([
+      actionFixture({
+        id: 'a-3',
+        pair: null,
+        tradeRef: null,
+        skipReason: 'parser_disagreement',
+        icon: 'trending-up',
+        iconColor: '#e5e5e5',
+      }),
+    ])
+    const badge = await screen.findByText('Needs review')
+    expect(badge).toHaveAttribute('title', 'parser_disagreement')
+    expect(screen.queryByText('Skipped')).toBeNull()
+  })
+
+  it('task-6: method="ai" рендерит текст "AI parsing" в колонке Method', async () => {
+    renderActions([actionFixture({ method: 'ai' })])
+    await screen.findByText('BTCUSDT')
+    expect(screen.getByText('AI parsing')).toBeInTheDocument()
+  })
+
   it('пустой список рендерит "No actions match the selected filters."', async () => {
     renderActions([])
     expect(await screen.findByText('No actions match the selected filters.')).toBeInTheDocument()

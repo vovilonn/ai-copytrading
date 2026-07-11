@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { actionIconColor, actionSummary } from 'shared/action-meta.js'
 import type { MessageActionDto, MessageDto } from 'shared/dto.js'
-import { getActionIcon, normalizeTradeRef } from '../lib/action-display.js'
+import { getActionIcon, isNeedsReviewReason, normalizeTradeRef } from '../lib/action-display.js'
 import { apiFetch } from '../lib/api.js'
 import { useChannelStream } from '../lib/ws.js'
 
@@ -81,6 +81,14 @@ function MessageRow({ message }: { message: MessageDto }) {
   const hasActions = message.actions.length > 0
   const navigate = useNavigate()
 
+  // Task 6 (Ф2, design/project/Admin.dc.html:220-243,557-559): у сообщений С действиями
+  // AI-саммари рисуется ПОД блоком actions (та же "результат"-панель), но только когда решение
+  // пришло от AI (summaryStyle: `has && isAi && m.summary`) — для method='auto'/'review' саммари
+  // здесь не показывается, даже если backend его когда-нибудь заполнит. У сообщений БЕЗ действий
+  // (commentary) саммари — отдельная note-строка (noteStyle: `!has && m.summary`), метод не важен.
+  const showResultSummary = hasActions && message.method === 'ai' && Boolean(message.aiSummary)
+  const showNoteSummary = !hasActions && Boolean(message.aiSummary)
+
   return (
     <div className="relative flex gap-[18px] pb-[26px]" data-testid="message-row">
       <NodeTile actions={message.actions} />
@@ -96,17 +104,17 @@ function MessageRow({ message }: { message: MessageDto }) {
         ))}
 
         {/* Блок actions (1..N строк, task-11-brief.md — приёмка Ф1): под сигналом видны все
-            распознанные действия сообщения (иконка+тип+пара+ссылка на сделку или Skipped),
-            design/project/Admin.dc.html:214-226. AI-саммари (Ф2) по-прежнему рисуется только
-            для сообщений без действий — CH1 (Ф1) его не производит вовсе. */}
+            распознанные действия сообщения (иконка+тип+пара+ссылка на сделку или Skipped/Needs
+            review), design/project/Admin.dc.html:214-226. */}
         {hasActions ? (
           <div className="mt-[11px] flex flex-col gap-2">
             {message.actions.map((action, i) => (
               <ActionRow key={i} action={action} onTradeClick={(ref) => navigate(`/positions?tr=${encodeURIComponent(ref)}`)} />
             ))}
+            {showResultSummary ? <AiSummary text={message.aiSummary!} variant="result" /> : null}
           </div>
-        ) : message.aiSummary ? (
-          <AiSummary text={message.aiSummary} />
+        ) : showNoteSummary ? (
+          <AiSummary text={message.aiSummary!} variant="note" />
         ) : null}
       </div>
     </div>
@@ -129,7 +137,7 @@ function ActionRow({ action, onTradeClick }: { action: MessageActionDto; onTrade
           title={action.skipReason}
           className="inline-flex items-center rounded-[5px] bg-skipped-bg px-2 py-[3px] text-[10.5px] font-bold uppercase tracking-[.04em] text-skipped"
         >
-          Skipped
+          {isNeedsReviewReason(action.skipReason) ? 'Needs review' : 'Skipped'}
         </span>
       ) : action.tradeRef ? (
         <button
@@ -212,13 +220,34 @@ function MediaTile({ media }: { media: MessageDto['media'][number] }) {
   )
 }
 
-function AiSummary({ text }: { text: string }) {
+// Два варианта геометрии/цвета 1:1 из дизайна:
+// - 'result' — саммари ПОД блоком actions (design:234-237, summaryStyle) — верхняя граница
+//   rgba(255,255,255,.06), паддинг сверху 11px, цвет текста #9a9aa0 (нет точного tailwind-токена —
+//   arbitrary-класс, как и в остальном коде, напр. text-[#d4d4d8] в ActionRow ниже).
+// - 'note' — саммари БЕЗ actions (design:240-243, noteStyle) — просто отступ сверху 11px,
+//   без границы, цвет muted-1 (#6b6b70, уже заведён токеном в tailwind.config.ts).
+function AiSummary({ text, variant }: { text: string; variant: 'result' | 'note' }) {
   return (
-    <div className="mt-[11px] flex items-start gap-2" data-testid="ai-summary">
+    <div
+      className={
+        variant === 'result'
+          ? 'flex items-start gap-2 border-t border-white/[.06] pt-[11px]'
+          : 'mt-[11px] flex items-start gap-2'
+      }
+      data-testid="ai-summary"
+    >
       <span className="flex h-[19px] flex-none items-center">
         <Sparkles size={13} color="#ff8a4d" />
       </span>
-      <span className="text-[12.5px] font-light leading-[1.55] text-muted-1">{text}</span>
+      <span
+        className={
+          variant === 'result'
+            ? 'text-[12.5px] font-light leading-[1.55] text-[#9a9aa0]'
+            : 'text-[12.5px] font-light leading-[1.55] text-muted-1'
+        }
+      >
+        {text}
+      </span>
     </div>
   )
 }

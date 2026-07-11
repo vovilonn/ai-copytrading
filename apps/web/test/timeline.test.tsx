@@ -137,6 +137,54 @@ describe('MessageTimeline', () => {
     expect(summary.querySelector('svg')).not.toBeNull()
   })
 
+  // Task 6 (Ф2): design/project/Admin.dc.html:220-238,557-558 — у сообщений С действиями
+  // AI-саммари рисуется ПОД блоком actions (внутри того же "результата"), но только когда
+  // method==='ai' (summaryStyle: `has && isAi && m.summary`).
+  it('task-6: сообщение с actions, method="ai" и aiSummary рендерит саммари-блок под действиями', async () => {
+    renderTimeline([
+      messageFixture({
+        method: 'ai',
+        aiSummary: 'AI разобрал терсный сигнал по картинке.',
+        actions: [
+          { type: 'open', side: 'long', pair: 'SOLUSDT', tradeRef: '#TR-2001', skipReason: null, icon: 'trending-up' },
+        ],
+      }),
+    ])
+    const row = await screen.findByTestId('timeline-action-row')
+    const summary = await screen.findByTestId('ai-summary')
+    expect(summary).toHaveTextContent('AI разобрал терсный сигнал по картинке.')
+    expect(summary.querySelector('svg')).not.toBeNull()
+    // Саммари должен идти в DOM ПОСЛЕ строки действия (под блоком результата, design:234).
+    expect(row.compareDocumentPosition(summary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('task-6: сообщение с actions и aiSummary при method="auto" НЕ рисует саммари-блок (design: только AI-разбор)', async () => {
+    renderTimeline([
+      messageFixture({
+        method: 'auto',
+        aiSummary: 'Текст, который design не должен показывать для auto.',
+        actions: [
+          { type: 'open', side: 'long', pair: 'BTCUSDT', tradeRef: '#TR-3001', skipReason: null, icon: 'trending-up' },
+        ],
+      }),
+    ])
+    await screen.findByTestId('timeline-action-row')
+    expect(screen.queryByTestId('ai-summary')).toBeNull()
+  })
+
+  it('task-6: action со skipReason="parser_disagreement" рендерит бейдж "Needs review" с тултипом вместо "Skipped"', async () => {
+    renderTimeline([
+      messageFixture({
+        actions: [
+          { type: 'open', side: null, pair: 'ETHUSDT', tradeRef: null, skipReason: 'parser_disagreement', icon: 'trending-up' },
+        ],
+      }),
+    ])
+    const badge = await screen.findByText('Needs review')
+    expect(badge).toHaveAttribute('title', 'parser_disagreement')
+    expect(screen.queryByText('Skipped')).toBeNull()
+  })
+
   it("событие message.new добавляет узел в начало списка без перезагрузки", async () => {
     renderTimeline([messageFixture({ id: 'm-1', text: 'старое сообщение' })])
     await screen.findByText('старое сообщение')
