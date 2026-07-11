@@ -266,7 +266,7 @@ describe('reconcileOnStart', () => {
     const { rest } = makeRest([makePosition({ symbol: 'UNKNOWNUSDT', side: 'Buy', size: '10' })])
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0, reattributedExecutions: 0 })
 
     const audit = await auditLogRows()
     expect(audit).toEqual([{ action: 'unknown_position', entity_id: 'UNKNOWNUSDT' }])
@@ -291,7 +291,7 @@ describe('reconcileOnStart', () => {
     )
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 1, closed: 0, flagged: 0, orphansCancelled: 0 })
+    expect(result).toEqual({ opened: 1, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open')
@@ -324,7 +324,7 @@ describe('reconcileOnStart', () => {
     const { rest } = makeRest([]) // на бирже вообще ничего не открыто
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 1, flagged: 0, orphansCancelled: 0 })
+    expect(result).toEqual({ opened: 0, closed: 1, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
 
     const liveTrade = await db.selectFrom('trades').selectAll().where('id', '=', live.tradeId).executeTakeFirstOrThrow()
     expect(liveTrade.status).toBe('closed')
@@ -369,7 +369,7 @@ describe('reconcileOnStart', () => {
     ])
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open') // статус не тронут
@@ -412,7 +412,7 @@ describe('reconcileOnStart', () => {
     ])
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0, reattributedExecutions: 0 })
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open') // не закрыт — позиция формально существует на символе
@@ -441,7 +441,7 @@ describeLive('reconcileOnStart (живой testnet) — требует BYBIT_LIV
 
     const result = await reconcileOnStart(db, client)
     console.log('[live] reconcileOnStart() =', JSON.stringify(result))
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
   })
 })
 
@@ -485,5 +485,67 @@ describe('reconcileOnStart — M1 (Minor адверсариального рев
     const result = await reconcileOnStart(db, rest)
 
     expect(result.orphansCancelled).toBe(0)
+  })
+})
+
+// I1 (Important финального ревью Ф3): гонка атрибуции executions -> realized_pnl занижается
+// безвозвратно. Market-ордер уходит на биржу ВНУТРИ ещё не закоммиченной транзакции
+// pipeline.ts::placeEntry/closePosition — исполнение занимает миллисекунды, приватный WS
+// (applyExecutionPush, ОТДЕЛЬНОЕ соединение, READ COMMITTED) не видит незакоммиченную строку
+// `orders` -> вставляет execution "осиротевшим" (order_id/trade_id/leg_id=null), который НИКОГДА
+// не попадает в SUM(exec_pnl) при пересчёте trades.realized_pnl. К моменту reconcileOnStart (10
+// мин интервал, main.ts) строка orders уже точно закоммичена — переатрибуция по order_link_id
+// самоисцеляет журнал в пределах этого окна.
+describe('reconcileOnStart — I1 (Important финального ревью Ф3): переатрибуция осиротевших execution', () => {
+  it('execution с order_link_id существующего ордера, но order_id=null -> привязан к order/trade/leg, realized_pnl сделки пересчитан; повторный reconcile идемпотентен', async () => {
+    const seeded = await seedTrade({ symbol: 'ORPHEXECUSDT', side: 'long', live: true, status: 'closed', acquireOwnership: false })
+
+    const orderRow = await db
+      .selectFrom('orders')
+      .select(['id', 'trade_id', 'leg_id'])
+      .where('order_link_id', '=', seeded.orderLinkId)
+      .executeTakeFirstOrThrow()
+
+    await db
+      .insertInto('executions')
+      .values({
+        order_id: null,
+        trade_id: null,
+        leg_id: null,
+        bybit_exec_id: 'exec-orphan-1',
+        order_link_id: seeded.orderLinkId,
+        symbol: 'ORPHEXECUSDT',
+        side: 'long',
+        exec_qty: '1',
+        exec_price: '100',
+        exec_pnl: '12.5',
+        exec_ts: new Date(),
+      })
+      .execute()
+
+    const { rest } = makeRest([]) // позиций на бирже нет — трогает только Шаг В (переатрибуция), не А/Б
+
+    const result = await reconcileOnStart(db, rest)
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 1 })
+
+    const execution = await db
+      .selectFrom('executions')
+      .selectAll()
+      .where('bybit_exec_id', '=', 'exec-orphan-1')
+      .executeTakeFirstOrThrow()
+    expect(execution.order_id).toBe(orderRow.id)
+    expect(execution.trade_id).toBe(seeded.tradeId)
+    expect(execution.leg_id).toBe(orderRow.leg_id)
+
+    const trade = await db.selectFrom('trades').select('realized_pnl').where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
+    expect(new Decimal(trade.realized_pnl).toString()).toBe('12.5')
+
+    // Идемпотентность: повторный reconcile не ломает уже привязанные строки (WHERE order_id IS
+    // NULL исключает их) — счётчик 0, realized_pnl не портится повторным пересчётом.
+    const second = await reconcileOnStart(db, rest)
+    expect(second).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
+
+    const tradeAfterSecond = await db.selectFrom('trades').select('realized_pnl').where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
+    expect(new Decimal(tradeAfterSecond.realized_pnl).toString()).toBe('12.5')
   })
 })

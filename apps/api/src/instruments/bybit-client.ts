@@ -4,7 +4,10 @@ import type { Network } from 'shared/domain.js'
 // нужен (docs/superpowers/research/bybit-execution.md §7). Раздельные хосты по сети — testnet
 // и mainnet держат независимые листинги/лимиты (§13 того же дока). 'demo' (p3-task6-demo) —
 // Bybit DEMO TRADING, публичные market-эндпоинты на api-demo.bybit.com проверены вживую (retCode=0).
-const HOSTS: Record<Network, string> = {
+// Экспортирован (I2 финального ревью Ф3): instruments.e2e.test.ts бьёт пробой доступности сети
+// в хост АКТИВНОЙ сети (а не хардкод testnet) — тот же приём DRY, что и engine/bybit/rest-client.ts
+// (там HOSTS экспортирован для live-e2e.test.ts).
+export const HOSTS: Record<Network, string> = {
   testnet: 'https://api-testnet.bybit.com',
   mainnet: 'https://api.bybit.com',
   demo: 'https://api-demo.bybit.com',

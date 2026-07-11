@@ -448,6 +448,23 @@ export async function applyPositionPush(
 }
 
 /**
+ * Пересчитывает `trades.realized_pnl` как сумму `exec_pnl` всех исполнений сделки — единственная
+ * формула в live-режиме (I1 финального ревью Ф3: вынесена из applyExecutionPush в отдельную
+ * функцию, чтобы reconcile.ts::reconcileOnStart мог пересчитать PnL переатрибутированных
+ * "осиротевших" execution той же логикой, не дублируя её).
+ */
+export async function recalcTradeRealizedPnl(trx: Kysely<DB>, tradeId: string): Promise<void> {
+  const { rows } = await sql<{ total: string }>`
+    SELECT COALESCE(SUM(exec_pnl), 0)::text AS total FROM executions WHERE trade_id = ${tradeId}::uuid
+  `.execute(trx)
+  await trx
+    .updateTable('trades')
+    .set({ realized_pnl: rows[0]?.total ?? '0', updated_at: new Date() })
+    .where('id', '=', tradeId)
+    .execute()
+}
+
+/**
  * Применяет один пуш `execution.linear`: идемпотентная вставка `executions` по `bybit_exec_id`
  * (UNIQUE), атрибуция к ордеру/сделке/леге по `orderLinkId`, пересчёт `trades.realized_pnl` как
  * суммы `exec_pnl` всех исполнений сделки (единственный писатель этого поля в live-режиме).
@@ -495,14 +512,7 @@ export async function applyExecutionPush(db: Kysely<DB>, push: ExecutionPush): P
     inserted = true
 
     if (order?.trade_id) {
-      const { rows } = await sql<{ total: string }>`
-        SELECT COALESCE(SUM(exec_pnl), 0)::text AS total FROM executions WHERE trade_id = ${order.trade_id}::uuid
-      `.execute(trx)
-      await trx
-        .updateTable('trades')
-        .set({ realized_pnl: rows[0]?.total ?? '0', updated_at: new Date() })
-        .where('id', '=', order.trade_id)
-        .execute()
+      await recalcTradeRealizedPnl(trx, order.trade_id)
     }
   })
 

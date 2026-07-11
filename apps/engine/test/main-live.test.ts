@@ -194,8 +194,8 @@ describe('initLiveRuntime — EXECUTION_MODE=live: реконсиляция -> �
     // Реконсиляция реально вызвана (§14: "при старте" — до подъёма пайплайна).
     expect(calls).toContain('getPositions')
     expect(calls).toContain('getOpenOrders')
-    // Пустой журнал/аккаунт -> 0/0/0/0 (тот же контракт, что и живая проверка на testnet).
-    expect(runtime.reconcileResult).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0 })
+    // Пустой журнал/аккаунт -> всё по нулям (тот же контракт, что и живая проверка на testnet).
+    expect(runtime.reconcileResult).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
     // Фабрика createExecutionPort('live', ...) действительно дала BybitAdapter.
     expect(runtime.executionPort).toBeInstanceOf(BybitAdapter)
     // Приватный WS сконструирован (готов к .start()), но НЕ подключается сам по себе —

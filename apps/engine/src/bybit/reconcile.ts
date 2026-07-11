@@ -27,6 +27,7 @@ import type { DB } from 'api/db/database.js'
 import type { Side, TradeStatus } from 'shared/domain.js'
 import { acquireSymbol, closeTrade } from '../state/trades.js'
 import { emitPositionUpsert } from '../pipeline.js'
+import { recalcTradeRealizedPnl } from './private-ws.js'
 import type { BybitRestClient, Order, Position } from './rest-client.js'
 
 /** Узкий срез BybitRestClient — тот же приём, что и BybitAdapterRestClient/BybitPrivateWsRestClient:
@@ -52,6 +53,17 @@ export interface ReconcileResult {
    * — очистка происходит обоими путями, отдельного механизма не требуется.
    */
   orphansCancelled: number
+  /**
+   * Important I1 финального ревью Ф3: `executions`, вставленные приватным WS ДО коммита строки
+   * `orders` тем же order_link_id (гонка транзакций — market-ордер уходит на биржу изнутри ещё
+   * не закоммиченной транзакции pipeline.ts, а execution с отдельного WS-соединения в READ
+   * COMMITTED её не видит) — "осиротевшие" (order_id/trade_id/leg_id=null). К моменту
+   * reconcileOnStart строка orders уже точно закоммичена — переатрибутированы по order_link_id,
+   * realized_pnl затронутых сделок пересчитан той же формулой, что applyExecutionPush
+   * (recalcTradeRealizedPnl). Самоисцеление в пределах RECONCILE_INTERVAL_MS (10 мин, та же
+   * периодичность, что и orphansCancelled выше).
+   */
+  reattributedExecutions: number
 }
 
 // execution/order-link-id.ts::MODE_PREFIX.live — не экспортирован оттуда (сознательно не трогаем
@@ -96,6 +108,7 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
   let opened = 0
   let closed = 0
   let flagged = 0
+  let reattributedExecutions = 0
 
   await db.transaction().execute(async (trx) => {
     const localLiveTrades = await trx
@@ -175,9 +188,12 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
       await zeroPositionRow(trx, t.channel_id, t.symbol)
       closed++
     }
+
+    // --- Шаг В (I1 финального ревью Ф3): переатрибуция осиротевших execution. ---
+    reattributedExecutions = await reattributeOrphanedExecutions(trx)
   })
 
-  // --- Шаг В (M1, Minor адверсариального ревью): осиротевшие reduceOnly-остатки — ПОСЛЕ коммита
+  // --- Шаг Г (M1, Minor адверсариального ревью): осиротевшие reduceOnly-остатки — ПОСЛЕ коммита
   // транзакции, тот же приём "сеть не держит транзакцию БД", что и cancelAll в
   // private-ws.ts::applyPositionPush. Только reduceOnly (TP/SL/close) — entry/add лимитки того
   // же "бессимвольного" положения НЕ трогаем, они законно ждут первого филла.
@@ -195,7 +211,7 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
     }
   }
 
-  return { opened, closed, flagged, orphansCancelled }
+  return { opened, closed, flagged, orphansCancelled, reattributedExecutions }
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +337,41 @@ async function zeroPositionRow(trx: Kysely<DB>, channelId: number, symbol: strin
     .returning('symbol')
     .executeTakeFirst()
   if (updated) await emitPositionUpsert(trx, channelId, symbol)
+}
+
+/**
+ * Шаг В (I1 финального ревью Ф3): переатрибуция "осиротевших" execution — вставленных приватным
+ * WS (private-ws.ts::applyExecutionPush) раньше, чем закоммитилась строка `orders` того же
+ * order_link_id (гонка: market-ордер уходит на биржу ВНУТРИ ещё не закоммиченной транзакции
+ * pipeline.ts::placeEntry/closePosition, исполнение — миллисекунды, а WS-обработчик на отдельном
+ * соединении в READ COMMITTED не видит незакоммиченную строку `orders` и вставляет execution с
+ * order_id/trade_id/leg_id=null). К моменту reconcileOnStart (10 мин интервал) строка `orders`
+ * уже точно закоммичена — привязываем по order_link_id (UPDATE ... FROM, тот же паттерн, что и
+ * остальные "сырые" JOIN-запросы этого модуля) и пересчитываем `trades.realized_pnl` каждой
+ * затронутой сделки той же формулой, что applyExecutionPush (recalcTradeRealizedPnl — не
+ * дублируем). Идемпотентно: `WHERE executions.order_id IS NULL` — уже привязанные строки
+ * (order_id заполнен) повторный запуск не трогает.
+ */
+async function reattributeOrphanedExecutions(trx: Kysely<DB>): Promise<number> {
+  const rows = await trx
+    .updateTable('executions')
+    .from('orders')
+    .set((eb) => ({
+      order_id: eb.ref('orders.id'),
+      trade_id: eb.ref('orders.trade_id'),
+      leg_id: eb.ref('orders.leg_id'),
+    }))
+    .whereRef('executions.order_link_id', '=', 'orders.order_link_id')
+    .where('executions.order_id', 'is', null)
+    .returning('executions.trade_id as tradeId')
+    .execute()
+
+  const affectedTradeIds = [...new Set(rows.map((r) => r.tradeId).filter((id): id is string => id !== null))]
+  for (const tradeId of affectedTradeIds) {
+    await recalcTradeRealizedPnl(trx, tradeId)
+  }
+
+  return rows.length
 }
 
 /** `audit_log` (миграция 001) существует, но не типизирован в Kysely DB (см. комментарий

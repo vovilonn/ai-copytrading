@@ -180,7 +180,8 @@ export async function initLiveRuntime(
   const reconcileResult = await reconcileOnStart(db, rest)
   console.log(
     `[engine] reconcileOnStart: opened=${reconcileResult.opened} closed=${reconcileResult.closed} ` +
-      `flagged=${reconcileResult.flagged} orphansCancelled=${reconcileResult.orphansCancelled}`,
+      `flagged=${reconcileResult.flagged} orphansCancelled=${reconcileResult.orphansCancelled} ` +
+      `reattributedExecutions=${reconcileResult.reattributedExecutions}`,
   )
   const privateWs = new BybitPrivateWs({ apiKey: keys.apiKey, apiSecret: keys.apiSecret, network, db, rest })
   const executionPort = createExecutionPort('live', { rest, network })
@@ -376,7 +377,8 @@ async function main(): Promise<void> {
         .then((result) =>
           console.log(
             `[engine] периодическая реконсиляция: opened=${result.opened} closed=${result.closed} ` +
-              `flagged=${result.flagged} orphansCancelled=${result.orphansCancelled}`,
+              `flagged=${result.flagged} orphansCancelled=${result.orphansCancelled} ` +
+              `reattributedExecutions=${result.reattributedExecutions}`,
           ),
         )
         .catch((err) => console.error('[engine] периодическая реконсиляция:', err))
