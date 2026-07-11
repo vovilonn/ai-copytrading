@@ -77,8 +77,14 @@ export interface BuildUserTurnParams {
   images: PromptImage[]
 }
 
-/** Сериализует одну позицию в порядок ключей §4.4 (sym/side/legs/avg_entry/sl/tps_left/opened). */
-function serializeOpenPosition(p: OpenPositionSummary): Record<string, unknown> {
+/**
+ * Сериализует одну позицию в порядок ключей §4.4 (sym/side/legs/avg_entry/sl/tps_left/opened).
+ * Экспортирована (не только для buildUserTurn ниже): ai/context.ts (задача 2, hashOpenPositions)
+ * хэширует ТУ ЖЕ каноническую форму, что здесь уходит в промпт модели — это принципиально
+ * (research §10: "hash(open_positions_snapshot)" в ключе кэша обязан отражать РОВНО то, что видит
+ * модель, иначе два разных промпта могут схлопнуться в один кэш-ключ или наоборот).
+ */
+export function serializeOpenPosition(p: OpenPositionSummary): Record<string, unknown> {
   const row: Record<string, unknown> = {
     sym: p.sym,
     side: p.side,

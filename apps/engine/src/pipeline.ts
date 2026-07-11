@@ -729,6 +729,11 @@ async function handleEntrySignal(
 // Приоритет для поля `type` итоговой actions-строки, когда intent несёт НЕСКОЛЬКО ops разом
 // (напр. R2 "MET:{fix,close}" — событие partial_close и команда close_remainder одновременно):
 // команды важнее событий, close_remainder — самый весомый исход (сделка закрылась).
+// tp_set/cancel_pending — новые Ф2-варианты (задача 2, AI-канал, normalize-output.ts): вставлены
+// НИЖЕ Ф1-набора по значимости (обновление TP-лесенки/отмена pending-ордера — не так критичны,
+// как факт закрытия/SL), сам пайплайн-обработчик появится в задаче 4 (handleDelta их пока не
+// исполняет — см. switch(op.op) ниже, где default-ветки для них нет, это осознанно вне
+// границ этой задачи).
 const OP_PRIORITY: readonly DeltaOp['op'][] = [
   'close_remainder',
   'sl_breakeven',
@@ -737,6 +742,8 @@ const OP_PRIORITY: readonly DeltaOp['op'][] = [
   'tp_hit',
   'sl_hit',
   'partial_close',
+  'tp_set',
+  'cancel_pending',
   'hold',
 ]
 
@@ -748,6 +755,8 @@ const OP_TYPE: Readonly<Record<DeltaOp['op'], ActionType>> = {
   tp_hit: 'tp_hit',
   sl_hit: 'sl_hit',
   partial_close: 'partial_close',
+  tp_set: 'modify_tp',
+  cancel_pending: 'cancel_order',
   hold: 'hold',
 }
 

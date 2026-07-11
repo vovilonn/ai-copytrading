@@ -72,14 +72,31 @@ export type ParsedIntent =
   | { kind: 'add'; symbol: string; price?: number } // доливка (реш. #6)
   | { kind: 'delta'; symbol: string | null; ops: DeltaOp[]; targetTradeId?: string } // R3/R4/D/E
 
+// Ф2 (задача 2, normalize-output.ts) добавила 3 варианта поверх Ф1-набора — AI-канал (CH2)
+// покрывает case'ы, которых нет у детерминированного CH1: «скинул один объём» (единица объёма,
+// не доля — value НЕ вычисляем здесь, реальное qty подставит пайплайн, задача 4), явную
+// AI-лесенку новых TP-целей (modify_tp) и отмену ЕЩЁ НЕ исполненного лимитного входа/добора
+// (cancel_order на pending-ордер — семантически ДРУГОЕ действие, чем sl_cancel, который снимает
+// уже выставленный стоп; смешивать их пайплайн (task-7-brief.md handleDelta ищет purpose='sl')
+// нельзя — привело бы к попытке отменить SL вместо висящего лимитника).
 export type DeltaOp =
   | { op: 'tp_hit'; index?: number }
-  | { op: 'partial_close'; fraction?: number }
+  // unit:'one_unit' — «скинул один объём»/«закрыл один объём» (research/ai-layer.md §3): AI НЕ
+  // считает, какая это доля — единицу объёма (одну добор-легу) находит пайплайн по состоянию
+  // сделки. basis — origin CloseAmountSpec.basis ('original'|'remaining'), 'unknown' не сохраняем
+  // (эквивалентно отсутствию поля — решение пайплайна по умолчанию).
+  | { op: 'partial_close'; fraction?: number; unit?: 'one_unit'; basis?: 'original' | 'remaining' }
   | { op: 'close_remainder' }
   | { op: 'sl_breakeven' }
   | { op: 'sl_hit' }
   | { op: 'sl_set'; price: number }
   | { op: 'sl_cancel' }
+  // Новые цели TP (modify_tp) — каждая цель либо число, либо символьный маркер 'current_price'
+  // (LLM не считает арифметику, research §3/§10) — value/marker взаимоисключающие, оба опциональны.
+  | { op: 'tp_set'; targets: Array<{ value?: number; marker?: 'current_price' }> }
+  // cancel_order (extract_signal.actions[].type) — отмена ЕЩЁ НЕ исполненного pending-ордера
+  // (лимитный вход/добор), НЕ путать с sl_cancel (снятие уже выставленного стоп-лосса).
+  | { op: 'cancel_pending' }
   | { op: 'hold' }
 
 export interface ParsedResult {
