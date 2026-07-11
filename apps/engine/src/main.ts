@@ -121,6 +121,40 @@ export interface LiveRuntime {
   reconcileResult: ReconcileResult
 }
 
+/** Минимальный контракт rest-клиента, нужный `createMarkPriceGetter` — тестируется мок-объектом
+ *  без реального `BybitRestClient` (тот же приём, что `BybitAdapterRestClient`/`ReconcileRestClient`). */
+export interface MarkPriceRestClient {
+  getTicker(symbol: string): Promise<{ markPrice: string; lastPrice: string }>
+}
+
+/**
+ * Фикс p3-slippage-fix (Important, найден e2e): живой mark price для гейта staleness/slippage I2
+ * (pipeline.ts::handleEntrySignal) — берётся из ПУБЛИЧНОГО тикера `GET /v5/market/tickers`
+ * (rest-client.ts::getTicker), а НЕ из стаб-позиции `position/list`. Стаб-позиция при size=0
+ * несёт markPrice ТОЛЬКО если на аккаунте когда-либо была история по символу — на "холодном"
+ * testnet-аккаунте без прежних позиций возвращает `markPrice=""` (LOOP_STATE.md, находка
+ * предыдущего лупа), из-за чего гейт молча fail-open на первом входе по любому новому символу.
+ * Публичный тикер не зависит от истории аккаунта — всегда несёт актуальную цену торгуемого
+ * символа, ключ/подпись не нужны (rest-client.ts::publicGet).
+ *
+ * Возвращает `null` ТОЛЬКО при полном сбое (сеть/исключение/пустые markPrice И lastPrice) —
+ * pipeline.ts теперь трактует `null` как fail-CLOSED (skip `mark_price_unavailable`), а не
+ * fail-open: если мы не можем достоверно узнать текущую цену, вход по протухшему сигналу
+ * опаснее, чем пропущенный вход (design spec: "не входить вслепую").
+ */
+export function createMarkPriceGetter(rest: MarkPriceRestClient): (symbol: string) => Promise<string | null> {
+  return async (symbol: string): Promise<string | null> => {
+    try {
+      const ticker = await rest.getTicker(symbol)
+      const price = ticker.markPrice || ticker.lastPrice
+      return price ? price : null
+    } catch (err) {
+      console.error(`[engine] getMarkPrice(${symbol}) для гейта slippage:`, err)
+      return null
+    }
+  }
+}
+
 /**
  * Единая точка ветвления EXECUTION_MODE внутри main.ts (design spec §14: "EXECUTION_MODE —
  * единственная точка ветвления... никаких if(dryRun) по коду"): main() (ниже) — ЕДИНСТВЕННЫЙ
@@ -206,8 +240,11 @@ async function main(): Promise<void> {
   let liveRest: BybitRestClient | null = null
   let privateWs: BybitPrivateWs | null = null
   let initialEquity = DRY_RUN_EQUITY
-  // Important I2: undefined в dry_run — pipeline.ts::handleEntrySignal делает гейт fail-open,
-  // если это поле не задано (нет сети в dry_run, тот же принцип, что и initialEquity выше).
+  // Important I2: undefined в dry_run — гейт в pipeline.ts::handleEntrySignal вообще не
+  // вызывается, если это поле не задано (нет сети в dry_run, тот же принцип, что и initialEquity
+  // выше) — это единственный fail-open случай. В live поле ВСЕГДА задано (createMarkPriceGetter
+  // ниже); если сам вызов вернёт null (сбой похода за ценой) — фикс p3-slippage-fix делает гейт
+  // fail-CLOSED (pipeline.ts: skip mark_price_unavailable), а не fail-open.
   let getMarkPrice: PipelineDeps['getMarkPrice']
 
   if (config.executionMode === 'live') {
@@ -223,20 +260,11 @@ async function main(): Promise<void> {
     initialEquity = (await getEquity(liveRest)).toString()
     console.log(`[engine] equity (wallet-balance totalEquity): ${initialEquity}`)
 
-    // Important I2: живой mark price по символу — `position/list` возвращает стаб-позицию с
-    // markPrice ДАЖЕ при size=0 (research §1, подтверждено live-тестом bybit-rest.test.ts) —
-    // не нужен отдельный ticker-эндпоинт. Сбой похода за ценой -> null -> гейт fail-open
-    // (pipeline.ts), не блокирует вход из-за временной сетевой проблемы самого гейта.
-    const rest = liveRest
-    getMarkPrice = async (symbol: string): Promise<string | null> => {
-      try {
-        const positions = await rest.getPositions(symbol)
-        return positions[0]?.markPrice ?? null
-      } catch (err) {
-        console.error(`[engine] getMarkPrice(${symbol}) для гейта slippage:`, err)
-        return null
-      }
-    }
+    // Important I2 / фикс p3-slippage-fix: живой mark price — публичный тикер (createMarkPriceGetter
+    // выше), не стаб-позиция `position/list` (та отдаёт markPrice="" на аккаунте без истории по
+    // символу — см. комментарий над createMarkPriceGetter). Сбой похода за ценой -> null -> гейт
+    // теперь fail-CLOSED (pipeline.ts: skip mark_price_unavailable), не fail-open.
+    getMarkPrice = createMarkPriceGetter(liveRest)
   } else {
     executionPort = createExecutionPort('dry_run')
   }

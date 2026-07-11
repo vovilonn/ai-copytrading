@@ -63,6 +63,38 @@ describeLive('BybitRestClient (живой testnet) — требует BYBIT_LIVE
     expect(result.ok).toBe(true)
     expect(result.idempotent).toBe(true)
   })
+
+  // Фикс p3-slippage-fix (Important, найден e2e): живая проверка — публичный тикер отдаёт
+  // непустые markPrice/lastPrice ДАЖЕ на аккаунте без истории позиций по символу (в отличие от
+  // стаб-позиции getPositions, см. LOOP_STATE.md находка предыдущего лупа) — источник цены для
+  // гейта slippage/staleness I2 (main.ts::createMarkPriceGetter). НЕ ставит ордеров — read-only.
+  it('getTicker(SOLUSDT)/getTicker(BTCUSDT) → непустые markPrice/lastPrice (публичный, ключ не нужен для этого запроса)', async () => {
+    const sol = await client.getTicker('SOLUSDT')
+    console.log('[live] getTicker(SOLUSDT) =', JSON.stringify(sol))
+    expect(sol.symbol).toBe('SOLUSDT')
+    expect(sol.markPrice).not.toBe('')
+    expect(Number(sol.markPrice)).toBeGreaterThan(0)
+    expect(sol.lastPrice).not.toBe('')
+    expect(Number(sol.lastPrice)).toBeGreaterThan(0)
+
+    const btc = await client.getTicker('BTCUSDT')
+    console.log('[live] getTicker(BTCUSDT) =', JSON.stringify(btc))
+    expect(btc.symbol).toBe('BTCUSDT')
+    expect(btc.markPrice).not.toBe('')
+    expect(Number(btc.markPrice)).toBeGreaterThan(0)
+    expect(btc.lastPrice).not.toBe('')
+    expect(Number(btc.lastPrice)).toBeGreaterThan(0)
+  })
+
+  it('getTicker работает БЕЗ валидных ключей (публичный эндпоинт, подтверждает, что подпись не требуется)', async () => {
+    // Отдельный клиент с заведомо мусорными ключами — если бы getTicker подписывал запрос своим
+    // (неверным) ключом, Bybit отверг бы его ошибкой аутентификации. Успех здесь доказывает, что
+    // publicGet() действительно не отправляет X-BAPI-* заголовки на этот эндпоинт.
+    const anonClient = new BybitRestClient({ apiKey: 'not-a-real-key', apiSecret: 'not-a-real-secret', network: 'testnet' })
+    const ticker = await anonClient.getTicker('SOLUSDT')
+    console.log('[live] getTicker(SOLUSDT) без валидных ключей =', JSON.stringify(ticker))
+    expect(Number(ticker.markPrice)).toBeGreaterThan(0)
+  })
 })
 
 describe('signPayload (HMAC-подпись) — детерминизм', () => {
@@ -271,6 +303,39 @@ describe('BybitRestClient — идемпотентные/ошибочные retC
         () => client.cancelOrder({ symbol: 'BTCUSDT', orderLinkId: 'K01-1-00-E0' }),
       ),
     ).rejects.toMatchObject({ retCode: 10001 })
+  })
+
+  it('getTicker: publicGet НЕ добавляет X-BAPI-* заголовки (публичный эндпоинт, без подписи/ключа)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    let capturedHeaders: Record<string, string> | undefined
+    let capturedUrl: string | undefined
+    const ticker = await withMockFetch(
+      (async (url: unknown, init?: RequestInit) => {
+        capturedUrl = String(url)
+        capturedHeaders = { ...(init?.headers as Record<string, string>) }
+        return mockResponse({
+          retCode: 0,
+          retMsg: 'OK',
+          result: { category: 'linear', list: [{ symbol: 'SOLUSDT', lastPrice: '150.5', markPrice: '150.6' }] },
+        })
+      }) as typeof fetch,
+      () => client.getTicker('SOLUSDT'),
+    )
+    expect(ticker).toEqual({ symbol: 'SOLUSDT', lastPrice: '150.5', markPrice: '150.6' })
+    expect(capturedUrl).toContain('/v5/market/tickers?category=linear&symbol=SOLUSDT')
+    expect(capturedHeaders).not.toHaveProperty('X-BAPI-API-KEY')
+    expect(capturedHeaders).not.toHaveProperty('X-BAPI-SIGN')
+    expect(capturedHeaders).not.toHaveProperty('X-BAPI-TIMESTAMP')
+  })
+
+  it('getTicker: пустой list (символ не найден) → бросает явную ошибку, не тихий undefined', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    await expect(
+      withMockFetch(
+        (async () => mockResponse({ retCode: 0, retMsg: 'OK', result: { category: 'linear', list: [] } })) as typeof fetch,
+        () => client.getTicker('NOSUCHUSDT'),
+      ),
+    ).rejects.toThrow(/пустой list/)
   })
 
   it('retCode 10006 (rate limit UID) → ждёт до X-Bapi-Limit-Reset-Timestamp и повторяет успешно', async () => {

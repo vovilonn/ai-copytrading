@@ -221,6 +221,19 @@ export interface Position {
   seq: number
 }
 
+/**
+ * `GET /v5/market/tickers` (публичный, без ключа/подписи) — фикс p3-slippage-fix: источник живого
+ * mark price для гейта slippage/staleness (Important I2), НЕ зависящий от истории позиций
+ * аккаунта (в отличие от стаб-позиции `position/list`, см. LOOP_STATE.md находка предыдущего
+ * лупа: `markPrice=""` на "холодном" символе). Bybit всегда отдаёт непустые `markPrice`/
+ * `lastPrice` для любого торгуемого символа category=linear.
+ */
+export interface Ticker {
+  symbol: string
+  lastPrice: string
+  markPrice: string
+}
+
 /** `GET /v5/order/realtime` (research §9/§14). */
 export interface Order {
   orderId: string
@@ -324,41 +337,60 @@ export class BybitRestClient {
   }
 
   private async signedGet<T>(path: string, params: Record<string, string | number | boolean | undefined> = {}): Promise<T> {
-    return this.execute<T>('GET', path, params)
+    return this.execute<T>('GET', path, params, { signed: true })
   }
 
   private async signedPost<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
-    return this.execute<T>('POST', path, body)
+    return this.execute<T>('POST', path, body, { signed: true })
   }
 
   /**
-   * Один подписанный вызов Bybit с ретраями (research §10):
+   * GET без HMAC-подписи/ключа — публичные market-эндпоинты Bybit V5 (research: `/v5/market/*`
+   * не требуют аутентификации). Используется getTicker (фикс p3-slippage-fix, LOOP_STATE.md
+   * находка: стаб-позиция `position/list` при size=0 может отдавать пустой markPrice на
+   * аккаунте без истории по символу — публичный тикер не зависит от истории аккаунта вовсе).
+   */
+  private async publicGet<T>(path: string, params: Record<string, string | number | boolean | undefined> = {}): Promise<T> {
+    return this.execute<T>('GET', path, params, { signed: false })
+  }
+
+  /**
+   * Один вызов Bybit с ретраями (research §10):
    *  - токен-бакет (GET/мутации раздельно) перед КАЖДОЙ попыткой, включая повторные;
    *  - 10006/10018 (rate limit) → ждать до `X-Bapi-Limit-Reset-Timestamp` (+backoff), ретрай;
    *  - сетевые сбои/таймаут/не-2xx HTTP → backoff-ретрай;
    *  - прочий ненулевой retCode (включая 110043/110072/110025) → бросить BybitApiError НЕМЕДЛЕННО,
    *    без ретрая — конкретный публичный метод (setLeverage/createOrder/switchMode) решает,
    *    идемпотентный ли это успех.
+   *  - `opts.signed` (дефолт true) — публичные market-эндпоинты (getTicker) идут без HMAC-подписи
+   *    и без ключа вовсе (заголовки X-BAPI-* не добавляются) — путь `signedGet`/`signedPost`
+   *    не затронут, оба по-прежнему подписывают запрос.
    */
-  private async execute<T>(method: HttpMethod, path: string, params: Record<string, unknown>): Promise<T> {
+  private async execute<T>(
+    method: HttpMethod,
+    path: string,
+    params: Record<string, unknown>,
+    opts: { signed: boolean },
+  ): Promise<T> {
     const bucket = method === 'GET' ? this.getBucket : this.mutateBucket
     let lastError: Error | null = null
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       await bucket.take()
 
-      const timestamp = String(Date.now())
       const isGet = method === 'GET'
       const queryString = isGet ? buildQueryString(params as Record<string, string | number | boolean | undefined>) : ''
       const jsonBody = isGet ? '' : JSON.stringify(params)
       const url = `${this.host}${path}${isGet && queryString ? `?${queryString}` : ''}`
-      const signature = signPayload(this.apiSecret, timestamp, this.apiKey, RECV_WINDOW, isGet ? queryString : jsonBody)
 
-      const headers: Record<string, string> = {
-        'X-BAPI-API-KEY': this.apiKey,
-        'X-BAPI-TIMESTAMP': timestamp,
-        'X-BAPI-RECV-WINDOW': RECV_WINDOW,
-        'X-BAPI-SIGN': signature,
+      const headers: Record<string, string> = {}
+      if (opts.signed) {
+        const timestamp = String(Date.now())
+        const signature = signPayload(this.apiSecret, timestamp, this.apiKey, RECV_WINDOW, isGet ? queryString : jsonBody)
+        headers['X-BAPI-API-KEY'] = this.apiKey
+        headers['X-BAPI-TIMESTAMP'] = timestamp
+        headers['X-BAPI-RECV-WINDOW'] = RECV_WINDOW
+        headers['X-BAPI-SIGN'] = signature
       }
       if (!isGet) headers['Content-Type'] = 'application/json'
 
@@ -446,6 +478,20 @@ export class BybitRestClient {
     else params.settleCoin = 'USDT'
     const result = await this.signedGet<{ list: Order[] }>('/v5/order/realtime', params)
     return result.list
+  }
+
+  /**
+   * `GET /v5/market/tickers category=linear symbol=<S>` — публичный (без ключа/подписи), фикс
+   * p3-slippage-fix. Источник mark price для гейта I2 вместо стаб-позиции `getPositions` (та
+   * возвращает `markPrice=""` на аккаунте без истории по символу, см. Ticker выше). Бросает,
+   * если Bybit вернул пустой `list` (символ не найден на бирже) — вызывающая сторона
+   * (main.ts::createMarkPriceGetter) ловит это как сбой похода за ценой -> null -> гейт fail-closed.
+   */
+  async getTicker(symbol: string): Promise<Ticker> {
+    const result = await this.publicGet<{ list: Ticker[] }>('/v5/market/tickers', { category: 'linear', symbol })
+    const ticker = result.list[0]
+    if (!ticker) throw new Error(`getTicker(${symbol}): Bybit вернул пустой list`)
+    return ticker
   }
 
   /** `GET /v5/execution/list category=linear` (research §11/§14: атрибуция филлов по orderLinkId). */

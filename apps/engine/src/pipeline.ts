@@ -70,9 +70,12 @@ export interface PipelineDeps {
    * handleEntrySignal ниже). `undefined` в dry_run (main.ts не подключает сеть в этом режиме —
    * см. PipelineDeps.equity выше про тот же принцип "0 сетевых походов в dry-run") — гейт тогда
    * НЕ применяется, entry_signal ведёт себя ровно как до этого фикса. В live main.ts подставляет
-   * живой запрос (rest.getPositions(symbol) — стаб-позиция несёт markPrice даже при size=0).
+   * `createMarkPriceGetter(rest)` — публичный тикер `GET /v5/market/tickers` (фикс p3-slippage-fix,
+   * НЕ стаб-позиция `getPositions`: та отдаёт markPrice="" на аккаунте без истории по символу).
    * Инжектируется функцией (а не готовым значением), т.к. mark price нужен ПЕРЕД каждым входом
-   * и может отличаться по символам внутри одного тика.
+   * и может отличаться по символам внутри одного тика. Возврат `null` ФУНКЦИЕЙ (не отсутствие
+   * поля целиком) означает сбой похода за ценой — handleEntrySignal ниже трактует это
+   * fail-CLOSED (skip mark_price_unavailable), не fail-open.
    */
   getMarkPrice?: (symbol: string) => Promise<string | null>
   /** Порог гейта I2, % (design: дефолт '0.5' = MAX_ENTRY_SLIPPAGE_PCT, .env.example). */
@@ -864,16 +867,19 @@ async function handleEntrySignal(
   // Important I2 адверсариального ревью (p3-core-fix-report.md): вход всегда market по
   // СИГНАЛЬНОЙ цене — риск/сайзинг ниже считаются от entryPrice, а реальный филл может быть
   // далеко, если сигнал протух (staleness) или цена уже ушла (slippage). Гейт применяется ТОЛЬКО
-  // когда есть живой источник цены (live, deps.getMarkPrice подключён main.ts) — dry_run или сбой
-  // самого похода за ценой (null) -> fail-open, поведение идентично состоянию до этого фикса
-  // (dry_run не имеет и не должен иметь сетевого пути к бирже, см. PipelineDeps.equity выше).
+  // когда есть живой источник цены (live, deps.getMarkPrice подключён main.ts) — dry_run НЕ
+  // вызывает его вовсе (fail-open, dry_run не имеет и не должен иметь сетевого пути к бирже, см.
+  // PipelineDeps.equity выше). Фикс p3-slippage-fix (Important, найден e2e): если getMarkPrice
+  // ПОДКЛЮЧЁН, но сам вызов вернул null (сбой похода за ценой/пустой тикер, main.ts::
+  // createMarkPriceGetter) — гейт теперь fail-CLOSED (skip mark_price_unavailable), а НЕ
+  // fail-open, как было раньше. Раньше null тихо пропускал проверку отклонения — торговая
+  // система не должна входить вслепую, если не может достоверно узнать текущую цену.
   if (base.deps.getMarkPrice) {
     const currentMark = await base.deps.getMarkPrice(intent.symbol)
-    if (currentMark !== null) {
-      const maxSlippagePct = new Decimal(base.deps.maxEntrySlippagePct ?? DEFAULT_MAX_ENTRY_SLIPPAGE_PCT)
-      const deviationPct = new Decimal(currentMark).minus(entryPrice).abs().div(entryPrice).mul(100)
-      if (deviationPct.gt(maxSlippagePct)) return { skipReason: 'price_slippage' }
-    }
+    if (currentMark === null) return { skipReason: 'mark_price_unavailable' }
+    const maxSlippagePct = new Decimal(base.deps.maxEntrySlippagePct ?? DEFAULT_MAX_ENTRY_SLIPPAGE_PCT)
+    const deviationPct = new Decimal(currentMark).minus(entryPrice).abs().div(entryPrice).mul(100)
+    if (deviationPct.gt(maxSlippagePct)) return { skipReason: 'price_slippage' }
   }
 
   const sizeResult = computeSize({

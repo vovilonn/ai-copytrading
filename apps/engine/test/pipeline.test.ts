@@ -7,6 +7,7 @@ import { migrateToLatest } from 'api/db/migrate.js'
 import { createExecutionPort, type ExecutionPort } from '../src/execution/port.js'
 import { DryRunAdapter } from '../src/execution/dry-run.adapter.js'
 import { processMessage, type PipelineDeps, type PipelineMessage } from '../src/pipeline.js'
+import { createMarkPriceGetter, type MarkPriceRestClient } from '../src/main.js'
 
 /**
  * Юнит/интеграционные тесты пайплайна на два денежных инварианта, найденных адверсариальным
@@ -434,7 +435,10 @@ describe('pipeline — гейт staleness/slippage перед market-входо�
     expect(action.status).toBe('executed')
   })
 
-  it('getMarkPrice возвращает null (сбой похода за ценой) -> гейт fail-open, вход не блокируется', async () => {
+  it('getMarkPrice возвращает null (сбой похода за ценой/тикер недоступен) -> гейт fail-CLOSED, skip mark_price_unavailable', async () => {
+    // Фикс p3-slippage-fix (Important, найден e2e): раньше null тихо пропускал проверку
+    // отклонения (fail-open) — торговая система входила вслепую по протухшему сигналу, если
+    // сам поход за ценой сломался. Теперь null -> skip, а не молчаливый вход.
     const channelId = nextChannelId++
     await seedChannel({ channelId, symbol: 'JJJUSDT' })
     const localDeps: PipelineDeps = {
@@ -448,6 +452,116 @@ describe('pipeline — гейт staleness/slippage перед market-входо�
     await processMessage(db, message, localDeps)
 
     const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('skipped')
+    expect(action.skip_reason).toBe('mark_price_unavailable')
+
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades).toHaveLength(0)
+    const orders = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).execute()
+    expect(orders).toHaveLength(0)
+  })
+})
+
+describe('pipeline — createMarkPriceGetter(main.ts) + гейт I2, сквозь мок публичного тикера (фикс p3-slippage-fix)', () => {
+  /** Мок rest-клиента с ЕДИНСТВЕННЫМ методом, нужным createMarkPriceGetter — getTicker. Тот же
+   *  приём, что и createMockRest() в main-live.test.ts (мок узкого контракта, не всего BybitRestClient). */
+  function mockRest(impl: MarkPriceRestClient['getTicker']): MarkPriceRestClient {
+    return { getTicker: impl }
+  }
+
+  it('getTicker -> markPrice=106 при сигнале entry=100 (6% отклонение) -> skip price_slippage', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'KKKUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      getMarkPrice: createMarkPriceGetter(mockRest(async () => ({ markPrice: '106', lastPrice: '106' }))),
+    }
+    const text = '#KKK/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('skipped')
+    expect(action.skip_reason).toBe('price_slippage')
+  })
+
+  it('getTicker -> markPrice=100.2 (0.2% отклонение, в пределах порога 0.5%) -> входит как обычно', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'LLLUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      getMarkPrice: createMarkPriceGetter(mockRest(async () => ({ markPrice: '100.2', lastPrice: '100.2' }))),
+    }
+    const text = '#LLL/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
     expect(action.status).toBe('executed')
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades).toHaveLength(1)
+  })
+
+  it('getTicker бросает (сеть/биржа недоступна) -> createMarkPriceGetter -> null -> skip mark_price_unavailable (fail-CLOSED)', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'MMMUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      getMarkPrice: createMarkPriceGetter(
+        mockRest(async () => {
+          throw new Error('Bybit сеть (/v5/market/tickers): connection reset')
+        }),
+      ),
+    }
+    const text = '#MMM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('skipped')
+    expect(action.skip_reason).toBe('mark_price_unavailable')
+  })
+
+  it('getTicker -> markPrice/lastPrice оба пусты (тикер вернул пустые строки) -> null -> skip mark_price_unavailable', async () => {
+    // Защита от "тикер ответил, но без цены" (напр. delisted/приостановленный символ) — та же
+    // логика fail-closed, что и для полного сбоя похода за ценой.
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'NNNUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      getMarkPrice: createMarkPriceGetter(mockRest(async () => ({ markPrice: '', lastPrice: '' }))),
+    }
+    const text = '#NNN/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('skipped')
+    expect(action.skip_reason).toBe('mark_price_unavailable')
+  })
+
+  it('getTicker -> markPrice пуст, но lastPrice непуст -> используется lastPrice как fallback', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'OOOUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      getMarkPrice: createMarkPriceGetter(mockRest(async () => ({ markPrice: '', lastPrice: '100.1' }))),
+    }
+    const text = '#OOO/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('executed') // 0.1% отклонение, в пределах порога 0.5%
   })
 })
