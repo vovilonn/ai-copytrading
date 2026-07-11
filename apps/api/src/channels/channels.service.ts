@@ -19,6 +19,8 @@ interface ChannelRow {
   enabled: boolean
   trade_size: string
   max_leverage: string
+  default_leverage: string | null
+  cross_margin: boolean
   action_count: number
   active_positions: number
   message_count: number
@@ -31,7 +33,7 @@ interface ChannelRow {
 // их сырым SQL, а не Kysely-билдером, одним запросом с коррелированными подзапросами (не N+1).
 const CHANNEL_COLUMNS = `
   c.id, c.key, c.title, c.handle, c.status,
-  cs.enabled, cs.trade_size, cs.max_leverage,
+  cs.enabled, cs.trade_size, cs.max_leverage, cs.default_leverage, cs.cross_margin,
   (SELECT count(*) FROM actions   a WHERE a.channel_id = c.id)                 AS action_count,
   (SELECT count(*) FROM positions p WHERE p.channel_id = c.id AND p.size <> 0) AS active_positions,
   (SELECT count(*) FROM messages  m WHERE m.channel_id = c.id)                 AS message_count
@@ -41,7 +43,9 @@ const CHANNEL_FROM = `
   JOIN channel_settings cs ON cs.channel_id = c.id
 `
 
-function formatNumeric(value: string): string {
+// Экспортирована для переиспользования в channel-settings.service.ts (тот же вид форматирования
+// нужен и для ChannelSettingsDto, DRY — не дублируем String(Number(...)) в двух файлах).
+export function formatNumeric(value: string): string {
   // NUMERIC приходит строкой вида '500.00000000' — для отображения обрезаем незначащие нули
   // (design/project/Admin.dc.html показывает '$500', '10x', а не '$500.00000000').
   // String(Number(...)) уже сам не печатает лишние нули/точку для целых значений.
@@ -78,6 +82,8 @@ function toChannelDto(row: ChannelRow): ChannelDto {
     messageCount: row.message_count,
     tradeSize: `$${formatNumeric(row.trade_size)}`,
     maxLeverage: `${formatNumeric(row.max_leverage)}x`,
+    defaultLeverage: row.default_leverage !== null ? `${formatNumeric(row.default_leverage)}x` : null,
+    crossMargin: row.cross_margin,
   }
 }
 

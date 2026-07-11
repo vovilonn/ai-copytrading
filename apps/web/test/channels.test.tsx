@@ -30,6 +30,8 @@ const CHANNELS: ChannelDto[] = [
     messageCount: 340,
     tradeSize: '$500',
     maxLeverage: '10x',
+    defaultLeverage: null,
+    crossMargin: true,
   },
   {
     id: 2,
@@ -45,6 +47,8 @@ const CHANNELS: ChannelDto[] = [
     messageCount: 90,
     tradeSize: '$100',
     maxLeverage: '3x',
+    defaultLeverage: '5x',
+    crossMargin: false,
   },
 ]
 

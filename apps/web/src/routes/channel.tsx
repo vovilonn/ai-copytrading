@@ -1,13 +1,15 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { CircleCheck } from 'lucide-react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useParams } from 'react-router-dom'
-import type { ChannelDto } from 'shared/dto.js'
+import { toast } from 'sonner'
+import type { ChannelDto, ChannelSettingsDto } from 'shared/dto.js'
 import { MessageTimeline } from '../components/MessageTimeline.js'
 import { Button } from '../components/ui/button.js'
 import { Input } from '../components/ui/input.js'
 import { Switch } from '../components/ui/switch.js'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs.js'
 import { apiFetch } from '../lib/api.js'
-import { useState, type ReactNode } from 'react'
 
 // Строки настроек в ChannelDto приходят уже отформатированными для таблицы каналов
 // ('$500', '10x' — apps/api/src/channels/channels.service.ts, formatNumeric) — здесь их
@@ -77,35 +79,191 @@ export default function ChannelPage() {
           <MessageTimeline channelId={channelId} />
         </TabsContent>
         <TabsContent value="settings">
-          <ChannelSettings channel={channel} />
+          {/* key={channel.id} — форма держит собственное несохранённое состояние, при переходе
+              на другой канал (при том же смонтированном ChannelPage) её нужно проинициализировать
+              заново из нового channel, а не донести правки чужого канала. */}
+          <ChannelSettings key={channel.id} channel={channel} />
         </TabsContent>
       </Tabs>
     </div>
   )
 }
 
-// Вкладка Settings (design/project/Admin.dc.html:251-302): в Ф0 все контролы задизейблены,
-// значения берутся из ChannelDto. Default leverage/Allow cross margin в DTO ещё нет
-// (появятся в Ф1 вместе с реальным сохранением) — разметка есть, но без данных под ней.
-function ChannelSettings({ channel }: { channel: ChannelDto }) {
+interface SettingsFormState {
+  enabled: boolean
+  tradeSize: string
+  maxLeverage: string
+  defaultLeverage: string // '' — не задано (плейсхолдер "—", null на бэке)
+  crossMargin: boolean
+}
+
+function toFormState(channel: ChannelDto): SettingsFormState {
+  return {
+    enabled: channel.copyEnabled,
+    tradeSize: stripCurrency(channel.tradeSize),
+    maxLeverage: stripLeverage(channel.maxLeverage),
+    defaultLeverage: channel.defaultLeverage ? stripLeverage(channel.defaultLeverage) : '',
+    crossMargin: channel.crossMargin,
+  }
+}
+
+interface SettingsPatchBody {
+  enabled: boolean
+  tradeSize: string
+  maxLeverage: string
+  defaultLeverage: string | null
+  crossMargin: boolean
+}
+
+// Тот же вид форматирования денег/плеча, что и бэкенд (apps/api/src/channels/channels.service.ts,
+// formatNumeric) — нужен для оптимистичного апдейта кэша ДО ответа сервера (реальный ответ,
+// ChannelSettingsDto, приходит уже в этом виде и просто перезаписывает оптимистичную догадку).
+function normalizeNumber(raw: string): string {
+  return String(Number(raw))
+}
+
+function applyOptimistic(channel: ChannelDto, body: SettingsPatchBody): ChannelDto {
+  return {
+    ...channel,
+    copyEnabled: body.enabled,
+    tradeSize: `$${normalizeNumber(body.tradeSize)}`,
+    maxLeverage: `${normalizeNumber(body.maxLeverage)}x`,
+    defaultLeverage: body.defaultLeverage !== null ? `${normalizeNumber(body.defaultLeverage)}x` : null,
+    crossMargin: body.crossMargin,
+  }
+}
+
+function mergeSettings(channel: ChannelDto, settings: ChannelSettingsDto): ChannelDto {
+  return {
+    ...channel,
+    copyEnabled: settings.enabled,
+    tradeSize: settings.tradeSize,
+    maxLeverage: settings.maxLeverage,
+    defaultLeverage: settings.defaultLeverage,
+    crossMargin: settings.crossMargin,
+  }
+}
+
+// Дублирует правила валидации API (apps/api/src/channels/channel-settings.service.ts,
+// assertValid) — на фронте это мгновенная обратная связь и экономия лишнего запроса,
+// а не единственная линия обороны (сервер проверяет то же самое ещё раз).
+function validateForm(form: SettingsFormState): string | null {
+  const tradeSize = Number(form.tradeSize)
+  if (!Number.isFinite(tradeSize) || tradeSize <= 0) return 'Trade size must be greater than 0'
+  const maxLeverage = Number(form.maxLeverage)
+  if (!Number.isFinite(maxLeverage) || maxLeverage < 1) return 'Max leverage must be at least 1'
+  if (form.defaultLeverage.trim() !== '') {
+    const defaultLeverage = Number(form.defaultLeverage)
+    if (!Number.isFinite(defaultLeverage) || defaultLeverage < 1) {
+      return 'Default leverage must be at least 1 (or left empty)'
+    }
+  }
+  return null
+}
+
+const SAVED_FLASH_MS = 1800
+
+// Вкладка Settings (design/project/Admin.dc.html:251-302): контролы активны — контролируемая
+// форма (без react-hook-form/zod: react-hook-form отсутствует в apps/web/package.json, а форма
+// всего из 5 полей без вложенной/динамической структуры — заводить новую зависимость ради неё
+// избыточно, KISS). Save -> PATCH /channels/:id/settings, оптимистичный апдейт кэша
+// ['channel', id]/['channels'], откат на ошибке (sonner), флеш "Saved" на ~1.8с.
+// Экспортирован именованно (а не только используется внутри ChannelPage) — settings.test.tsx
+// рендерит компонент напрямую, в обход Radix Tabs: клики по TabsTrigger в jsdom не переключают
+// активную вкладку (Radix Tabs полагается на pointer capture, которого нет в jsdom), а сама форма
+// не зависит от контекста Tabs — та же практика, что и с MessageTimeline (timeline.test.tsx).
+export function ChannelSettings({ channel }: { channel: ChannelDto }) {
+  const queryClient = useQueryClient()
+  const [form, setForm] = useState<SettingsFormState>(() => toFormState(channel))
+  const [savedFlash, setSavedFlash] = useState(false)
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(
+    () => () => {
+      if (flashTimer.current) clearTimeout(flashTimer.current)
+    },
+    [],
+  )
+
+  const mutation = useMutation<
+    ChannelSettingsDto,
+    unknown,
+    SettingsPatchBody,
+    { prevChannel?: ChannelDto; prevChannels?: ChannelDto[] }
+  >({
+    mutationFn: (body) =>
+      apiFetch<ChannelSettingsDto>(`/channels/${channel.id}/settings`, {
+        method: 'PATCH',
+        body: JSON.stringify(body),
+      }),
+    onMutate: async (body) => {
+      await queryClient.cancelQueries({ queryKey: ['channel', channel.id] })
+      await queryClient.cancelQueries({ queryKey: ['channels'] })
+      const prevChannel = queryClient.getQueryData<ChannelDto>(['channel', channel.id])
+      const prevChannels = queryClient.getQueryData<ChannelDto[]>(['channels'])
+      queryClient.setQueryData<ChannelDto>(['channel', channel.id], (old) =>
+        old ? applyOptimistic(old, body) : old,
+      )
+      queryClient.setQueryData<ChannelDto[]>(['channels'], (old) =>
+        old?.map((c) => (c.id === channel.id ? applyOptimistic(c, body) : c)),
+      )
+      return { prevChannel, prevChannels }
+    },
+    onError: (_err, _body, context) => {
+      if (context?.prevChannel) queryClient.setQueryData(['channel', channel.id], context.prevChannel)
+      if (context?.prevChannels) queryClient.setQueryData(['channels'], context.prevChannels)
+      toast.error('Failed to save channel settings')
+    },
+    onSuccess: (settings) => {
+      queryClient.setQueryData<ChannelDto>(['channel', channel.id], (old) =>
+        old ? mergeSettings(old, settings) : old,
+      )
+      queryClient.setQueryData<ChannelDto[]>(['channels'], (old) =>
+        old?.map((c) => (c.id === channel.id ? mergeSettings(c, settings) : c)),
+      )
+      setSavedFlash(true)
+      if (flashTimer.current) clearTimeout(flashTimer.current)
+      flashTimer.current = setTimeout(() => setSavedFlash(false), SAVED_FLASH_MS)
+    },
+  })
+
+  function handleSave() {
+    const error = validateForm(form)
+    if (error) {
+      toast.error(error)
+      return
+    }
+    mutation.mutate({
+      enabled: form.enabled,
+      tradeSize: form.tradeSize,
+      maxLeverage: form.maxLeverage,
+      defaultLeverage: form.defaultLeverage.trim() === '' ? null : form.defaultLeverage,
+      crossMargin: form.crossMargin,
+    })
+  }
+
   return (
     <div className="max-w-[620px] rounded-[10px] border border-card-border bg-card px-5 py-1">
       <SettingsRow
         title="Copy trading"
         description="If off, messages are still parsed but every action is marked Skipped — no orders are sent to Bybit."
       >
-        <Switch checked={channel.copyEnabled} disabled />
+        <Switch
+          aria-label="Copy trading"
+          checked={form.enabled}
+          onCheckedChange={(checked) => setForm((f) => ({ ...f, enabled: checked }))}
+        />
       </SettingsRow>
 
       <SettingsRow title="Trade size" description="Fixed notional used for every trade copied from this channel.">
         <div className="flex h-[34px] flex-none items-center overflow-hidden rounded-[7px] border border-white/[.12] bg-white/[.04]">
           <span className="pl-[11px] pr-[3px] text-[13px] text-muted-1">$</span>
           <Input
+            aria-label="Trade size"
             type="number"
-            value={stripCurrency(channel.tradeSize)}
-            disabled
-            readOnly
-            className="h-full w-[88px] rounded-none border-none bg-transparent px-[4px] pr-[11px] text-[13px] disabled:opacity-100"
+            value={form.tradeSize}
+            onChange={(e) => setForm((f) => ({ ...f, tradeSize: e.target.value }))}
+            className="h-full w-[88px] rounded-none border-none bg-transparent px-[4px] pr-[11px] text-[13px]"
           />
         </div>
       </SettingsRow>
@@ -113,11 +271,11 @@ function ChannelSettings({ channel }: { channel: ChannelDto }) {
       <SettingsRow title="Max leverage" description="Signals above this leverage are clamped down to the limit.">
         <div className="flex h-[34px] flex-none items-center overflow-hidden rounded-[7px] border border-white/[.12] bg-white/[.04]">
           <Input
+            aria-label="Max leverage"
             type="number"
-            value={stripLeverage(channel.maxLeverage)}
-            disabled
-            readOnly
-            className="h-full w-[66px] rounded-none border-none bg-transparent pl-[11px] pr-[4px] text-[13px] disabled:opacity-100"
+            value={form.maxLeverage}
+            onChange={(e) => setForm((f) => ({ ...f, maxLeverage: e.target.value }))}
+            className="h-full w-[66px] rounded-none border-none bg-transparent pl-[11px] pr-[4px] text-[13px]"
           />
           <span className="pl-[2px] pr-[11px] text-[13px] text-muted-1">x</span>
         </div>
@@ -133,9 +291,11 @@ function ChannelSettings({ channel }: { channel: ChannelDto }) {
       >
         <div className="flex h-[34px] flex-none items-center overflow-hidden rounded-[7px] border border-white/[.12] bg-white/[.04]">
           <Input
+            aria-label="Default leverage"
             type="number"
             placeholder="—"
-            disabled
+            value={form.defaultLeverage}
+            onChange={(e) => setForm((f) => ({ ...f, defaultLeverage: e.target.value }))}
             className="h-full w-[66px] rounded-none border-none bg-transparent pl-[11px] pr-[4px] text-[13px]"
           />
           <span className="pl-[2px] pr-[11px] text-[13px] text-muted-1">x</span>
@@ -147,11 +307,24 @@ function ChannelSettings({ channel }: { channel: ChannelDto }) {
         description="If off, positions from this channel are opened in isolated margin only."
         last
       >
-        <Switch checked={false} disabled />
+        <Switch
+          aria-label="Allow cross margin"
+          checked={form.crossMargin}
+          onCheckedChange={(checked) => setForm((f) => ({ ...f, crossMargin: checked }))}
+        />
       </SettingsRow>
 
       <div className="flex items-center justify-end gap-3 border-t border-white/[.06] py-[18px] pb-2">
-        <Button disabled size="sm" className="h-9 px-[18px] text-[13px]">
+        {savedFlash && (
+          <span
+            className="inline-flex items-center gap-[5px] text-[12.5px] font-semibold"
+            style={{ color: '#34d399' }}
+          >
+            <CircleCheck size={14} color="#34d399" className="inline-flex flex-none" />
+            Saved
+          </span>
+        )}
+        <Button size="sm" className="h-9 px-[18px] text-[13px]" onClick={handleSave} disabled={mutation.isPending}>
           Save changes
         </Button>
       </div>

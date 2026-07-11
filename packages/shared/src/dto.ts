@@ -16,6 +16,25 @@ export interface ChannelDto {
   messageCount: number
   tradeSize: string
   maxLeverage: string
+  // Задача "редактируемые настройки канала" (Ф4): та же строковая конвенция форматирования,
+  // что и у tradeSize/maxLeverage выше ('5x'), null — сигнал не задаёт плечо (используется
+  // maxLeverage сигнала как есть). Settings-таб (design/project/Admin.dc.html:280-289).
+  defaultLeverage: string | null
+  crossMargin: boolean
+}
+
+// Задача "редактируемые настройки канала" (Ф4): ответ PATCH /api/channels/:id/settings
+// (apps/api/src/channels/channel-settings.controller.ts) — полный снимок channel_settings
+// после обновления, в том же строковом форматировании денег/плеча, что и ChannelDto
+// ('$500', '10x'), чтобы фронт мог применить его к кэшу ['channel', id]/['channels'] без
+// дополнительного парсинга.
+export interface ChannelSettingsDto {
+  channelId: number
+  enabled: boolean
+  tradeSize: string
+  maxLeverage: string
+  defaultLeverage: string | null
+  crossMargin: boolean
 }
 
 // Задача 8: теперь actions пайплайна (задача 7) реально заполняют это поле — реализация в
