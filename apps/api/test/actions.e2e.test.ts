@@ -229,4 +229,53 @@ describe('GET /api/actions', () => {
     expect(rows[0]!.pair).toBe('BTCUSDT')
     expect(rows[0]!.type).toBe('close')
   })
+
+  // Important #2 финального ревью Ф1: GET /api/actions раньше не имел LIMIT — рос бы вечно.
+  it('?limit=50 возвращает ≤50 строк (буквальная приёмка ревью)', async () => {
+    const res = await agent.get('/api/actions?limit=50').expect(200)
+    const rows = res.body as ActionRowDto[]
+    expect(rows.length).toBeLessThanOrEqual(50)
+  })
+
+  it('?limit=2 реально усекает список (4 строки в фикстуре -> 2), свежие сверху', async () => {
+    const res = await agent.get('/api/actions?limit=2').expect(200)
+    const rows = res.body as ActionRowDto[]
+    expect(rows).toHaveLength(2)
+    expect(rows.map((r) => r.pair)).toEqual(['ETHUSDT', 'BTCUSDT'])
+  })
+
+  it('?before=<id первой страницы> отдаёт keyset-продолжение без пересечения и без пропусков', async () => {
+    const page1 = (await agent.get('/api/actions?limit=2').expect(200)).body as ActionRowDto[]
+    expect(page1).toHaveLength(2)
+    const cursor = page1[1]!.id
+
+    const page2 = (await agent.get(`/api/actions?limit=2&before=${cursor}`).expect(200)).body as ActionRowDto[]
+    expect(page2).toHaveLength(2)
+    // BTC close (11:00) -> skipped (10:00), т.е. ровно оставшиеся 2 строки из общих 4.
+    expect(page2.map((r) => r.pair)).toEqual(['BTCUSDT', null])
+
+    const allIds = [...page1, ...page2].map((r) => r.id)
+    expect(new Set(allIds).size).toBe(4) // ни одного дубля, ни одного пропуска
+  })
+
+  it('?before=<мусорный не-uuid> тихо игнорируется (не 500)', async () => {
+    const res = await agent.get('/api/actions?before=not-a-uuid').expect(200)
+    const rows = res.body as ActionRowDto[]
+    expect(rows).toHaveLength(4) // курсор проигнорирован — как будто before не передавали вовсе
+  })
+
+  // Minor #3 финального ревью Ф1: `%`/`_` в q — LIKE-метасимволы, не экранированные до фикса
+  // работали бы как wildcard. Ни у одного symbol в фикстуре нет буквального `%`/`_` — значит
+  // корректно экранированный поиск обязан вернуть 0 строк, а не "все строки подряд" (баг).
+  it('q="%" экранируется — не матчит все строки как LIKE-wildcard', async () => {
+    const res = await agent.get(`/api/actions?q=${encodeURIComponent('%')}`).expect(200)
+    const rows = res.body as ActionRowDto[]
+    expect(rows).toHaveLength(0)
+  })
+
+  it('q="_" экранируется — не матчит все строки как LIKE-wildcard', async () => {
+    const res = await agent.get(`/api/actions?q=${encodeURIComponent('_')}`).expect(200)
+    const rows = res.body as ActionRowDto[]
+    expect(rows).toHaveLength(0)
+  })
 })

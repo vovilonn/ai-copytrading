@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { ActionRowDto, ChannelDto } from 'shared/dto.js'
 import { SegmentedControl, type SegmentOption } from '../components/SegmentedControl.js'
+import { TableStateRow } from '../components/TableStateRow.js'
 import { Card } from '../components/ui/card.js'
 import { Input } from '../components/ui/input.js'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table.js'
@@ -11,6 +12,11 @@ import { getActionIcon, normalizeTradeRef } from '../lib/action-display.js'
 import { apiFetch } from '../lib/api.js'
 import { cn } from '../lib/utils.js'
 import { useActionsStream } from '../lib/ws.js'
+
+// Финальное ревью Ф1, Important #2: без LIMIT GET /api/actions рос бы вечно. Бэкенд сам
+// дефолтит/clamp'ит (apps/api/src/actions/actions.service.ts: DEFAULT_LIMIT/MAX_LIMIT), фронт
+// здесь явно запрашивает первую страницу тем же числом — "показать ещё" оставлено на будущее.
+const PAGE_LIMIT = 200
 
 // Ровно списки сегментов из design/project/Admin.dc.html:708-710 (periodOpts/typeOpts/dirOpts) —
 // Type сознательно НЕ покрывает все 12 ActionType (шире, чем 4 варианта дизайна): бэкенд отдаёт
@@ -55,6 +61,7 @@ async function fetchActions(filters: ActionsFilters): Promise<ActionRowDto[]> {
   if (filters.type !== 'all') params.set('type', filters.type)
   if (filters.side !== 'all') params.set('side', filters.side)
   if (filters.q.trim()) params.set('q', filters.q.trim())
+  params.set('limit', String(PAGE_LIMIT))
   const qs = params.toString()
   return apiFetch<ActionRowDto[]>(`/actions${qs ? `?${qs}` : ''}`)
 }
@@ -107,7 +114,7 @@ export default function ActionsPage() {
   useActionsStream(channels.map((c) => c.id))
 
   const filters: ActionsFilters = { channel, period, type, side, q }
-  const { data } = useQuery({
+  const { data, isPending, isError } = useQuery({
     queryKey: ['actions', filters],
     queryFn: () => fetchActions(filters),
   })
@@ -178,11 +185,13 @@ export default function ActionsPage() {
             ))}
           </TableBody>
         </Table>
-        {actions.length === 0 ? (
-          <div className="border-t border-row-border px-[22px] py-8 text-center">
-            <span className="text-[13px] text-muted-1">No actions match the selected filters.</span>
-          </div>
-        ) : null}
+        <TableStateRow
+          isPending={isPending}
+          isError={isError}
+          isEmpty={actions.length === 0}
+          emptyMessage="No actions match the selected filters."
+          errorMessage="Failed to load actions. Please try again."
+        />
       </Card>
     </div>
   )

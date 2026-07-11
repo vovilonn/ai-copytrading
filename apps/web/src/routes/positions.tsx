@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { ChannelDto, PositionDto, PositionStatsDto } from 'shared/dto.js'
 import { SegmentedControl, type SegmentOption } from '../components/SegmentedControl.js'
+import { TableStateRow } from '../components/TableStateRow.js'
 import { Card } from '../components/ui/card.js'
 import { Input } from '../components/ui/input.js'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table.js'
@@ -149,7 +150,11 @@ export default function PositionsPage() {
   usePositionsStream(channels.map((c) => c.id))
 
   const filters: PositionsFilters = { channel, side, margin, q }
-  const { data: positionsData } = useQuery({
+  const {
+    data: positionsData,
+    isPending: isPositionsPending,
+    isError: isPositionsError,
+  } = useQuery({
     queryKey: positionsQueryKey(filters),
     queryFn: () => fetchPositions(filters),
   })
@@ -248,11 +253,13 @@ export default function PositionsPage() {
             ))}
           </TableBody>
         </Table>
-        {positions.length === 0 ? (
-          <div className="border-t border-row-border px-[22px] py-8 text-center">
-            <span className="text-[13px] text-muted-1">No positions match the selected filters.</span>
-          </div>
-        ) : null}
+        <TableStateRow
+          isPending={isPositionsPending}
+          isError={isPositionsError}
+          isEmpty={positions.length === 0}
+          emptyMessage="No positions match the selected filters."
+          errorMessage="Failed to load positions. Please try again."
+        />
       </Card>
     </div>
   )

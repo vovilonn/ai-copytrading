@@ -107,8 +107,14 @@ const ENTRY_HASHTAG_RE = /#([a-zA-Z0-9]+)\/usdt/i
 const ENTRY_GATE_RE = /диапазон\s+входа/i
 const ENTRY_RANGE_RE = /диапазон\s+входа:?\s*([\d.,\s]+?)\s*[-–—]\s*([\d.,\s]+?)\s*\$/i
 const TP_LINE_RE = /tp:?\s*([^\n]+)/i
-const SL_RE = /sl:?\s*([\d.,]+)\s*\$/i
-const RISK_RE = /риск:?\s*([\d.,]+)\s*%/i
+// `\s` в классе символов (не только между `sl:` и числом, но и ВНУТРИ самого числа) — как у
+// ENTRY_RANGE_RE выше: у крупных монет (BTC/ETH) стоп пишут с пробелом-разделителем тысяч
+// ("SL: 61 500$", обычный или неразрывный U+00A0 пробел). Без `\s` в классе класс `[\d.,]+`
+// останавливался на первом пробеле — совпадение схлопывалось до "61", число терялось, а
+// сигнал ложно уходил в skip(no_SL). `toNum` (shared/numbers.ts) сам снимает пробелы-разделители
+// при конвертации в число — здесь достаточно просто дать регэкспу их не отбрасывать при матче.
+const SL_RE = /sl:?\s*([\d.,\s]+?)\s*\$/i
+const RISK_RE = /риск:?\s*([\d.,\s]+?)\s*%/i
 
 function tryEntrySignal(text: string, ctx: ParseContext): ParsedResult | null {
   const hashtagMatch = ENTRY_HASHTAG_RE.exec(text)

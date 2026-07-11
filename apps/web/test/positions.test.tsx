@@ -244,4 +244,28 @@ describe('PositionsPage', () => {
 
     expect(await screen.findByTestId('channel-probe')).toHaveTextContent('channel:1')
   })
+
+  // Important #4 финального ревью Ф1: до фикса `data ?? []` не отличал упавший запрос от
+  // честного пустого списка — 401/500 рисовали то же самое "No positions match the filters.".
+  it('упавший запрос GET /api/positions рендерит сообщение об ошибке, а не пустое состояние', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/channels') return CHANNELS
+      if (path === '/positions/stats') return statsFixture()
+      if (path.startsWith('/positions')) throw new Error('boom')
+      throw new Error(`неожиданный путь в моке apiFetch: ${path}`)
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/positions']}>
+          <Routes>
+            <Route path="/positions" element={<PositionsPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+
+    expect(await screen.findByText('Failed to load positions. Please try again.')).toBeInTheDocument()
+    expect(screen.queryByText('No positions match the selected filters.')).not.toBeInTheDocument()
+  })
 })

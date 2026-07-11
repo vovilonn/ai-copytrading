@@ -208,6 +208,22 @@ describe('GET /api/positions', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]!.symbol).toBe('XRPUSDT')
   })
+
+  // Minor #3 финального ревью Ф1: `%`/`_` в q — LIKE-метасимволы, не экранированные до фикса
+  // работали бы как wildcard, т.е. матчили бы ВСЕ 3 открытые позиции сразу (баг). Ни в одном
+  // symbol/channel-key/human_ref фикстуры нет буквального `%`/`_` — корректно экранированный
+  // поиск обязан вернуть 0 строк.
+  it('q="%" экранируется — не матчит все позиции как LIKE-wildcard', async () => {
+    const res = await agent.get(`/api/positions?q=${encodeURIComponent('%')}`).expect(200)
+    const rows = res.body as PositionDto[]
+    expect(rows).toHaveLength(0)
+  })
+
+  it('q="_" экранируется — не матчит все позиции как LIKE-wildcard', async () => {
+    const res = await agent.get(`/api/positions?q=${encodeURIComponent('_')}`).expect(200)
+    const rows = res.body as PositionDto[]
+    expect(rows).toHaveLength(0)
+  })
 })
 
 describe('GET /api/positions/stats', () => {

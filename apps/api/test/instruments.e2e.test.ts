@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import type { Kysely } from 'kysely'
 import { resetTestSchema } from 'test-db'
 import { createDb, type DB } from '../src/db/database.js'
@@ -44,6 +44,34 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await db.destroy()
+})
+
+// Important #1 финального ревью Ф1: refresh() существовал, но его никто не вызывал — на чистой
+// БД instruments пустая, каждый сигнал уходил в symbol_not_listed. Юнит проверяет ИМЕННО связку
+// "bootstrap вызывает refresh()", а не сам живой Bybit (тот уже покрыт describe ниже) — refresh
+// замокан, поэтому не зависит от networkAvailable и не требует реальной сети. Отдельный экземпляр
+// сервиса (не общий `service` из beforeAll выше) — чтобы vi.spyOn не задел живые тесты ниже.
+describe('InstrumentsService.onModuleInit (Important #1)', () => {
+  it('вызывает refresh() в фоне при старте api, не дожидаясь его завершения (fire-and-forget)', async () => {
+    const config = loadConfig(process.env)
+    const database = new DatabaseService(config)
+    const own = new InstrumentsService(database, config)
+    const refreshSpy = vi.spyOn(own, 'refresh').mockResolvedValue(42)
+
+    await own.onModuleInit()
+    // onModuleInit не await'ит сам refresh (иначе недоступность Bybit при старте блокировала бы
+    // api) — ждём микротаск, чтобы фоновый вызов успел стартовать.
+    await vi.waitFor(() => expect(refreshSpy).toHaveBeenCalledTimes(1))
+  })
+
+  it('падение refresh() при старте не пробрасывается наружу из onModuleInit (не роняет bootstrap api)', async () => {
+    const config = loadConfig(process.env)
+    const database = new DatabaseService(config)
+    const own = new InstrumentsService(database, config)
+    vi.spyOn(own, 'refresh').mockRejectedValue(new Error('Bybit недоступен'))
+
+    await expect(own.onModuleInit()).resolves.toBeUndefined()
+  })
 })
 
 describe.skipIf(!networkAvailable)('InstrumentsService (живой Bybit testnet)', () => {

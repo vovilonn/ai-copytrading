@@ -13,7 +13,9 @@ export class ActionsController {
     @Query('type') type?: string,
     @Query('side') side?: string,
     @Query('q') q?: string,
+    @Query('limit') limit?: string,
+    @Query('before') before?: string,
   ): Promise<ActionRowDto[]> {
-    return this.actions.listActions({ channel, period, type, side, q })
+    return this.actions.listActions({ channel, period, type, side, q, limit, before })
   }
 }

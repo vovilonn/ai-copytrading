@@ -1,4 +1,5 @@
-import { Inject, Injectable } from '@nestjs/common'
+import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common'
+import { Interval } from '@nestjs/schedule'
 import type { Selectable } from 'kysely'
 import type { Instrument, Network } from 'shared/domain.js'
 import { APP_CONFIG } from '../config/config.module.js'
@@ -16,6 +17,28 @@ const RISK_LIMIT_CONCURRENCY = 20
 // Держим batch upsert под лимитом параметров Postgres (~65535 на запрос) с большим запасом:
 // 12 колонок * 500 строк = 6000 параметров на чанк.
 const UPSERT_CHUNK_SIZE = 500
+
+// Листинги/делистинги на Bybit меняются нечасто (не быстрее, чем за часы) — 6ч периодического
+// refresh() с запасом достаточно, чтобы кэш не разошёлся с биржей надолго, не гоняя лишний
+// трафик на bulk instruments-info+risk-limit (см. bybit-client.ts) слишком часто.
+const REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+// Ретраи ТОЛЬКО для самого первого refresh() при старте api (onModuleInit): если Bybit недоступен
+// ровно в момент деплоя/рестарта (сеть, релиз биржи и т.п.), не хотим ждать целых 6ч до следующего
+// @Interval-тика с пустой таблицей instruments — на чистой БД это ops-gap, из-за которого каждый
+// сигнал уходит в symbol_not_listed и торговли нет (финальное ревью Ф1, Important #1). Периодический
+// @Interval-тик ниже сам себя не ретраит — при сбое просто ждём следующего тика, там это уже дёшево.
+const STARTUP_RETRY_DELAYS_MS = [10_000, 30_000, 60_000]
+
+// unref() — таймер ретрая не должен сам по себе держать процесс живым (в т.ч. в тестах:
+// каждый api e2e тест поднимает createApp() через общий AppModule/InstrumentsModule, см.
+// apps/api/test/*.e2e.test.ts — фоновый ретрай не имеет права мешать процессу завершиться).
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    timer.unref()
+  })
+}
 
 /**
  * USDT-перпетуал — единственный тип контракта, с которым работает система: резолвер
@@ -43,7 +66,8 @@ function isUsdtPerpetual(info: InstrumentInfoDto): boolean {
  * maxLeverage/mmr) — см. docs/superpowers/research/bybit-execution.md §6-§8.
  */
 @Injectable()
-export class InstrumentsService {
+export class InstrumentsService implements OnModuleInit {
+  private readonly logger = new Logger(InstrumentsService.name)
   private readonly network: Network
 
   constructor(
@@ -51,6 +75,53 @@ export class InstrumentsService {
     @Inject(APP_CONFIG) config: AppConfig,
   ) {
     this.network = config.bybitNetwork
+  }
+
+  /**
+   * Ops-gap финального ревью Ф1 (Important #1): на чистой БД таблица instruments пуста, пока
+   * никто не вызовет refresh() — раньше это не делал никто. Здесь — при старте api, БЕЗ await
+   * (намеренно fire-and-forget): если бы мы дождались, недоступность Bybit ровно на старте
+   * (сеть/рестарт биржи) не давала бы api вообще подняться/начать слушать порт. Ошибка ловится
+   * целиком внутри runInitialRefresh() — наружу никогда не пробрасывается.
+   */
+  async onModuleInit(): Promise<void> {
+    void this.runInitialRefresh()
+  }
+
+  private async runInitialRefresh(): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const count = await this.refresh()
+        this.logger.log(`refresh() при старте api — ${count} инструмент(ов)`)
+        return
+      } catch (err) {
+        const delay = STARTUP_RETRY_DELAYS_MS[attempt]
+        if (delay === undefined) {
+          this.logger.error(
+            `refresh() при старте api не удался после ${attempt + 1} попыт(ок) — ждём периодический ` +
+              `тик (раз в ${REFRESH_INTERVAL_MS}мс)`,
+            err instanceof Error ? err.stack : String(err),
+          )
+          return
+        }
+        this.logger.warn(
+          `refresh() при старте api упал (попытка ${attempt + 1}/${STARTUP_RETRY_DELAYS_MS.length + 1}), повтор через ${delay}мс: ${String(err)}`,
+        )
+        await sleep(delay)
+      }
+    }
+  }
+
+  /** Периодика (~раз в 6ч, REFRESH_INTERVAL_MS) — инструменты меняются редко, чаще незачем.
+   *  Ошибка тут НЕ ретраится сама: следующий тик через 6ч сам является ретраем. */
+  @Interval(REFRESH_INTERVAL_MS)
+  private async scheduledRefresh(): Promise<void> {
+    try {
+      const count = await this.refresh()
+      this.logger.log(`периодический refresh() — ${count} инструмент(ов)`)
+    } catch (err) {
+      this.logger.error('периодический refresh() упал — попробуем на следующем тике', err instanceof Error ? err.stack : String(err))
+    }
   }
 
   /** Полностью обновляет реестр активной сети из Bybit. Возвращает число upsert'нутых строк. */

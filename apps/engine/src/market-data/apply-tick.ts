@@ -72,11 +72,18 @@ export async function applyMarkPriceTick(
     const pnl = computeUnrealisedPnl(row.side, row.size, row.avg_price, markPrice)
 
     await db.transaction().execute(async (trx) => {
+      // `size <> 0` в WHERE UPDATE, а не только в исходном SELECT выше: позиция могла закрыться
+      // (size обнулиться другой транзакцией — close_remainder/sl_hit из pipeline.ts) как раз в
+      // окне между SELECT и этим UPDATE. Без этого гейта UPDATE молча перезаписал бы mark_price/
+      // unrealised_pnl уже закрытой строки устаревшим ненулевым PnL. emitPositionUpsert ниже
+      // перечитывает актуальную строку заново, так что на итоговый payload это не влияет —
+      // WHERE просто делает сам UPDATE идемпотентным no-op для гонки, вместо порчи данных.
       await trx
         .updateTable('positions')
         .set({ mark_price: markPrice, unrealised_pnl: pnl.toString(), updated_at: new Date() })
         .where('channel_id', '=', row.channel_id)
         .where('symbol', '=', symbol)
+        .where(sql<boolean>`size <> 0`)
         .execute()
       if (emit) await emitPositionUpsert(trx, row.channel_id, symbol)
     })

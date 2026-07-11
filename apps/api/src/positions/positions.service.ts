@@ -4,6 +4,7 @@ import type { Side } from 'shared/domain.js'
 import type { PositionDto, PositionStatsDto } from 'shared/dto.js'
 import { formatDecimal } from 'shared/numbers.js'
 import { DatabaseService } from '../db/database.service.js'
+import { escapeLikePattern } from '../db/like-escape.js'
 
 /** Query-параметры GET /api/positions (task-8-brief.md) — все опциональны, отсутствие/'all' = без фильтра. */
 export interface PositionsFilter {
@@ -41,8 +42,10 @@ function marginOf(size: string, markPrice: string | null, avgPrice: string | nul
   return lev > 0 ? notional / lev : notional
 }
 
-/** unrealised_pnl в Ф1 всегда null (тот же гэп, что и position_im выше) — 0 здесь не
- *  "заглушка-на-удачу", а точное значение: раз mark_price===avg_price, реальный PnL и есть 0. */
+/** unrealised_pnl обновляется живым тиком mark price (задача 10, apps/engine/src/market-data/
+ *  apply-tick.ts) — здесь просто парсим уже посчитанную NUMERIC-строку в число для витрины.
+ *  0 остаётся только пока по позиции ещё не пришёл ни один тик (mark_price/unrealised_pnl всё
+ *  ещё null сразу после открытия) — это переходное состояние, а не гэп фазы. */
 function pnlOf(unrealisedPnl: string | null): number {
   return toNumber(unrealisedPnl)
 }
@@ -156,8 +159,9 @@ export class PositionsService {
     if (filter.q && filter.q.trim()) {
       // design/project/Admin.dc.html + docs/superpowers/research/frontend-inventory.md §2:
       // поиск на Positions матчит symbol+источник(канал)+tradeRef, не только symbol (в отличие
-      // от Actions, где поиск только по pair/symbol).
-      const like = `%${filter.q.trim()}%`
+      // от Actions, где поиск только по pair/symbol). escapeLikePattern — иначе `%`/`_` в
+      // пользовательском вводе работали бы как LIKE-wildcard (Minor #3 финального ревью Ф1).
+      const like = `%${escapeLikePattern(filter.q.trim())}%`
       query = query.where(
         sql<boolean>`(p.symbol ILIKE ${like} OR coalesce(c.title, c.key) ILIKE ${like} OR t.human_ref ILIKE ${like})`,
       )

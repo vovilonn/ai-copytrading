@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common'
 import { APP_GUARD } from '@nestjs/core'
+import { ScheduleModule } from '@nestjs/schedule'
 import { ActionsModule } from './actions/actions.module.js'
 import { AuthModule } from './auth/auth.module.js'
 import { JwtGuard } from './auth/jwt.guard.js'
@@ -15,6 +16,10 @@ import { RealtimeModule } from './realtime/realtime.module.js'
   imports: [
     ConfigModule,
     DbModule,
+    // ScheduleModule.forRoot() — регистрируется один раз в корне: без него @Interval()
+    // в InstrumentsService (периодический refresh() кэша инструментов, Important #1
+    // финального ревью Ф1) не подхватится SchedulerRegistry — декоратор молча ничего не делает.
+    ScheduleModule.forRoot(),
     AuthModule,
     ChannelsModule,
     InstrumentsModule,

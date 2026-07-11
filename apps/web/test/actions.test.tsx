@@ -112,7 +112,9 @@ describe('ActionsPage', () => {
         .mocked(apiFetch)
         .mock.calls.map((c) => c[0] as string)
         .findLast((p) => p.startsWith('/actions'))
-      expect(lastActionsCall).toBe('/actions?type=open')
+      // limit=200 — теперь всегда в запросе (Important #2 финального ревью Ф1: GET /api/actions
+      // без LIMIT рос бы вечно, фронт явно просит первую страницу тем же дефолтом, что и бэкенд).
+      expect(lastActionsCall).toBe('/actions?type=open&limit=200')
     })
   })
 
@@ -151,5 +153,28 @@ describe('ActionsPage', () => {
   it('пустой список рендерит "No actions match the selected filters."', async () => {
     renderActions([])
     expect(await screen.findByText('No actions match the selected filters.')).toBeInTheDocument()
+  })
+
+  // Important #4 финального ревью Ф1: до фикса `data ?? []` не отличал упавший запрос от
+  // честного пустого списка — 401/500 рисовали то же самое "No actions match the filters.".
+  it('упавший запрос GET /api/actions рендерит сообщение об ошибке, а не пустое состояние', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/channels') return CHANNELS
+      if (path.startsWith('/actions')) throw new Error('boom')
+      throw new Error(`неожиданный путь в моке apiFetch: ${path}`)
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/actions']}>
+          <Routes>
+            <Route path="/actions" element={<ActionsPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+
+    expect(await screen.findByText('Failed to load actions. Please try again.')).toBeInTheDocument()
+    expect(screen.queryByText('No actions match the selected filters.')).not.toBeInTheDocument()
   })
 })

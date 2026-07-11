@@ -187,3 +187,70 @@ describe('ch1.adapter — точечные проверки', () => {
     expect(result.reason).toBe('symbol_not_listed')
   })
 })
+
+// Minor #1 финального ревью Ф1: SL_RE/RISK_RE не понимали пробел-разделитель тысяч (класс
+// символов был `[\d.,]+`, без `\s`, в отличие от ENTRY_RANGE_RE) — стоп вида "SL: 61 500$"
+// (BTC/крупные монеты) не матчился вовсе, и entry_signal с реальным стопом ложно уходил в skip
+// (no_SL), хотя стоп в тексте был. Отдельный минимальный ParseContext (не фикстура) — тест
+// специально синтетический, под конкретный regex-баг, а не под покрытие реального дампа.
+describe('ch1.adapter — SL/Риск с пробелом-разделителем тысяч (Minor #1 финального ревью Ф1)', () => {
+  function buildStandaloneContext(text: string): ParseContext {
+    return {
+      channelId: '2088626562',
+      message: {
+        id: 9001,
+        text,
+        date: '2026-07-10T00:00:00.000Z',
+        replyToMsgId: null,
+        groupedId: null,
+        media: null,
+        mediaFile: null,
+      },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed: () => true,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('SL с обычным пробелом-разделителем тысяч ("SL: 61 500$") парсится как sl=61500, а не no_SL', () => {
+    const text = '#BTC/USDT 📈LONG\nДиапазон входа: 62000 - 61500$\nTP: 64000$\nSL: 61 500$\nРиск: 1%'
+    const result = parseCh1(buildStandaloneContext(text))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toHaveLength(1)
+    const intent = result.intents[0]!
+    expect(intent.kind).toBe('entry_signal')
+    if (intent.kind !== 'entry_signal') throw new Error('unreachable')
+    expect(intent.sl).toBe(61500)
+    expect(intent.riskPct).toBe(1)
+  })
+
+  it('SL с неразрывным пробелом (U+00A0) тоже парсится как sl=61500', () => {
+    const text = '#BTC/USDT 📈LONG\nДиапазон входа: 62000 - 61500$\nTP: 64000$\nSL: 61 500$\nРиск: 1%'
+    const result = parseCh1(buildStandaloneContext(text))
+
+    expect(result.route).toBe('execute')
+    const intent = result.intents[0]!
+    if (intent.kind !== 'entry_signal') throw new Error('unreachable')
+    expect(intent.sl).toBe(61500)
+  })
+
+  it('Риск с пробелом-разделителем тысяч ("Риск: 1 234%") тоже парсится (RISK_RE тот же класс символов)', () => {
+    const text = '#BTC/USDT 📈LONG\nДиапазон входа: 62000 - 61500$\nTP: 64000$\nSL: 61500$\nРиск: 1 234%'
+    const result = parseCh1(buildStandaloneContext(text))
+
+    expect(result.route).toBe('execute')
+    const intent = result.intents[0]!
+    if (intent.kind !== 'entry_signal') throw new Error('unreachable')
+    expect(intent.riskPct).toBe(1234)
+  })
+
+  it('без фикса (для контраста) старый SL_RE без \\s вовсе не матчит "SL: 61 500$" — сигнал уходил в no_SL', () => {
+    // Документирует сам баг класса символов: `[\d.,]+` (без `\s`) не может дотянуться через
+    // пробел-разделитель тысяч до `$` в конце — ни при каком бэктрекинге группы вся SL_RE не
+    // матчится вообще (а не "откусывает" число до пробела, как можно было бы наивно предположить).
+    expect(/sl:?\s*([\d.,]+)\s*\$/i.test('SL: 61 500$')).toBe(false)
+  })
+})
