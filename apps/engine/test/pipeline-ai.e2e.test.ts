@@ -336,6 +336,7 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
         baseOutput({
           message_type: 'close_partial',
           confidence: 0.9,
+          summary: 'Автор фиксирует половину лонга BTCUSDT.',
           actions: [
             {
               type: 'close',
@@ -357,6 +358,10 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
     const row = await messageRow(db, message.id)
     expect(row.status).toBe('executed')
     expect(row.method).toBe('ai')
+    // Приёмка задачи 7: extract_signal.summary (обязательное поле схемы) теперь доходит до
+    // messages.ai_summary — раньше пайплайн его нигде не читал (см. p2-task7-report.md), и
+    // sparkles-саммари (design) никогда не показывался на реальных данных.
+    expect(row.ai_summary).toBe('Автор фиксирует половину лонга BTCUSDT.')
 
     const actions = await actionsFor(db, message.id)
     expect(actions).toHaveLength(1)
@@ -387,8 +392,11 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
     expect(row.status_reason).toBe('low_confidence')
     expect(row.method).toBe('review')
 
+    // Задача 6/7: needs_review теперь порождает СИНТЕТИЧЕСКУЮ actions-строку (0 ордеров, гейт
+    // сработал ДО processIntent) — иначе оператор не видел бы в UI, что это сообщение непонято.
     const actions = await actionsFor(db, message.id)
-    expect(actions).toHaveLength(0) // 0 ордеров/actions — гейт сработал ДО processIntent
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({ status: 'needs_review', skip_reason: 'low_confidence', method: 'review', trade_id: null })
   })
 
   it('needs_human=true (даже с валидным символом) -> needs_review needs_human, 0 actions', async () => {
@@ -411,7 +419,10 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
     const row = await messageRow(db, message.id)
     expect(row.status).toBe('needs_review')
     expect(row.status_reason).toBe('needs_human')
-    expect(await actionsFor(db, message.id)).toHaveLength(0)
+    // Задача 6/7: needs_review теперь видим оператору как actions-строка (0 ордеров).
+    const actions = await actionsFor(db, message.id)
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({ status: 'needs_review', skip_reason: 'needs_human', method: 'review' })
   })
 
   it('эскалация Sonnet(0.6)->Opus(0.95, резолвит уверенно) -> УСПЕШНОЕ исполнение, method ai', async () => {
@@ -459,7 +470,11 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
     expect(ch2Row.status).toBe('needs_review')
     expect(ch2Row.status_reason).toBe('ai_unavailable')
     expect(ch2Row.method).toBe('review')
-    expect(await actionsFor(db, ch2Message.id)).toHaveLength(0)
+    // Задача 6/7: деградация AI тоже теперь оставляет видимую actions-строку (needs_review,
+    // reason ai_unavailable) — оператор видит В UI, что именно эти сообщения не были обработаны.
+    const ch2Actions = await actionsFor(db, ch2Message.id)
+    expect(ch2Actions).toHaveLength(1)
+    expect(ch2Actions[0]).toMatchObject({ status: 'needs_review', skip_reason: 'ai_unavailable', method: 'review' })
     const ch2Orders = await db.selectFrom('orders').selectAll().where('channel_id', '=', CH2_ID).execute()
     expect(ch2Orders).toHaveLength(0)
 

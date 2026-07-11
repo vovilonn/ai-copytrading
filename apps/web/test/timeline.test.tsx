@@ -185,6 +185,23 @@ describe('MessageTimeline', () => {
     expect(screen.queryByText('Skipped')).toBeNull()
   })
 
+  // Задача 7 (приёмка форума 1962583820): 'symbol_unknown_needs_vision' — reconciler.ts/
+  // normalize-output.ts тоже маркируют needs_review этой причиной (AI не смог определить символ,
+  // САМАЯ частая needs_review-причина на реальных данных), а task-6 её пропустила при написании
+  // NEEDS_REVIEW_REASONS (action-display.tsx) — без этой правки бейдж молча падал на "Skipped".
+  it('task-7: action со skipReason="symbol_unknown_needs_vision" тоже рендерит "Needs review", а не "Skipped"', async () => {
+    renderTimeline([
+      messageFixture({
+        actions: [
+          { type: 'open', side: null, pair: null, tradeRef: null, skipReason: 'symbol_unknown_needs_vision', icon: 'trending-up' },
+        ],
+      }),
+    ])
+    const badge = await screen.findByText('Needs review')
+    expect(badge).toHaveAttribute('title', 'symbol_unknown_needs_vision')
+    expect(screen.queryByText('Skipped')).toBeNull()
+  })
+
   it("событие message.new добавляет узел в начало списка без перезагрузки", async () => {
     renderTimeline([messageFixture({ id: 'm-1', text: 'старое сообщение' })])
     await screen.findByText('старое сообщение')

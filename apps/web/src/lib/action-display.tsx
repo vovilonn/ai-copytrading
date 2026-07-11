@@ -39,17 +39,25 @@ export function normalizeTradeRef(ref: string): string {
   return ref.startsWith('#') ? ref : `#${ref}`
 }
 
-// Task 6 (Ф2, task-6-brief.md): причины, которыми reconciler (apps/engine/src/reconciler.ts)
-// помечает исход needs_review (а не обычный business-skip вроде symbol_busy/no_sl) —
+// Task 6 (Ф2, task-6-brief.md), дополнено задачей 7 (task-7-brief.md, приёмка на реальном форуме
+// 1962583820): причины, которыми reconciler (apps/engine/src/reconciler.ts) ЛИБО
+// normalizeAiOutput (apps/engine/src/ai/normalize-output.ts: resolveReason(), route==='ai')
+// помечают исход needs_review (а не обычный business-skip вроде symbol_busy/no_sl) —
 // 'parser_disagreement' (rule 3: детерминированный/AI разбор разошлись), 'ai_unavailable'
-// (деградация ai-proxy), 'low_confidence' (гейт §8/§11), 'needs_human' (дефолт-фолбэк AI-причины).
-// Список вынесен сюда, а не в shared/ — задача работает только в apps/web, skipReason в DTO
-// сейчас просто `string | null`, разбор смысла причины — забота фронта этой задачи.
+// (деградация ai-proxy), 'low_confidence' (гейт §8/§11), 'needs_human' (AI явно поднял флаг),
+// 'symbol_unknown_needs_vision' (AI не смог определить символ — САМАЯ частая needs_review-причина
+// на реальном форуме, задача 6 её пропустила: risk был явно записан в "Сомнения" p2-task6-report.md
+// п.2 — "если такое всплывёт в задаче 7"; всплыло — 2 из 75 сообщений приёмки), 'ai_unresolved_marker'
+// (символьный маркер, который AI не смог разрешить). Список вынесен сюда, а не в shared/ — задача
+// работает только в apps/web, skipReason в DTO сейчас просто `string | null`, разбор смысла причины —
+// забота фронта этой задачи.
 const NEEDS_REVIEW_REASONS: ReadonlySet<string> = new Set([
   'parser_disagreement',
   'ai_unavailable',
   'needs_human',
   'low_confidence',
+  'symbol_unknown_needs_vision',
+  'ai_unresolved_marker',
 ])
 
 /** true, если skipReason — один из "требует ручной проверки" исходов реконсилера (needs_review):

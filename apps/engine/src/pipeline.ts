@@ -109,8 +109,16 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     // детерминированный адаптер сам не смог построить intent (route==='ai' — терсное/free-form/
     // картинка-only сообщение CH2). CH1 и CH2 A/B/C/D никогда не заходят сюда — деградация AI их
     // не касается (см. runAiBranch — при отказе возвращает null, а не бросает наружу).
-    const aiParsed: ParsedResult | null =
+    const aiBranch =
       parsed.route === 'ai' ? await runAiBranch(trx, message, normalizedText, instruments, channel.adapter_id, detParseResult.id) : null
+    const aiParsed: ParsedResult | null = aiBranch?.parsed ?? null
+    // НАХОДКА приёмки задачи 7 (в дополнение к находке задачи 6): extract_signal ВСЕГДА возвращает
+    // `summary` (schema.ts: обязательное поле tool-вызова), но до этой правки пайплайн его нигде
+    // не читал — messages.ai_summary оставался NULL даже для method='ai' сообщений, и UI (design:
+    // sparkles-саммари) никогда не рисовался на реальных данных (см. p2-task7-report.md). Кладём
+    // как есть, независимо от исхода реконсиляции (needs_review/skipped/executing) — саммари
+    // описывает, что модель УВИДЕЛА в сообщении, это полезно оператору и в needs_review-кейсе.
+    const aiSummary: string | null = aiBranch?.summary ?? null
 
     const decision = reconcile(parsed, aiParsed, { channelId: message.channelId })
     const now = new Date()
@@ -118,13 +126,25 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     if (decision.outcome === 'noise') {
       await trx
         .updateTable('messages')
-        .set({ status: 'noise', normalized_text: normalizedText, method: decision.method, updated_at: now })
+        .set({ status: 'noise', normalized_text: normalizedText, method: decision.method, ai_summary: aiSummary, updated_at: now })
         .where('id', '=', message.id)
         .execute()
       return
     }
 
     if (decision.outcome === 'needs_review') {
+      // НАХОДКА задачи 6 (закрыта здесь, task-7-brief.md п.1): раньше needs_review возвращался
+      // БЕЗ actions-строки — оператор не видел в UI ни таймлайна, ни /actions, что сообщение
+      // непонято/спорно (UNKNOWN, parser_disagreement, ai_unavailable, needs_human, low_confidence).
+      // Пишем ту же синтетическую "весь месседж" строку, что и для skip (ensureWholeMessageAction
+      // ниже), status='needs_review', skip_reason=decision.reason — фронт (action-display.tsx:
+      // isNeedsReviewReason) уже умеет рисовать по этому skip_reason бейдж "Needs review" вместо
+      // "Skipped" (задача 6), достаточно, чтобы строка вообще существовала.
+      // decision.method здесь всегда 'review' (reconciler.ts: все needs_review-ветки возвращают
+      // method:'review') — берём defensively, тем же приёмом, что и у method ниже для skipped.
+      const method: 'review' = decision.method === 'review' ? decision.method : 'review'
+      const created = await ensureWholeMessageAction(trx, message, decision.reason ?? 'needs_review', method, 'needs_review')
+      if (created) notifyNeeded = true
       await trx
         .updateTable('messages')
         .set({
@@ -132,6 +152,7 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
           status_reason: decision.reason ?? null,
           normalized_text: normalizedText,
           method: decision.method,
+          ai_summary: aiSummary,
           updated_at: now,
         })
         .where('id', '=', message.id)
@@ -142,7 +163,7 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     if (decision.outcome === 'skipped') {
       // decision.method здесь всегда 'auto' либо 'ai' (reconciler.ts) — never null/'review'.
       const method: 'auto' | 'ai' = decision.method === 'ai' ? 'ai' : 'auto'
-      const created = await ensureWholeMessageSkipped(trx, message, decision.reason ?? 'skip', method)
+      const created = await ensureWholeMessageAction(trx, message, decision.reason ?? 'skip', method, 'skipped')
       if (created) notifyNeeded = true
       await trx
         .updateTable('messages')
@@ -151,6 +172,7 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
           status_reason: decision.reason ?? null,
           normalized_text: normalizedText,
           method,
+          ai_summary: aiSummary,
           updated_at: now,
         })
         .where('id', '=', message.id)
@@ -173,7 +195,7 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
 
     await trx
       .updateTable('messages')
-      .set({ status: 'executed', normalized_text: normalizedText, method, updated_at: now })
+      .set({ status: 'executed', normalized_text: normalizedText, method, ai_summary: aiSummary, updated_at: now })
       .where('id', '=', message.id)
       .execute()
   })
@@ -196,6 +218,15 @@ function needsEscalation(output: ExtractSignalOutput): boolean {
   if (output.needs_human) return true
   if (output.confidence < AI_CONFIDENCE_GATE) return true
   return output.actions.some((a) => a.symbol === 'UNKNOWN')
+}
+
+/** Результат успешной AI-ветки: и канонический разбор для reconciler'а, и `summary` от модели
+ *  (schema.ts: extract_signal.summary, обязательное поле) — приёмка задачи 7 обнаружила, что
+ *  пайплайн раньше нигде не читал `output.summary`, из-за чего `messages.ai_summary` оставался
+ *  NULL и sparkles-саммари (design) никогда не рендерился на реальных данных, см. отчёт. */
+interface AiBranchResult {
+  parsed: ParsedResult
+  summary: string
 }
 
 /**
@@ -223,7 +254,7 @@ async function runAiBranch(
   instruments: InstrumentMap,
   adapterId: string,
   deterministicParseResultId: string,
-): Promise<ParsedResult | null> {
+): Promise<AiBranchResult | null> {
   try {
     const aiContext = await buildContext(trx, {
       id: message.id,
@@ -296,7 +327,7 @@ async function runAiBranch(
       })
       .execute()
 
-    return aiParsed
+    return { parsed: aiParsed, summary: output.summary }
   } catch (err) {
     // Алерт в лог (задача просит "алерт в лог", отдельная алертинг-инфраструктура вне границ
     // этой задачи) — без него отказ AI был бы виден только по накоплению needs_review в UI.
@@ -397,15 +428,17 @@ async function buildParseContext(trx: Kysely<DB>, message: PipelineMessage, inst
 }
 
 // ---------------------------------------------------------------------------
-// Целиком отвергнутое сообщение (route==='skip', ParsedResult.intents всегда []).
+// Целиком отвергнутое ИЛИ спорное сообщение (route==='skip' -> status skipped; outcome
+// needs_review -> status needs_review, задача 6/7). ParsedResult.intents в обоих случаях всегда [].
 // ---------------------------------------------------------------------------
 
 /** @returns true, если строка actions реально создана этим вызовом (а не уже существовала). */
-async function ensureWholeMessageSkipped(
+async function ensureWholeMessageAction(
   trx: Kysely<DB>,
   message: PipelineMessage,
   reason: string,
-  method: 'auto' | 'ai',
+  method: 'auto' | 'ai' | 'review',
+  status: 'skipped' | 'needs_review',
 ): Promise<boolean> {
   const existing = await trx
     .selectFrom('actions')
@@ -422,15 +455,17 @@ async function ensureWholeMessageSkipped(
       channel_id: message.channelId,
       action_index: 0,
       // 'open' — лучшее приближение: подавляющее большинство skip-исходов CH1 (no_SL/
-      // symbol_unknown/symbol_not_listed/incomplete_signal) происходит из R1 (попытка входа).
-      // ParsedResult НЕ сохраняет исходные symbol/kind на skip-ветке (ch1.adapter.ts, задача 3,
-      // не переписываем) — точнее классифицировать здесь нечем, см. отчёт по задаче 7.
+      // symbol_unknown/symbol_not_listed/incomplete_signal) происходит из R1 (попытка входа), а
+      // needs_review-исходы (UNKNOWN/parser_disagreement/ai_unavailable/needs_human/low_confidence)
+      // по той же причине не несут восстановимого symbol/kind — action_type NOT NULL в схеме
+      // (миграция 001_initial.ts) не допускает null, точнее классифицировать здесь нечем, см.
+      // отчёт по задаче 7.
       type: 'open',
       side: null,
       symbol: null,
       pair: null,
       method,
-      status: 'skipped',
+      status,
       skip_reason: reason,
     })
     .returning('id')
@@ -439,6 +474,9 @@ async function ensureWholeMessageSkipped(
   await trx
     .insertInto('domain_events')
     .values({
+      // Один и тот же event И для skipped, И для needs_review — фронт (apps/web/src/lib/ws.ts)
+      // слушает 'action.skipped' как сигнал "эта action-строка в терминальном состоянии без
+      // исполнения, перечитай список" безотносительно конкретного status/skip_reason.
       type: 'action.skipped',
       aggregate: 'action',
       aggregate_id: inserted.id,

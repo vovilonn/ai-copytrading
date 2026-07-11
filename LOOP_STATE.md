@@ -2,250 +2,111 @@
 
 ## Goal
 
-Production-ready AI копитрейдинг-платформа:
+Фаза 2, задача 7 (финальная задача Ф2): включить форум `1962583820` в обработку engine наравне
+с каналом `2088626562`, закрыть находку задачи 6 (`needs_review` не писал action-строку —
+оператор не видел непонятые сообщения), провести приёмку Ф2.
 
-- **Ingestion:** Telegram MTProto userbot, каналы `2088626562` и форум `1962583820` (топик «A TRADING», `173666`).
-- **Понимание:** детерминированный парсер + AI-слой (текст **и картинки**) через локальный `ai-proxy`. Цель AI — 100% покрытие, ни один action не потерян.
-- **Исполнение:** Bybit V5 (`linear`). Фиксированный notional из настроек канала, дефолтное и максимальное плечо, пересчёт плеча если SL за ценой ликвидации.
-- **UI:** React (Vite) + shadcn, 1:1 по `design/project/Admin.dc.html`. Страница позиций стримится в реальном времени.
-- **Проверка:** реальные API; Bybit — testnet.
+Источник: `.superpowers/sdd/task-7-brief.md`.
 
-Процесс: superpowers (brainstorming → writing-plans → реализация по фазам).
-
-## Установленные факты
-
-Проверено вживую, не по документации:
-
-- **ai-proxy** (`http://127.0.0.1:8317`) авторизован под `dcsport111@gmail.com` (Claude-подписка).
-  - `/v1/messages` отвечает; доступны `claude-haiku-4-5`, `claude-sonnet-4-5`, `claude-opus-4-*` и др.
-  - **Structured output работает**: `tool_choice: {type:"tool"}` → `stop_reason: tool_use` с валидным JSON.
-  - **Vision работает**: base64 PNG в `content[].image` распознаётся.
-  - Прокси подмешивает системный промпт Claude Code (~1.3k input-токенов на запрос) — учитывать в стоимости.
-- **Bybit**: ключи в `.env` теперь **testnet** (`api-testnet.bybit.com`, `retCode=0`). Mainnet-ключи закомментированы.
-  - Баланс testnet пуст → перед e2e нужен faucet.
-  - Прошлые mainnet-ключи имели права `ContractTrade: Order, Position` (не read-only).
-- **Telegram**: сессии нет. `TG_APP_API_ID`/`TG_APP_API_HASH` есть, `TG_SESSION` создаётся входом по телефону.
-
-## Дизайн: что должен уметь фронт
-
-Разобран `design/project/Admin.dc.html` целиком.
-
-- **Auth**: экран логина (login/password), logout.
-- **Навигация**: сайдбар (Telegram Channels / Actions / Positions) + Settings; на мобиле — bottom nav; хлебные крошки.
-- **Channels**: таблица — Channel (аватар-инициал, name, handle), Copy (On/Off), Win Rate, Actions, Active Positions, Messages, Trade size, Max lev.
-- **Channel → Messages**: таймлайн сообщений (время, текст, фото), под каждым — блок распознанных actions (1..N строк: иконка, заголовок + процент, пара, ссылка «Trade #TR-xxxx» → на Positions с фильтром, либо бейдж «Skipped» если копитрейд выключен) + AI-саммари (sparkles) когда `method === 'ai'`.
-- **Channel → Settings**: Copy trading (toggle), Trade size ($), Max leverage (x), Default leverage (x, опционально), Allow cross margin (toggle), Save + флеш «Saved».
-- **Actions**: фильтры Channel / Period (All, Today, 7d, 30d) / Type (Open, Close, Partial TP, Partial close) / Side + поиск по паре. Таблица: Action, Pair, Summary, Trade, Channel, Time, Method (AI parsing / Auto parsing). Пустое состояние.
-- **Positions**: 4 стат-карточки (Open positions, Unrealised PnL, Position value, Margin used), фильтры Channel / Side / Margin + поиск по symbol/channel/#TR-ID. Таблица: Symbol, Side, Size, Entry, Mark, Liq. price, Unreal. PnL + ROI, TP/SL, Leverage + чип Cross/Isolated, Source (канал + #TR-ref).
-- **Токены**: фон `#000`, карточка `#0d0d0f`, границы `rgba(255,255,255,.07)`, акцент `#ff6a1f`, long `#34d399`, short `#fb7185`, skipped `#fbbf24`. Шрифт `Exo 2`, моно — `ui-monospace`. Иконки только lucide.
-- **Типы actions в UI**: `open` (long/short), `close`, `partial_tp`, `partial_close`. Сущность **Trade (#TR-xxxx)** связывает actions и позицию.
-
-## Анализ реальных сообщений (по 100 из каждого источника)
-
-Дамп: `temp/tg-dump/<channel>/messages.jsonl` + `media/*.jpg`.
-
-| | канал 2088626562 | форум, топик A TRADING |
-|---|---|---|
-| Структурные входы | 27 (жёсткий шаблон) | 7 |
-| Дельты | 30, **reply на сам сигнал** | 25, в основном reply на корень топика |
-| Шум | 29 «обзоров» + 11 прочего | 33 коммента |
-| Сообщений < 25 символов | 1 | 42 |
-| С фото | 80 | 47 |
-
-Выводы:
-
-- **Канал 2088626562** — регулярный: `#TICKER/USDT 📈LONG`, `Диапазон входа: a - b$`, `TP: x$ - y$ - z$`, `SL: s$`, `Риск: N%`. Дельты приходят `reply` на сообщение-сигнал → **позиция матчится детерминированно**, без state-догадок. Опасный шум: `#BTC обзор 💸` содержит цены BTC, но сигналом не является.
-- **Форум A TRADING** — свободный чат. `2🎯`, `Фикс половину`, `Стоп на твх`, `Sl 74`. **Текст без картинки бессмыслен**: у `2🎯` приложена карточка WEEX с `SOLUSDT, Лонг, 10x, вход 79,28, закрытие 82,29`. Vision обязателен. Цели склеены emoji-цифрами: `1️⃣80.82️⃣82.33️⃣84`. Встречаются несколько ордеров в одном сообщении: `Limit long btc 60850 + limit long btc 60000`.
-
-## Решения по ТЗ (утверждены заказчиком)
-
-1. **Изоляция каналов:** один символ — один канал. Первый занявший `BTCUSDT` владеет им до закрытия; сигнал другого канала → `Skipped` с причиной. (Bybit в one-way режиме держит одну позицию на символ.)
-2. **Тейки:** лесенка частичных TP на бирже (`tpslMode: Partial`), равными долями по числу целей из сообщения. Стопы/тейки живут на бирже — сработают, даже если бот лежит.
-3. **Dry-run:** глобальный `EXECUTION_MODE=dry_run|live` в `.env` поверх per-channel тоггла Copy trading.
-4. **Сайзинг** (fixed-fractional с фолбэком):
-   ```
-   есть Риск% и SL  →  notional = (Риск% × equity) / stopDistance,  stopDistance = |entry − SL| / entry
-   нет Риск%        →  notional = Trade size канала            (фолбэк, работает для обоих каналов)
-   нет SL           →  Skipped: без стопа не посчитать ни размер, ни безопасное плечо
-   ```
-   Нужен жёсткий потолок notional — узкий стоп (0.5%) иначе даёт notional в разы больше депозита.
-5. **Плечо:** берём default канала; если цена ликвидации ближе SL — понижаем, пока liq не уйдёт за SL (с буфером); всегда `≤ Max leverage` канала и `≤ maxLeverage` инструмента.
-6. **Доливки** исполняются и показываются в UI как ещё один `Open` в той же сделке `#TR-x`.
-7. **Вход диапазоном:** цена внутри → market; ещё не дошла → limit на ближнюю границу; ушла за диапазон → Skipped. Неисполненные лимитки отменяются по TTL (иначе сработают через неделю, когда сигнал уже неактуален).
-
-## Пересмотр решений после верификации
-
-Рецензент опроверг три решения доказательствами из дампа. Пересогласовано с заказчиком:
-
-1. **Изоляция → субаккаунт Bybit на канал** (было: один символ — один канал). Причина: 30 июня
-   оба канала держали SOL long одновременно (форум с 12:39, канал с 14:34, закрыт в плюс) —
-   на одном one-way аккаунте сделка была бы потеряна. Ключ в `.env` оказался мастер-ключом
-   (`isMaster: true`, права `AccountTransfer`+`SubMemberTransfer`) — провижининг возможен.
-   Побочно чинит тумблер cross/isolated (в UTA режим маржи аккаунт-уровневый) и фильтр Margin.
-2. **Вход без SL → входим со страховочным SL** (было: Skipped). Причина: форум почти всегда
-   постит вход без стопа, стоп приходит отдельным поздним сообщением (`221353` → `221355`).
-   Правило Skipped оставило бы каналу 7 сигналов из 100.
-3. **TP:** цели из сообщения, если нет — свои. Последующие сообщения, меняющие ещё не
-   сработавшие TP/SL, двигают выставленные ордера (`amend`). «Зафиксировал 50%» — событие,
-   не команда (иначе двойное закрытие).
-4. **«Один объём» = одна лега** (вход или добор). Позиция — список лег.
-
-## Ключевые находки верификации
-
-- **ai-proxy молча игнорирует поле `system`** — инструкции класть в user-turn с `cache_control`.
-  Prompt caching работает. Прокси добавляет ~1370 input-токенов в каждый запрос. Это SPOF (был 502).
-- **Двухступенчатость haiku→sonnet отвергнута эмпирикой:** haiku теряет 2–4.5% действий и выходит
-  дороже ($12.03 против $11.65 за 1000). Одна ступень Sonnet 4.5 (F1 0.891), эскалация на Opus 4.8.
-- **Признак ответа в топике — `replyToTopId`, а не `replyToMsgId`** (проверено на 221445/221452).
-  Без колонки `reply_to_top_id` в реалтайме терялось бы 14% дельт форума.
-- **`orderLinkId` нельзя строить от `tradeId`** — краш между отправкой ордера и персистом даёт
-  дубль. Ключ — координаты сообщения: `K02-221452-00-E0`. Префикс `D` для dry-run.
-- **`catchUp()` в GramJS — пустая заглушка**, `getDifference` нет: пропуск после обрыва библиотека
-  не восстанавливает, а сообщение может прийти дважды. Бэкфилл — наш, дедуп обязателен.
-- «Error: TIMEOUT» из `updates.js` — штатный keepalive-пинг, за ним идёт авто-реконнект.
-- **24 из 25 сообщений топика имеют `editDate`** — правки норма. Политика «любая правка →
-  needs_review» парализовала бы систему; нужен дифф против исполненной версии.
-- `downloadMedia(msg, {thumb: -1})` качает весь mp4, а не превью — брать `PhotoSize` из `thumbs`.
-- `GRASSUSDT`/`EIGENUSDT` на testnet `status=Closed` → гейт `status == 'Trading'`.
-- `maxLeverage` расходится testnet/mainnet — клампить по инструменту сети исполнения.
-- Автор форума держал лимитку на BTC 61000 **трое суток** → TTL 24ч сломал бы план; TTL = 7 дней
-  как защитный потолок, отмена — по явным сообщениям.
+Файлы: `apps/engine/src/main.ts`, `apps/engine/src/pipeline.ts`,
+`apps/engine/test/pipeline-ai.e2e.test.ts`, `apps/web/src/lib/action-display.tsx`,
+`apps/web/test/timeline.test.tsx`, `apps/web/test/actions.test.tsx`, `LOOP_STATE.md`.
 
 ## Status
 
-- [x] Изучен `design/`, `temp/tg-signal-bot-architecture.md`, окружение
-- [x] Проверены ai-proxy (tool_use + vision) и Bybit testnet (REST + private/public WS)
-- [x] `scripts/tg-login.mjs`, `scripts/tg-dump.mjs`, `scripts/lib/tg.mjs` + pnpm-скрипты
-- [x] `pnpm tg:login` выполнен, `TG_SESSION` в `.env`
-- [x] Выгружены и проанализированы 200 реальных сообщений
-- [x] Верификация допущений: 6 исследований + злой рецензент + проверяющий
-      (`docs/superpowers/research/`)
-- [x] Пересогласованы решения, опровергнутые верификацией
-- [x] Дизайн-док: `docs/superpowers/specs/2026-07-10-ai-copytrading-platform-design.md`
-- [x] **Аппрув спеки заказчиком**
-- [x] План реализации по фазам (writing-plans)
-- [x] **Ф0 реализована и принята** (задача 13: docker-compose целиком, приёмка вручную —
-      см. `.superpowers/sdd/task-13-report.md`): вход, оба канала с реальными счётчиками,
-      таймлайны с текстом/фото/альбомами, реалтайм по WebSocket без перезагрузки страницы,
-      дедуп подтверждён (0 дублей `channel_id, tg_message_id`), `pnpm test`/`pnpm typecheck` зелёные.
-- [x] **Фикс edited-сообщений** (commit d017068): правки автора теперь прилетают в UI без F5.
-      Добавлено событие `message.updated`; `saveMessage` возвращает `updated`; publisher рассылает,
-      фронт заменяет узел на месте. Проверено сквозным путём на пересобранном стеке (метка `[EDITED]`
-      появилась без перезагрузки).
-- [x] **Bybit testnet пополнен**: 1000 USDT на UNIFIED-счёте (`totalEquity 999`, доступно 1000) —
-      готово к e2e-исполнению в Ф3.
-- [x] **Ф1 реализована и принята** (задача 11: `engine` в docker-compose, приёмка на живой БД —
-      см. `.superpowers/sdd/p1-task11-report.md`): `docker compose ps` — postgres/ai-proxy/api/web
-      healthy, tg-ingest/engine running; `/actions` 909 строк (619 при фильтре Type=Open),
-      `/positions` 76 открытых позиций (4 стат-карточки, Liq. price заполнен у всех, mark price
-      меняется живым потоком в пределах ~6с), `/channels/2088626562` — action-строки под
-      сообщениями (иконка+тип+пара+Trade #TR-x) теперь РЕАЛЬНО рендерятся (см. грабли ниже).
-      trades=110, actions=909, positions(size<>0)=76, orders=478. Идемпотентность подтверждена:
-      сброшены 516 executed-сообщений в received, после реобработки — 0 дублей
-      (message_id,action_index) в actions и 0 дублей order_link_id в orders, счётчики не
-      изменились. `pnpm test`/`pnpm typecheck` зелёные (309 тестов, 6 пакетов).
-- [ ] Ф2: AI-слой и форум
-- [ ] Ф3: live-исполнение на Bybit testnet (баланс есть)
-- [ ] Ф4: история, Win Rate, реплей-бэктест
+- [x] Прочитаны task-7-brief.md, pipeline.ts/reconciler.ts/main.ts, p2-task6-report.md
+      (находка задачи 6), progress-phase2.md.
+- [x] **Находка задачи 6 закрыта**: `pipeline.ts` при исходе `needs_review` теперь вставляет
+      синтетическую actions-строку (`ensureWholeMessageSkipped` обобщена в
+      `ensureWholeMessageAction(trx, message, reason, method, status)`, status ∈
+      {'skipped','needs_review'}) — `type='open'` (та же условность, что и у skip-ветки, symbol
+      реально не восстановить), `symbol=null`, `skip_reason=decision.reason`,
+      `method='review'`. Фронт (задача 6, `isNeedsReviewReason`) уже рисовал бейдж "Needs
+      review" по `skipReason` — строки не хватало.
+- [x] **Вторая находка (обнаружена приёмкой, не была известна заранее)**: `NEEDS_REVIEW_REASONS`
+      во фронте (`action-display.tsx`, задача 6) перечисляла только 4 причины
+      (`parser_disagreement`/`ai_unavailable`/`needs_human`/`low_confidence`) — реальные
+      needs_review-сообщения форума в основном несут `symbol_unknown_needs_vision` (AI не
+      определил символ, `normalize-output.ts: resolveReason()`) и теоретически
+      `ai_unresolved_marker` — ни один не входил в список, бейдж падал на "Skipped". Это была
+      явно предсказана в `p2-task6-report.md` (Сомнения п.2: "если такое всплывёт в задаче 7").
+      Всплыло: 2 из 75 сообщений приёмки. Добавлены оба значения + 2 регресс-теста
+      (`timeline.test.tsx`, `actions.test.tsx`).
+- [x] **Третья находка (обнаружена приёмкой)**: `extract_signal.summary` (обязательное поле
+      AI tool-схемы, `schema.ts`) нигде не читался пайплайном — `messages.ai_summary` оставался
+      NULL даже для `method='ai'`, sparkles-саммари никогда не рендерился на реальных данных.
+      `runAiBranch` теперь возвращает `{parsed, summary}`, `processMessage` пишет
+      `ai_summary` во ВСЕХ 4 ветках (noise/needs_review/skipped/executing). Тест на
+      `messages.ai_summary` добавлен в `pipeline-ai.e2e.test.ts`.
+- [x] `apps/engine/src/main.ts`: `DETERMINISTIC_ADAPTER_ID` (только CH1) заменён на
+      `KNOWN_ADAPTER_IDS = ['ch1-structured','ch2-freeform']` — engine забирает `active`-каналы
+      обоих адаптеров. Порядок обработки внутри каждого канала строго последовательный
+      (`withChannelLock` не менялся) — деградация AI на форуме не блокирует CH1 в том же тике.
+- [x] `pnpm --filter engine test` → 254 passed (22 файла, было 254 — 3 теста needs_review
+      обновлены под новое поведение + 1 новый на ai_summary). `pnpm --filter web test` → 45
+      passed (было 43, +2 регресс-теста needs-review-reasons). `pnpm -r typecheck` → 7/7 чисто.
+- [x] Приёмка: выборка 75 последних сообщений форума (tg_message_id 221384..221460, окно
+      заведомо содержит терсные с картинками — `2🎯`, `Фикс половину`, `Стоп на твх`,
+      `1🎯стоп на твх`) обработана ЧЕРЕЗ `processMessage()` (тот же код, что и main.ts) —
+      52 executed, 4 needs_review (2 `ai_unavailable`+`symbol_unknown_needs_vision` из
+      контролируемого теста деградации, 2 из основной выборки), 21 noise. `ai_calls`: 34,
+      cost $0.47179. Playwright: символ из картинки виден (BTCUSDT "2🎯" → 28.95%/17.28% из
+      WEEX-карточки), Method "AI parsing", sparkles-саммари, "Needs review" бейдж на symbol
+      unknown кейсе. Скриншоты `/tmp/p2-forum*.png`, `/tmp/p2-actions.png`.
+- [x] Деградация вживую: `docker compose stop ai-proxy`, 2 форум-сообщения (нетронутый
+      бэклог, tg=221372/221354, прямой вызов `processMessage()`, НЕ через живой поллер —
+      см. "Грабли" ниже) → `needs_review`/`ai_unavailable`, actions-строка создана, 0 orders;
+      CH1-сообщение (tg=923, `#MOODENG/USDT LONG`) в ТОМ ЖЕ прогоне → `executed`, `trade_id`
+      прежний (идемпотентно). `docker compose start ai-proxy` — healthy.
+- [x] Отчёт `.superpowers/sdd/p2-task7-report.md`.
+- [ ] Коммит (`apps engine`/`apps web`/`LOOP_STATE.md`, БЕЗ `AGENTS.md`).
 
-## Известные грабли
+## LOOP ЗАВЕРШЁН (кроме коммита выше)
 
-- Порт `8317` у ai-proxy нельзя переназначать: OAuth-редирект жёстко ведёт на `127.0.0.1:<port из конфига>`.
-- Внутри `ai-proxy/` лежит свой `docker-compose.yml`; compose ищет файл вверх по дереву — команды запускать из корня.
-- `--force` у pnpm-скрипта перехватывается самим pnpm, поэтому флаг называется `--relogin`.
-- Порт хоста postgres — `POSTGRES_PORT=5442` (5432 занят postgres другого проекта).
-- `pnpm up` — зарезервированный алиас pnpm; корневой скрипт запускать как `pnpm run up`.
-- Пересборка контейнеров: `docker compose up -d --build`. Не забыть про `tg-ingest` — он без
-  healthcheck, `--build` иногда не пересоздаёт; при конфликте имён `docker rm -f <hash>_name`.
+## Грабли Ф2 (все задачи, накопительно)
 
-## Грабли Ф0 (задача 13 — docker-compose и приёмка)
+- **ai-proxy молча игнорирует поле `system`** — инструкции класть в user-turn с `cache_control`.
+  Prompt caching работает (`cache_read` в ответах). Прокси добавляет ~1.3-1.4k input-токенов
+  системного промпта Claude Code в КАЖДЫЙ запрос — учитывать в стоимости.
+- **Символ терсных сообщений форума резолвится ТОЛЬКО из картинки** — текст типа `2🎯`/`Фикс
+  половину` без vision бессмыслен, WEEX-скриншот с parою/направлением/плечом — единственный
+  источник символа.
+- **`needs_review` должен писать action-строку** (эта задача) — иначе оператор не видит в UI
+  ни одного из непонятых/спорных сообщений, только накопление в БД без интерфейса.
+- **Список needs_review-причин на фронте должен быть синхронизирован с ДВУМЯ источниками**:
+  `reconciler.ts` (`parser_disagreement`/`low_confidence`/`ai_unavailable`) И
+  `ai/normalize-output.ts: resolveReason()` (`symbol_unknown_needs_vision`/`needs_human`/
+  `ai_unresolved_marker`) — пропуск любого из шести на фронте молча превращает "Needs review"
+  в "Skipped".
+- **`PROMPT_VERSION` инвалидирует `ai_cache`** при смене промпта (v1→v2, задача 5) — ожидаемо,
+  но нужно помнить при калибровке: старый кэш не переиспользуется под новый промпт.
+- **Деградация fail-safe подтверждена вживую**: отказ ai-proxy НЕ роняет транзакцию/сообщение
+  (`runAiBranch` ловит исключение, возвращает null, reconciler доводит до `needs_review`), CH1
+  в ТОМ ЖЕ тике/прогоне продолжает работать — детерминированный путь не вызывает AI вообще.
+- **Живой поллер `main.ts` НЕЛЬЗЯ просто "включить" на канал с большим необработанным
+  бэклогом** — `processChannel()` берёт 50 САМЫХ СТАРЫХ `received` по `tg_message_id ASC`;
+  форум имел 1657 `received` (1657-N с начала истории), и первый же рестарт `engine`-контейнера
+  с новым `main.ts` НАЧАЛ их обрабатывать (случайно затронул 43 старых сообщения до того, как
+  это было замечено и остановлено/откачено). Приёмка выборки последних ~75 и деградация
+  сделаны ПРЯМЫМ вызовом `processMessage()` (тот же код, что и engine) на конкретных
+  `tg_message_id`, а не через живой поллер — иначе поллер прошёл бы весь старый бэклог раньше,
+  чем добрался бы до специально выбранных/сброшенных сообщений. Контейнер `engine` в docker
+  сейчас **остановлен** (`docker compose stop engine`) — код смёржен и корректен, но старт
+  живого поллера начнёт дорабатывать оставшиеся ~1580 старых сообщений форума (оценка ~$10
+  AI-бюджета на всю историю, безопасно — dry-run, copy trading выключен для форума по
+  умолчанию) — решение "включать сейчас или нет" оставлено оператору осознанно, не принято
+  за него.
+- **`extract_signal.summary` — обязательное поле схемы, но пайплайн его не читал** (найдено
+  этой приёмкой) — `messages.ai_summary` был NULL даже для `method='ai'`, sparkles-блок
+  дизайна никогда не появлялся на реальных данных. Почищено.
+- **Copy trading выключен по умолчанию** (`channel_settings.enabled=false`) — ВСЕ actions
+  форума в приёмке получили `status='skipped', skip_reason='copy_disabled'` (кроме
+  needs_review) — символ/тип определяются и видны корректно, но ордера не идут ни для одного
+  канала, пока оператор явно не включит Copy trading (design intent, не баг).
 
-- `pg` отдаёт `BIGINT` строкой → зарегистрирован `setTypeParser(INT8, Number)`.
-- `msg.chatId` в GramJS — marked id (`-100<id>`), сырой id лежит в `msg.peerId`.
-- `saveMessage.inserted` нельзя выводить из `editedTs`: сообщения форума приходят уже с
-  `editDate`. Признак реальной вставки — `RETURNING (xmax = 0)`.
-- `catchUp()` в GramJS — заглушка, бэкфилл только свой.
-- Скачивание медиа падало при массовом бэкфилле и глушилось → нужны ретраи и ремонтный проход
-  (`apps/tg-ingest/src/retry.ts`, `media-repair.ts`).
-- Альбом Telegram — это N сообщений с общим `grouped_id`; группировать в один узел таймлайна
-  должен API (`apps/api/src/channels/channels.service.ts`), не ingest.
-- Vite-прокси по префиксу `/channels` перехватывал SPA-роут → весь HTTP API вынесен под `/api`
-  (`app.setGlobalPrefix('api')`), это же зеркалит `apps/web/nginx.conf` в контейнере.
-- Порт `5432` на хосте занят другим проектом → `POSTGRES_PORT=5442` (проброшен только наружу;
-  внутри сети compose `api`/`tg-ingest` ходят в `postgres:5432` напрямую).
-- vitest/esbuild не эмитит `design:paramtypes` → в NestJS-провайдерах обязателен явный
-  `@Inject(Class)` (актуально и для нового `HealthController` — не понадобился, DI без параметров).
-- **`pnpm up` — не наш скрипт**: pnpm резервирует `up` как alias для `pnpm update`, поэтому
-  голый `pnpm up` тихо не запускает `docker compose up`, а гоняет resolution зависимостей.
-  Нужно `pnpm run up` (или `pnpm run down`/`pnpm run logs` для симметрии).
-- **`ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` в чистом контейнере**: `pnpm-lock.yaml` записан с
-  `settings.injectWorkspacePackages: true`, а этот флаг на хосте стоял только в глобальном
-  `~/Library/Preferences/pnpm/rc`, не в репозитории — в Docker (нет глобального rc) `pnpm install
-  --frozen-lockfile` падал. Зафиксировано явно в корневом `.npmrc` (`inject-workspace-packages=true`),
-  чтобы сборка не зависела от конфигурации конкретной машины.
-- **Секьюр-кука ломает вход за `http`**: `sessionCookieOptions()` ставит `Secure` только при
-  `NODE_ENV=production`. Весь стек здесь работает по обычному http (`127.0.0.1:5173`, без TLS) —
-  если по привычке выставить `NODE_ENV=production` в compose для `api`, браузер тихо не сохранит
-  куку и вход будет молча не работать (без единой ошибки в сети). В `docker-compose.yml` `api`
-  намеренно держит `NODE_ENV=development`.
-- **`apps/api`/`apps/tg-ingest` рантайм — это `tsx`, не скомпилированный JS**: `exports` в
-  `package.json` обоих пакетов указывают на `./src/*`, а `tg-ingest` импортирует исходники `api`
-  напрямую как workspace-зависимость. Значит "прод-зависимости" в Dockerfile в привычном смысле
-  (`--prod`, без devDependencies) не подходят — `tsx`/`typescript` нужны в рантайме контейнера.
-  Ставим зависимости всего workspace одним `pnpm install` (без `--prod`) — осознанный компромисс,
-  задокументирован в `.superpowers/sdd/task-13-report.md`.
-- `RealtimeGateway` (WS) жёстко проверяет `Origin: http://localhost:5173` на хендшейке — порт
-  веб-контейнера в compose нельзя менять без правки кода, поэтому `127.0.0.1:5173:80` — не
-  только рекомендация брифа, но и жёсткое требование текущего кода.
-- Media-контроллер `api` читает файлы с диска (`var/media/...` относительно корня репозитория) —
-  контейнеру `api` тоже нужен том `./var:/app/var`, не только `tg-ingest` (иначе картинки в
-  таймлайне не отдаются, 404).
+## Известные грабли Ф0/Ф1 (не менялись, для справки)
 
-## Грабли Ф1 (задача 11 — engine в compose, приёмка, две полировки)
-
-- **`positions.liq_price` был NULL с самого task-6**, хотя `risk/leverage.ts liqPrice()` уже
-  вызывается в `pipeline.ts` (гейт `unsafe_stop`) — значение считалось и тут же выбрасывалось,
-  не долетая до `DryRunAdapter.placeEntry`. Полировка А — пробросить уже посчитанный `projectedLiq`
-  через новое поле `EntryOrder.liqPrice` (не пересчитывать второй раз, mmr не всегда под рукой
-  в адаптере). Тесты `dry-run.adapter.test.ts` пришлось точечно обновить (11 вызовов placeEntry
-  без liqPrice — поле сделано обязательным, а не optional, чтобы забытый liqPrice не проходил
-  тайпчек молча).
-- **Идемпотентный `ON CONFLICT (order_link_id) DO NOTHING` в `placeEntry` — короткое замыкание
-  ДО обновления positions**: значит простой сброс `messages.status='received'` и реобработка НЕ
-  бэкфиллит `liq_price` (или любое другое новое поле) для уже существующих открытых позиций —
-  ордер с тем же `orderLinkId` уже есть, `positions` не трогается вовсе. На реальной dev-БД у всех
-  76 уже открытых (до фикса) позиций `liq_price` остался NULL после реплея. Разово забэкенден
-  прямым SQL UPDATE (та же формула long/short, mmr из `instruments`, network='testnet') —
-  осознанный one-off бэкфилл dry-run-данных, не тронувший код/`.env`/схему. Для НОВЫХ входов
-  (после пересборки engine) `liq_price` пишется автоматически.
-- **Троттлинг тикеров (задача 10) — ОДНА карта таймстампов на «применить тик» — этого мало**:
-  1/сек на символ всё ещё даёт ~76 WS-событий/сек суммарно при 76+ открытых позициях, каждое
-  триггерит патч React Query кэша на фронте. Полировка Б — ВТОРАЯ, независимая карта таймстампов
-  (`lastEmittedAt`, порог `EMIT_THROTTLE_MS=2000`) гейтит именно эмит `position.upsert` в
-  `domain_events`; `positions.mark_price`/`unrealised_pnl` в БД по-прежнему пишутся на каждый
-  прошедший 1-секундный тик (дёшево). `applyMarkPriceTick` получил `opts.emit` (default true —
-  обратная совместимость со старыми тестами и прямыми вызовами); `outbox.publisher.ts` в `api`
-  рассылает КАЖДУЮ неопубликованную строку `domain_events` почти немедленно (NOTIFY-driven) —
-  поэтому троттлить нужно именно эмит события, а не что-то на стороне API/фронта, иначе поздно.
-- **Фронт молчаливо НЕ рендерил action-строки под сообщениями таймлайна** — `MessageTimeline.tsx`
-  с задачи 12 (Ф0) содержал буквальный комментарий "появится в Ф1", но при реализации Ф1
-  (`apps/api` — task 7/8) отрисовку так и не добавили: `MessageActionDto[]` из
-  `GET /channels/:id/messages` уже полностью готов (icon/type/pair/tradeRef/skipReason), а
-  компонент рисовал только точку/AI-саммари. Приёмка §4.2 брифа явно требует видеть
-  "иконка+тип+пара+Trade #TR-x" под сообщением — без этого честная приёмка невозможна, поэтому
-  доделано here: `ActionRow` в `MessageTimeline.tsx` (переиспользует `actionIconColor`/
-  `actionSummary` из `shared/action-meta.ts`, те же, что и `actions.tsx`) + `NodeTile` теперь берёт
-  иконку/цвет первого action вместо иконки-заглушки `Layers`. `getActionIcon`/`normalizeTradeRef`
-  вынесены в новый `apps/web/src/lib/action-display.tsx`, чтобы не дублировать маппинг иконок
-  между `actions.tsx` и `MessageTimeline.tsx` (DRY). `MessageRow` теперь использует
-  `useNavigate()` — тест `timeline.test.tsx` пришлось обернуть в `MemoryRouter` (тот же паттерн,
-  что уже был в `actions.test.tsx`/`positions.test.tsx`).
-- **`engine` в compose — единственный писатель, но БЕЗ healthcheck**: `main.ts` сам гоняет
-  миграции при старте (idempotent) и не слушает никакой сети — задача явно просит
-  `depends_on: postgres (service_healthy)` и НЕ просит зависимость от `api`/`ai-proxy`. На деле
-  это безопасно только потому, что `channels`/`instruments` в dev-БД уже засеяны с прошлых фаз
-  (постоянный volume `postgres-data`) — на чистой БД `engine` первые тики просто нашёл бы 0
-  каналов и молча ждал бы следующего опроса (5с) или NOTIFY, без порчи данных.
-- BIGINT/unsafe_stop-гейт/copy_disabled-гейт/префикс алиасов монет — унаследованные грабли задач
-  7-10 (см. соответствующие `.superpowers/sdd/task-*-report.md`), в рамках задачи 11 не
-  затрагивались повторно, отдельных новых сюрпризов не дали.
+- Порт `8317` у ai-proxy нельзя переназначать (OAuth-редирект на `127.0.0.1:<port>`).
+- `pnpm up` — зарезервированный алиас pnpm; корневой скрипт — `pnpm run up`.
+- Порт хоста postgres — `POSTGRES_PORT=5442`.
+- Пересборка контейнеров: `docker compose up -d --build`.

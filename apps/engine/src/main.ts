@@ -13,11 +13,16 @@ import { processMessage, type PipelineDeps, type PipelineMessage } from './pipel
 // тот же приём, что apps/tg-ingest/src/main.ts и apps/api/src/main.ts.
 loadDotenv({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) })
 
-// В Ф1 engine обрабатывает ТОЛЬКО канал(ы) с детерминированным адаптером CH1 (2088626562) —
-// форум (ch2-freeform) ждёт AI-слоя (Ф2, task-7-brief.md). Единственный известный
-// детерминированный адаптер сейчас — 'ch1-structured'; когда в Ф2/Ф3 появится второй det-канал,
-// сюда достаточно добавить его adapter_id (или сменить условие на список).
-const DETERMINISTIC_ADAPTER_ID = 'ch1-structured'
+// Ф2 (задача 7, task-7-brief.md): форум `1962583820` (adapter ch2-freeform) включён в обработку
+// НАРАВНЕ с CH1 (2088626562) — AI-слой (задача 4) и деградация fail-safe уже готовы (pipeline.ts:
+// route==='ai' -> runAiBranch). Фильтр по adapter_id остаётся (защита от неизвестного будущего
+// адаптера без парсера — getAdapter() иначе бросил бы исключение и сорвал бы тик остальным
+// каналам, см. tick() ниже), но теперь это список ОБОИХ известных адаптеров, а не один
+// детерминированный CH1: маршрутизация "детерминированный/AI" внутри канала — забота
+// adapter.parse()/reconcile() внутри processMessage, не этого тика. withChannelLock (ниже)
+// по-прежнему держит строгий последовательный порядок ВНУТРИ каждого канала независимо —
+// отказ AI на форуме (ai_unavailable) не блокирует и не замедляет обработку CH1 в том же тике.
+const KNOWN_ADAPTER_IDS = ['ch1-structured', 'ch2-freeform'] as const
 
 const POLL_INTERVAL_MS = 5000
 const BATCH_SIZE = 50
@@ -113,7 +118,7 @@ async function main(): Promise<void> {
       const channels = await db
         .selectFrom('channels')
         .select('id')
-        .where('adapter_id', '=', DETERMINISTIC_ADAPTER_ID)
+        .where('adapter_id', 'in', KNOWN_ADAPTER_IDS)
         .where('status', '=', 'active')
         .execute()
       for (const { id: channelId } of channels) {

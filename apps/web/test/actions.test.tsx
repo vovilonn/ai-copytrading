@@ -168,6 +168,25 @@ describe('ActionsPage', () => {
     expect(screen.queryByText('Skipped')).toBeNull()
   })
 
+  // Задача 7 (приёмка форума 1962583820): 'symbol_unknown_needs_vision' — САМАЯ частая needs_review-
+  // причина на реальных данных (normalize-output.ts: resolveReason(), AI не смог определить символ) —
+  // task-6 её не перечислила в NEEDS_REVIEW_REASONS, обнаружено на живом прогоне этой задачей.
+  it('task-7: needs_review-причина (symbol_unknown_needs_vision) рендерит бейдж "Needs review" вместо "Skipped"', async () => {
+    renderActions([
+      actionFixture({
+        id: 'a-4',
+        pair: null,
+        tradeRef: null,
+        skipReason: 'symbol_unknown_needs_vision',
+        icon: 'trending-up',
+        iconColor: '#e5e5e5',
+      }),
+    ])
+    const badge = await screen.findByText('Needs review')
+    expect(badge).toHaveAttribute('title', 'symbol_unknown_needs_vision')
+    expect(screen.queryByText('Skipped')).toBeNull()
+  })
+
   it('task-6: method="ai" рендерит текст "AI parsing" в колонке Method', async () => {
     renderActions([actionFixture({ method: 'ai' })])
     await screen.findByText('BTCUSDT')
