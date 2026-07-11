@@ -3,7 +3,9 @@ import { sql } from 'kysely'
 import { actionIcon } from 'shared/action-meta.js'
 import type { ChannelDto, MessageActionDto, MessageDto } from 'shared/dto.js'
 import { mediaUrl } from 'shared/media.js'
+import { formatWinRate } from 'shared/numbers.js'
 import { DatabaseService } from '../db/database.service.js'
+import { ChannelStatsService } from './stats.service.js'
 
 export const DEFAULT_MESSAGE_LIMIT = 50
 export const MAX_MESSAGE_LIMIT = 200
@@ -63,7 +65,11 @@ function mediaKindOf(messageMediaKind: string | null, mediaType: string): 'photo
   return 'photo'
 }
 
-function toChannelDto(row: ChannelRow): ChannelDto {
+// Win Rate (Ф4, task-2-brief.md): передаётся вызывающим кодом (listChannels/getChannel) —
+// сама toChannelDto не ходит в БД, чтобы остаться чистой функцией форматирования строки (та же
+// причина, по которой формула округления/пустого состояния вынесена в stats.service.ts, а не
+// дублируется здесь).
+function toChannelDto(row: ChannelRow, winRate: string): ChannelDto {
   const title = row.title ?? row.key
   return {
     id: row.id,
@@ -76,7 +82,7 @@ function toChannelDto(row: ChannelRow): ChannelDto {
     initial: title.charAt(0).toUpperCase(),
     status: row.status,
     copyEnabled: row.enabled,
-    winRate: '—', // закрытых сделок ещё нет (Ф0)
+    winRate,
     actionCount: row.action_count,
     activePositions: row.active_positions,
     messageCount: row.message_count,
@@ -89,7 +95,10 @@ function toChannelDto(row: ChannelRow): ChannelDto {
 
 @Injectable()
 export class ChannelsService {
-  constructor(@Inject(DatabaseService) private readonly database: DatabaseService) {}
+  constructor(
+    @Inject(DatabaseService) private readonly database: DatabaseService,
+    @Inject(ChannelStatsService) private readonly stats: ChannelStatsService,
+  ) {}
 
   async listChannels(): Promise<ChannelDto[]> {
     const { rows } = await sql<ChannelRow>`
@@ -97,7 +106,9 @@ export class ChannelsService {
       ${sql.raw(CHANNEL_FROM)}
       ORDER BY c.ord
     `.execute(this.database.db)
-    return rows.map(toChannelDto)
+    // Один доп. запрос на ВЕСЬ список (winRatesForAll — GROUP BY channel_id), не N+1 по каналам.
+    const winRates = await this.stats.winRatesForAll()
+    return rows.map((row) => toChannelDto(row, winRates.get(row.id) ?? formatWinRate(0, 0)))
   }
 
   async getChannel(id: number): Promise<ChannelDto | null> {
@@ -106,7 +117,10 @@ export class ChannelsService {
       ${sql.raw(CHANNEL_FROM)}
       WHERE c.id = ${id}
     `.execute(this.database.db)
-    return rows[0] ? toChannelDto(rows[0]) : null
+    const row = rows[0]
+    if (!row) return null
+    const winRate = await this.stats.winRateFor(id)
+    return toChannelDto(row, winRate)
   }
 
   async listMessages(channelId: number, limit: number, before?: number): Promise<MessageDto[]> {

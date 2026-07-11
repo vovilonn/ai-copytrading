@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseNumbers, toNum, splitKeycaps, signedMoney, computeRoi } from '../src/numbers.js'
+import { parseNumbers, toNum, splitKeycaps, signedMoney, computeRoi, formatWinRate } from '../src/numbers.js'
 
 describe('parseNumbers', () => {
   it('62 000$ — разделитель тысяч обычный пробел U+0020', () => {
@@ -93,5 +93,23 @@ describe('splitKeycaps', () => {
 
   it('1️⃣1.0752️⃣1.0953️⃣1.115 -> [1.075, 1.095, 1.115]', () => {
     expect(splitKeycaps('1️⃣1.0752️⃣1.0953️⃣1.115')).toEqual([1.075, 1.095, 1.115])
+  })
+})
+
+describe('formatWinRate', () => {
+  it('closedTrades=0 -> "—" (нет закрытых сделок, не "0%")', () => {
+    expect(formatWinRate(0, 0)).toBe('—')
+  })
+
+  it('2 победы из 3 закрытых -> округление 66.67 -> "67%"', () => {
+    expect(formatWinRate(3, 2)).toBe('67%')
+  })
+
+  it('0 побед из закрытых -> "0%"', () => {
+    expect(formatWinRate(5, 0)).toBe('0%')
+  })
+
+  it('все закрытые прибыльны -> "100%"', () => {
+    expect(formatWinRate(4, 4)).toBe('100%')
   })
 })

@@ -6,6 +6,7 @@ import { Badge } from '../components/ui/badge.js'
 import { Card } from '../components/ui/card.js'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table.js'
 import { apiFetch } from '../lib/api.js'
+import { useChannelStatsStream } from '../lib/ws.js'
 
 // Порядок и ширины колонок — дословно из брифа задачи 11 / Admin.dc.html:140-148.
 const COLUMNS: { label: string; width: string }[] = [
@@ -26,6 +27,10 @@ export default function ChannelsPage() {
     queryFn: () => apiFetch<ChannelDto[]>('/channels'),
   })
   const channels = data ?? []
+
+  // Win Rate в реалтайме (задача Ф4): подписка на комнаты ВСЕХ уже загруженных каналов — тот же
+  // приём, что useActionsStream/usePositionsStream (apps/web/src/routes/actions.tsx/positions.tsx).
+  useChannelStatsStream(channels.map((c) => c.id))
 
   return (
     <div className="flex w-full flex-col gap-[22px]">

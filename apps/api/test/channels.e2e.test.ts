@@ -417,3 +417,51 @@ describe('MessageDto.actions — заполняется из таблицы acti
     expect(noSignal.actions).toEqual([])
   })
 })
+
+// Задача Win Rate (Ф4, task-2-brief.md): closedTrades/wins считаются из trades.status='closed'/
+// is_win; cancelled (неисполнившаяся лимитка — не результат) исключён из знаменателя.
+// CHANNEL_2 (не CHANNEL_1) — изоляция от фикстур CHANNEL_1 выше (тест 'GET /channels...'
+// уже проверил ch1.winRate === '—' на канале без единой закрытой сделки).
+describe('Win Rate — статистика закрытых сделок (задача Win Rate, Ф4)', () => {
+  const CHANNEL_2_ID = Number(CHANNEL_SOURCES[1]!.channelId)
+  let seq = 700_000
+
+  async function seedClosedTrade(status: 'closed' | 'cancelled', isWin: boolean | null): Promise<void> {
+    const n = seq++
+    await db
+      .insertInto('trades')
+      .values({
+        human_ref: `TR-WR-${n}`,
+        seq: n,
+        channel_id: CHANNEL_2_ID,
+        symbol: 'BTCUSDT',
+        side: 'long',
+        status,
+        is_win: isWin,
+        closed_at: new Date(),
+      })
+      .execute()
+  }
+
+  beforeAll(async () => {
+    // 2 из 3 ЗАКРЫТЫХ сделок прибыльны (win) -> round(2/3*100) = 67% (пример дословно из брифа).
+    await seedClosedTrade('closed', true)
+    await seedClosedTrade('closed', true)
+    await seedClosedTrade('closed', false)
+    // cancelled — неисполнившаяся лимитка: НЕ должна попасть в знаменатель (иначе было бы 2/4=50%).
+    await seedClosedTrade('cancelled', null)
+  })
+
+  it('GET /channels/:id -> winRate = "67%" (2 из 3 закрытых прибыльны), cancelled не искажает знаменатель', async () => {
+    const res = await agent.get(`/api/channels/${CHANNEL_2_ID}`).expect(200)
+    const channel = res.body as ChannelDto
+    expect(channel.winRate).toBe('67%')
+  })
+
+  it('GET /channels -> тот же канал в общем списке отдаёт тот же winRate', async () => {
+    const res = await agent.get('/api/channels').expect(200)
+    const channels = res.body as ChannelDto[]
+    const ch2 = channels.find((c) => c.id === CHANNEL_2_ID)!
+    expect(ch2.winRate).toBe('67%')
+  })
+})

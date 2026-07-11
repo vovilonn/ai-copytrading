@@ -6,10 +6,11 @@ import { ChannelSettingsService } from './channel-settings.service.js'
 import { ChannelsController } from './channels.controller.js'
 import { ChannelsService } from './channels.service.js'
 import { MediaController } from './media.controller.js'
+import { ChannelStatsService } from './stats.service.js'
 
 @Module({
   imports: [DbModule],
   controllers: [ChannelsController, ChannelSettingsController, MediaController],
-  providers: [ChannelsService, ChannelSettingsService, ChannelSeedService],
+  providers: [ChannelsService, ChannelSettingsService, ChannelSeedService, ChannelStatsService],
 })
 export class ChannelsModule {}

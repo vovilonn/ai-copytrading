@@ -10,7 +10,9 @@ export interface ChannelDto {
   initial: string
   status: 'active' | 'paused' | 'error'
   copyEnabled: boolean
-  winRate: string // '—' пока нет закрытых сделок
+  // Win Rate (Ф4, task-2-brief.md): round(wins/closedTrades*100) + '%' по закрытым сделкам
+  // канала (apps/api/src/channels/stats.service.ts); '—' — закрытых сделок ещё нет.
+  winRate: string
   actionCount: number
   activePositions: number
   messageCount: number

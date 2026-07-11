@@ -10,6 +10,7 @@ import { Input } from '../components/ui/input.js'
 import { Switch } from '../components/ui/switch.js'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs.js'
 import { apiFetch } from '../lib/api.js'
+import { useChannelStatsStream } from '../lib/ws.js'
 
 // Строки настроек в ChannelDto приходят уже отформатированными для таблицы каналов
 // ('$500', '10x' — apps/api/src/channels/channels.service.ts, formatNumeric) — здесь их
@@ -35,6 +36,10 @@ export default function ChannelPage() {
     queryFn: () => apiFetch<ChannelDto>(`/channels/${channelId}`),
     enabled: Number.isFinite(channelId),
   })
+
+  // Win Rate в реалтайме (задача Ф4) — до раннего return ниже (правило хуков: порядок вызовов
+  // не должен зависеть от того, успел ли загрузиться channel).
+  useChannelStatsStream(Number.isFinite(channelId) ? [channelId] : [])
 
   if (!channel) return null
 

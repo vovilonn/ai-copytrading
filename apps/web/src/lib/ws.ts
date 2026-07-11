@@ -3,9 +3,10 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { io, type Socket } from 'socket.io-client'
 import type { Side } from 'shared/domain.js'
-import type { MessageDto, PositionDto } from 'shared/dto.js'
+import type { ChannelDto, MessageDto, PositionDto } from 'shared/dto.js'
 import { computeRoi, formatDecimal, signedMoney } from 'shared/numbers.js'
 import type {
+  ChannelStatsPayload,
   ClientToServerEvents,
   MessageNewPayload,
   MessageUpdatedPayload,
@@ -304,6 +305,43 @@ export function usePositionsStream(channelIds: readonly number[]): void {
       ids.forEach((id) => s.emit('channel.unsubscribe', id))
       statsThrottle.cancel()
       listFallback.cancel()
+    }
+  }, [idsKey, queryClient])
+}
+
+/**
+ * Win Rate в реалтайме (задача Ф4, task-2-brief.md п.4): `channel.stats` летит в комнату
+ * `channel:<id>` при КАЖДОМ закрытии сделки этого канала (apps/engine/src/state/trades.ts::
+ * closeTrade) — точечно патчим winRate и в списке каналов (['channels']), и в шапке экрана
+ * канала (['channel', id]), не дожидаясь рефетча. Тот же приём подписки на комнаты ВСЕХ каналов
+ * сразу, что и useActionsStream/usePositionsStream выше; событие редкое и дискретное (сделка
+ * закрывается не чаще, чем открывается), поэтому точечный патч без троттлинга — не polling.
+ */
+export function useChannelStatsStream(channelIds: readonly number[]): void {
+  const queryClient = useQueryClient()
+  const idsKey = channelIds.join(',')
+
+  useEffect(() => {
+    const ids = idsKey === '' ? [] : idsKey.split(',').map(Number)
+    if (ids.length === 0) return
+
+    const s = getSocket()
+    ids.forEach((id) => s.emit('channel.subscribe', id))
+
+    function onChannelStats(payload: ChannelStatsPayload): void {
+      queryClient.setQueryData<ChannelDto[]>(['channels'], (old) =>
+        old?.map((c) => (c.id === payload.channelId ? { ...c, winRate: payload.winRate } : c)),
+      )
+      queryClient.setQueryData<ChannelDto>(['channel', payload.channelId], (old) =>
+        old ? { ...old, winRate: payload.winRate } : old,
+      )
+    }
+
+    s.on('channel.stats', onChannelStats)
+
+    return () => {
+      s.off('channel.stats', onChannelStats)
+      ids.forEach((id) => s.emit('channel.unsubscribe', id))
     }
   }, [idsKey, queryClient])
 }

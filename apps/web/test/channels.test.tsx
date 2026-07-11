@@ -12,8 +12,9 @@ import { apiFetch } from '../src/lib/api.js'
 vi.mock('../src/lib/api.js', () => ({ apiFetch: vi.fn() }))
 // ChannelPage (после задачи 12) тянет реалтайм через useChannelStream/socket.io-client —
 // в этом файле проверяется только навигация со списка каналов, поэтому сокет замокан в no-op,
-// чтобы не открывать реальное соединение внутри jsdom.
-vi.mock('../src/lib/ws.js', () => ({ useChannelStream: () => {} }))
+// чтобы не открывать реальное соединение внутри jsdom. useChannelStatsStream (задача Ф4, Win
+// Rate в реалтайме) вызывается и ChannelsPage, и ChannelPage — тоже no-op здесь.
+vi.mock('../src/lib/ws.js', () => ({ useChannelStream: () => {}, useChannelStatsStream: () => {} }))
 
 const CHANNELS: ChannelDto[] = [
   {
@@ -105,6 +106,16 @@ describe('ChannelsPage', () => {
     for (const header of HEADERS) {
       expect(screen.getByText(header)).toBeInTheDocument()
     }
+  })
+
+  // Задача Ф4 (Win Rate): колонка рендерит РЕАЛЬНОЕ значение winRate из ChannelDto как есть,
+  // без собственного форматирования на фронте — вся арифметика (round/'—') уже сделана бэком
+  // (apps/api/src/channels/stats.service.ts).
+  it('колонка Win Rate рендерит значение winRate из DTO', async () => {
+    renderChannels()
+    await screen.findByText('Crypto Signals VIP')
+    expect(screen.getByText('68%')).toBeInTheDocument()
+    expect(screen.getByText('44%')).toBeInTheDocument()
   })
 
   it('бейдж Copy зелёный при copyEnabled: true, серый при false', async () => {

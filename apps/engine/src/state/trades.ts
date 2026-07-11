@@ -1,6 +1,8 @@
+import { Decimal } from 'decimal.js'
 import { sql, type Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 import type { Side, TradeStatus, LegKind, LegStatus } from 'shared/domain.js'
+import { formatWinRate } from 'shared/numbers.js'
 
 // Состояние сделок (design spec: trades/trade_legs/symbol_ownership, research
 // backend-architecture.md §2/§"Инициатор переходов"). Все функции принимают `tx: Kysely<DB>` —
@@ -177,23 +179,53 @@ export interface CloseTradeParams {
 }
 
 /**
+ * Win Rate (Ф4, task-2-brief.md): «win» ⟺ реализованный PnL положителен. Ровно ноль — НЕ
+ * выигрыш (строго `>`, не `>=`). Деньги/PnL — Decimal/строка (CLAUDE.md), никогда JS number.
+ */
+export function computeIsWin(realizedPnl: string): boolean {
+  return new Decimal(realizedPnl).greaterThan(0)
+}
+
+/**
  * Закрывает сделку: переводит trades.status в 'closed'/'cancelled' и освобождает
  * symbol_ownership (research backend-architecture.md §"Инициатор переходов": "→closed —
  * position.size→0 (тогда же symbol_ownership.released_at=now()...)"). Освобождение ключуется
  * по trade_id (не по channel_id/symbol) — эта связь уже есть в самой строке symbol_ownership
  * (FK на trades), вызывающему коду не нужно повторно передавать channelId/symbol.
+ *
+ * Win Rate (Ф4, task-2-brief.md): `is_win` проставляется ТОЛЬКО для настоящего закрытия
+ * ('closed') — 'cancelled' это неисполнившиеся лимитки, не результат сделки (не входят в
+ * знаменатель winRate, см. apps/api/src/channels/stats.service.ts). Явный `params.isWin`
+ * (если вызывающий код уже знает ответ) имеет приоритет; иначе выводим его из realized_pnl
+ * чистой функцией computeIsWin — из ПЕРЕДАННОГО в этом же вызове значения (`params.realizedPnl`,
+ * реконсилер/dry-run путь его не шлют) либо, если оно не передано, из уже посчитанного колонкой
+ * значения (единственный писатель live-режима — recalcTradeRealizedPnl/applyExecutionPush,
+ * bybit/private-ws.ts) — читаем текущую строку ОДИН раз ниже, не дублируя формулу пересчёта PnL
+ * здесь. Та же строка даёт channel_id — нужен для реалтайм-события ниже.
  */
 export async function closeTrade(tx: Kysely<DB>, params: CloseTradeParams): Promise<void> {
   const closedAt = params.closedAt ?? new Date()
+  const status = params.status ?? 'closed'
+
+  const current = await tx
+    .selectFrom('trades')
+    .select(['channel_id', 'realized_pnl'])
+    .where('id', '=', params.tradeId)
+    .executeTakeFirstOrThrow(() => new Error(`closeTrade: сделка ${params.tradeId} не найдена`))
+
+  let isWin = params.isWin
+  if (isWin === undefined && status === 'closed') {
+    isWin = computeIsWin(params.realizedPnl ?? current.realized_pnl)
+  }
 
   await tx
     .updateTable('trades')
     .set({
-      status: params.status ?? 'closed',
+      status,
       closed_at: closedAt,
       ...(params.realizedPnl !== undefined ? { realized_pnl: params.realizedPnl } : {}),
       ...(params.feesPaid !== undefined ? { fees_paid: params.feesPaid } : {}),
-      ...(params.isWin !== undefined ? { is_win: params.isWin } : {}),
+      ...(isWin !== undefined ? { is_win: isWin } : {}),
     })
     .where('id', '=', params.tradeId)
     .execute()
@@ -203,5 +235,37 @@ export async function closeTrade(tx: Kysely<DB>, params: CloseTradeParams): Prom
     .set({ released_at: closedAt })
     .where('trade_id', '=', params.tradeId)
     .where('released_at', 'is', null)
+    .execute()
+
+  // Реалтайм Win Rate (task-2-brief.md п.4): 'channel.stats' объявлен контрактом ws-events.ts
+  // ещё с задачи 9, но до этой задачи его никто не публиковал — переиспользуем существующий
+  // outbox/WS-канал (apps/api/src/realtime/outbox.publisher.ts рассылает ЛЮБОЙ domain_events по
+  // payload.channelId уже сейчас, без изменений на api), а не заводим новый. 'cancelled' —
+  // не результат, событие не шлём (симметрично isWin выше).
+  if (status === 'closed') {
+    await emitChannelStats(tx, current.channel_id)
+  }
+}
+
+/** Пересчитывает и публикует 'channel.stats' (winRate) в domain_events — в ТОЙ ЖЕ транзакции,
+ *  что и сам переход в 'closed' (outbox-паттерн задачи 9: событие не может потеряться при
+ *  крэше между UPDATE trades и коммитом). cancelled сознательно исключён из WHERE — та же
+ *  формула, что и apps/api/src/channels/stats.service.ts (не дублируем округление отдельно). */
+async function emitChannelStats(tx: Kysely<DB>, channelId: number): Promise<void> {
+  const { rows } = await sql<{ closed_trades: string; wins: string }>`
+    SELECT count(*)::text AS closed_trades, count(*) FILTER (WHERE is_win)::text AS wins
+    FROM trades WHERE channel_id = ${channelId} AND status = 'closed'
+  `.execute(tx)
+  const row = rows[0]
+  const winRate = formatWinRate(Number(row?.closed_trades ?? 0), Number(row?.wins ?? 0))
+
+  await tx
+    .insertInto('domain_events')
+    .values({
+      type: 'channel.stats',
+      aggregate: 'channel',
+      aggregate_id: String(channelId),
+      payload: JSON.stringify({ channelId, winRate }),
+    })
     .execute()
 }

@@ -17,10 +17,18 @@ export interface MessageUpdatedPayload {
   message: MessageDto
 }
 
+/**
+ * Задача Win Rate (Ф4, task-2-brief.md): объявлено ещё с задачи 9 как целевая форма
+ * ('messageCount'/'actionCount'), но ни один продюсер его не публиковал (нет ни одного
+ * `insertInto('domain_events')` с type='channel.stats' в истории репозитория до этой задачи).
+ * Первый реальный продюсер — apps/engine/src/state/trades.ts::closeTrade — публикует событие при
+ * КАЖДОМ переходе сделки в 'closed', неся winRate (единственное, что реально меняется закрытием
+ * сделки); messageCount/actionCount черновика задачи 9 сюда не переносим — своего продюсера у
+ * них по-прежнему нет (YAGNI, не изобретаем то, что не нужно прямо сейчас).
+ */
 export interface ChannelStatsPayload {
   channelId: number
-  messageCount: number
-  actionCount: number
+  winRate: string
 }
 
 // Задача 8 (спека §11): события таблиц Actions/Positions. Имена совпадают с тем, что реально
