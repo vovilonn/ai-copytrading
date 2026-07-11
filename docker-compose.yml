@@ -119,6 +119,13 @@ services:
       # Та же переопределённая переменная, что у api/tg-ingest (задача 13): внутри сети compose
       # postgres слушает свой контейнерный порт 5432, а не опубликованный на хосте POSTGRES_PORT.
       DATABASE_URL: postgresql://${POSTGRES_USER:-copytrade}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-copytrade}
+      # Ф3 задача 6 (task-6-brief.md): `.env` НЕ трогаем (EXECUTION_MODE=dry_run в нём остаётся
+      # дефолтом навсегда) — для приёмки live-режима запуск переопределяет переменную ОКРУЖЕНИЯ
+      # шелла перед `docker compose up`, напр. `EXECUTION_MODE=live docker compose up -d engine`.
+      # Docker Compose сначала подставляет её из переменных окружения самого шелла, и только если
+      # там её нет — берёт из служебного .env рядом с этим файлом (тот же .env, что и env_file
+      # выше) — поэтому `${EXECUTION_MODE:-dry_run}` безопасен и НЕ меняет поведение по умолчанию.
+      EXECUTION_MODE: ${EXECUTION_MODE:-dry_run}
     depends_on:
       postgres:
         condition: service_healthy

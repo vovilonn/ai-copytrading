@@ -2,63 +2,80 @@
 
 ## Goal
 
-Фаза 3: фикс live-ядра по адверсариальному ревью (перед e2e с реальными ордерами) — Critical C1
-(SL атомарно с входом) + Important I1 (идемпотентная отмена SL) + Important I3 (WS-топики по
-префиксу) + Important I2 (staleness/slippage-гейт) + Minor M3 (getEquity fallback) + Minor M1
-(orphan reduceOnly-очистка). Полный отчёт — `.superpowers/sdd/p3-core-fix-report.md`.
+Фаза 3, задача 6 (финальная): e2e с РЕАЛЬНЫМИ ордерами на Bybit testnet + приёмка Ф3 —
+`apps/engine/test/live-e2e.test.ts` (BYBIT_LIVE_TESTS=1), рестарт-реконсиляция с реальной позицией,
+приёмка через UI, отказоустойчивость вживую (ручное закрытие в терминале Bybit). Полный отчёт —
+`.superpowers/sdd/p3-task6-report.md`.
 
 ## Status
 
-- [x] C1: `BybitAdapter.placeEntry` передаёт `stopLoss` атомарно в `rest.createOrder` (Bybit V5
-      `order/create` принимает `stopLoss`/`slTriggerBy`); `pipeline.ts::handleEntrySignal` больше
-      не делает отдельный `setStopLoss` после TP-лесенки. `EntryOrder.stopLoss` — опционально
-      (`add`/доливка его не передаёт). `DryRunAdapter` — паритетная атомарная запись.
-- [x] I1: `BybitAdapter.cancelOrder` различает SL-trading-stop (purpose='sl', bybit_order_id=null)
-      → `setTradingStop(stopLoss='0')`, обычный ордер → `rest.cancelOrder`. `rest-client.ts`:
-      retCode 110001 ("order not exists") — идемпотентный успех.
-- [x] I3: `private-ws.ts::handleMessage` матчит топик по `split('.')[0]` — работает и для
-      `position.linear`, и для bare `position`; `default`-кейс логирует неизвестный топик.
-- [x] I2: гейт staleness/slippage в `handleEntrySignal` — `deps.getMarkPrice`/
-      `deps.maxEntrySlippagePct` (PipelineDeps), fail-open в dry_run/при сбое похода за ценой.
-      `main.ts` (live) подключает `rest.getPositions(symbol)` (стаб-позиция несёт markPrice даже
-      при size=0). `MAX_ENTRY_SLIPPAGE_PCT` — новый env, дефолт 0.5, добавлен в `.env.example`.
-- [x] M3: `state/equity.ts::resolveEquityValue` — totalEquity пуст → totalAvailableBalance → кэш
-      → throw (в этом порядке).
-- [x] M1: `reconcileOnStart` — шаг В (после коммита транзакции): осиротевшие reduceOnly-остатки
-      (TP/SL/close) по символам без открытой позиции отменяются по одному через `rest.cancelOrder`
-      (не cancelAll — не трогает legitimate entry/add лимитки). Новое поле
-      `ReconcileResult.orphansCancelled`. Работает и на старте, и на периодическом тике (main.ts) —
-      одна функция на оба места.
-- [x] `pnpm --filter engine test` — 345 passed, 10 skipped (было 321/10 до этого лупа, +24 теста).
-- [x] `pnpm typecheck` — 6/6 пакетов зелёные.
-- [x] Живая проверка (`EXECUTION_MODE=live pnpm --filter engine exec tsx src/main.ts`, ~15с, оба
-      канала `enabled=false`): `reconcileOnStart: opened=0 closed=0 flagged=0 orphansCancelled=0`;
-      `equity: 998.998`; `[private-ws] auth success` → `subscribe success`; 0 строк `orders` с
-      префиксом `K` после прогона (подтверждено SQL). Процесс убит, `.env` не менялся
-      (EXECUTION_MODE=dry_run в файле — без изменений).
-- [x] Коммит `apps/engine` + `.env.example` + `LOOP_STATE.md`.
+**BLOCKED — внешний блокер биржи (compliance-ограничение testnet-аккаунта), не дефект кода.**
 
-## LOOP ЗАВЕРШЁН
+- [x] `apps/engine/test/live-e2e.test.ts` (новый) — 7 шагов из брифа полностью реализованы через
+      `BybitRestClient` напрямую (символ `SOLUSDT`, qty=0.2 ≈ $15.6 notional): вход market с
+      атомарным SL в теле `order/create`, немедленная идемпотентность (тот же orderLinkId),
+      TP-лесенка (2 reduceOnly Limit), перенос SL (`setTradingStop`), частичное закрытие, полное
+      закрытие + `cancelAll`, `afterAll`-cleanup (всегда, try/catch на каждый сетевой вызов).
+      Каждый шаг перечитывает ЖИВОЕ состояние биржи (не кэширует из прошлого шага) — устойчив к
+      движению рынка/раннему исполнению TP.
+- [x] `docker-compose.yml` — engine получает `EXECUTION_MODE: ${EXECUTION_MODE:-dry_run}` —
+      переопределяется переменной окружения шелла перед `docker compose up`, `.env` НЕ тронут.
+      Проверено `docker compose config` в обоих направлениях (дефолт/override).
+- [x] `pnpm --filter engine test` — 345 passed, 16 skipped (было 345/10 до этой задачи, +6 новых
+      тестов `live-e2e.test.ts`, корректно пропускаются без `BYBIT_LIVE_TESTS=1`).
+- [x] `pnpm typecheck` — 6/6 пакетов зелёные.
+- [ ] **Живой прогон `BYBIT_LIVE_TESTS=1 pnpm --filter engine test live-e2e` — ЗАБЛОКИРОВАН.**
+      Bybit отклоняет КАЖДУЮ попытку `POST /v5/order/create` (реального создания ордера) с
+      `retCode 10024` ("regulatory restrictions" / compliance-блок), независимо от символа
+      (проверено SOLUSDT и BTCUSDT), типа ордера и наличия `stopLoss` в теле (проверено отдельно —
+      не связано с атомарным SL). READ-эндпоинты (`wallet-balance`, `position/list`,
+      `order/realtime`) и идемпотентные мутации без создания ордера (`switch-mode`,
+      `set-leverage`) работают штатно — баланс подтверждён (~999 USDT), права API-ключа в порядке
+      (`ContractTrade: [Order, Position]`, `Derivatives: [DerivativesTrade]`, `readOnly:0`).
+      Аккаунт/ключ созданы 2026-07-09 (двое суток на момент прогона), `kycRegion` в
+      `/v5/user/query-api` пуст — вероятная причина: не пройден шаг подтверждения торговли
+      деривативами (client agreement/risk disclosure) или не указан регион на сайте
+      testnet.bybit.com — оба требуют входа в веб-интерфейс под этим аккаунтом (вне доступа агента:
+      нет браузера/учётных данных). Полная доказательная база, изолирующие проверки и предложенные
+      пути разблокировки — `.superpowers/sdd/p3-task6-report.md`.
+- [ ] **Шаги 3 (рестарт-реконсиляция с реальной позицией), 4 (приёмка UI), 5 (отказоустойчивость
+      вживую) брифа — НЕ выполнены**: все требуют реальной открытой позиции на бирже, которую
+      физически невозможно создать при текущем блоке. Ничего не сфабриковано вместо реальной
+      биржи — не переключал канал `2088626562` в `enabled=true`/движок в `EXECUTION_MODE=live`,
+      т.к. сигнал всё равно не исполнился бы реальным ордером (бессмысленный шаг без биржи).
+- [x] Testnet-аккаунт после ВСЕХ попыток — чист: `0` открытых позиций, `0` открытых ордеров
+      (проверено отдельным read-only запросом после падения теста). Ни один реальный ордер не был
+      создан ни на одном из шагов — биржа отклоняет создание атомарно, до появления любого эффекта.
+
+## ЛУП НЕ ЗАВЕРШЁН — заблокирован внешней стороной (Bybit compliance), требуется действие
+## владельца testnet-аккаунта на сайте биржи (см. "Пути разблокировки" в отчёте) прежде чем
+## задачу 6 можно довести до конца.
 
 ## Грабли этого лупа
 
-- `EntryOrder.stopLoss` сделан ОПЦИОНАЛЬНЫМ (не обязательным), хотя "идеальная" типовая гарантия
-  атомарности выглядела бы строже как required-поле. Причина: десятки уже существующих юнит-тестов
-  адаптеров (`bybit-adapter.test.ts`, `dry-run.adapter.test.ts`) вызывают `placeEntry` изолированно
-  без SL (сценарии TP/close/cancelOrder, не про исходный вход) — required-поле сломало бы их все
-  на typecheck без единого изменения поведения. `pipeline.ts` — единственный реальный вызывающий
-  код в проде — гарантирует передачу `stopLoss` для `purpose='entry'` сам по себе (intent.sl
-  обязателен в грамматике парсера), инвариант держится на уровне вызывающей стороны, не типа.
-- SL как "trading-stop, не отдельный ордер" (bybit_order_id=null) — уже существовавший инвариант
-  до этой задачи, только теперь ЕЩЁ и ставится атомарно с `order/create`, а не отдельным
-  `position/trading-stop`. `cancelOrder` (I1) опирается ИМЕННО на связку `purpose='sl' &&
-  bybit_order_id===null` для маршрутизации в `setTradingStop(0)` — если когда-нибудь появится
-  реальный SL-ордер с собственным orderId (иной механизм Bybit), этот гейт придётся пересмотреть.
-- M1 (orphan-очистка) реализована ПОЛНОСТЬЮ (не просто задокументирована) — оказалось несложно,
-  т.к. `reconcileOnStart` уже читал `getPositions`/`getOpenOrders` ДО транзакции; потребовалось
-  расширить `ReconcileRestClient` до `cancelOrder` и обновить 6 существующих `.toEqual()`-тестов
-  под новое поле `orphansCancelled` (иначе они падали на несовпадении формы объекта).
-- Живая проверка была на аккаунте БЕЗ открытых позиций — I3 (`.linear`-топики) подтверждён живым
-  хендшейком (auth+subscribe success), но НЕ живыми data-пушами `position`/`execution`/`order`
-  (нечему прийти на пустом аккаунте) — юнит-тест на смоделированных `.linear`-фреймах закрывает
-  этот пробел, но полное сквозное подтверждение — только на e2e с реальным входом (задача 6).
+- **Побочная находка, не в периметре задачи**: допущение research `bybit-execution.md §1`
+  ("стаб-позиция `position/list` при size=0 несёт живой `markPrice`") НЕ подтвердилось на этом
+  аккаунте прямо сейчас — `getPositions('SOLUSDT'|'BTCUSDT')` при size=0 отдаёт `markPrice: ""`
+  (пустую строку) для ОБОИХ символов. `main.ts::getMarkPrice` (Important I2, гейт slippage
+  адверсариального ревью p3-core-fix-report.md) опирается ИМЕННО на это допущение — если оно
+  систематически неверно (не артефакт заблокированного аккаунта), гейт I2 тихо fail-open на первом
+  входе по любому "холодному" символу без прежней истории позиций на аккаунте. НЕ исправлено в этой
+  задаче (вне периметра брифа — прод-код трогать не просили, задача про e2e-тест). Кандидат на
+  отдельный тикет: переключить `getMarkPrice` на публичный `GET /v5/market/tickers` (не требует
+  ключа, не зависит от истории аккаунта) — тот же приём уже использован внутри самого
+  `live-e2e.test.ts::fetchPublicMarkPrice` для получения цены входа теста.
+- **Живая проверка идемпотентности 110072 и атомарного SL в `order/create` (Critical C1) остаются
+  НЕПОДТВЕРЖДЁННЫМИ живым исполненным ордером** — обе были явно отмечены как непроверяемые в
+  research `bybit-execution.md §16` ДО этого лупа ("непроверяемого live: ... фактическое
+  отклонение по minNotional/дублю") и остаются такими ПОСЛЕ — блокер внешний (аккаунт), не решённый
+  этим лупом. Вся логика адаптеров при этом покрыта мок-юнит-тестами (345 тестов, включая
+  `bybit-adapter.test.ts`/`bybit-rest.test.ts` — HTTP-тело запроса с `stopLoss` проверено
+  структурно, retCode 110072/110001/110043 проверены мок-фреймами) — код готов, живое
+  подтверждение — нет.
+- Диагностика блокера заняла существенную часть лупа (изолирующие проверки: BTCUSDT vs SOLUSDT,
+  с `stopLoss` vs без, `query-api`/`account/info` на предмет видимых флагов, веб-поиск по коду
+  ошибки) — сделано осознанно, чтобы не спутать "наш баг" с "биржа блокирует аккаунт": если бы
+  ошибка была специфична для SOLUSDT/наличия SL, это указывало бы на дефект нашего кода/округления,
+  а не на внешний блокер. Все debug-скрипты одноразовые, удалены после проверки, в коммит не попали
+  (проверено `git status` перед коммитом этого лупа — только `docker-compose.yml`,
+  `apps/engine/test/live-e2e.test.ts`, `LOOP_STATE.md`).
