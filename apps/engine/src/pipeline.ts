@@ -1,7 +1,8 @@
+import { createHash } from 'node:crypto'
 import { Decimal } from 'decimal.js'
 import { sql, type Kysely, type Selectable } from 'kysely'
 import type { DB } from 'api/db/database.js'
-import type { ActionType, DeltaOp, Network, ParsedIntent, ParseContext, Side } from 'shared/domain.js'
+import type { Network, ParsedIntent, ParseContext, ParsedResult, Side } from 'shared/domain.js'
 import { getAdapter } from './adapters/registry.js'
 import { normalize } from './normalize.js'
 import { resolveSymbol } from './symbol-resolver.js'
@@ -10,7 +11,18 @@ import { computeSize } from './risk/sizing.js'
 import { acquireSymbol, addLeg, closeTrade, openTrade } from './state/trades.js'
 import type { ExecutionPort, OrderContext } from './execution/port.js'
 import { listInstruments, type InstrumentMap } from './instruments.js'
-import { reconcile } from './reconciler.js'
+import { AI_CONFIDENCE_GATE, classifyIntent, reconcile } from './reconciler.js'
+import { buildContext } from './ai/context.js'
+import { cacheKey, getCached, putCached, type AiCacheSchema } from './ai/cache.js'
+import {
+  callExtractSignal,
+  MODEL_OPUS,
+  MODEL_SONNET,
+  PROMPT_VERSION,
+  type AiCallsSchema,
+} from './ai/client.js'
+import { normalizeAiOutput } from './ai/normalize-output.js'
+import type { ExtractSignalOutput } from './ai/schema.js'
 
 /**
  * Пайплайн разбора и исполнения одного сообщения (design spec §6, task-7-brief.md):
@@ -78,7 +90,7 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     const normalizedText = normalize(message.text)
     const parsed = adapter.parse(ctx)
 
-    await trx
+    const detParseResult = await trx
       .insertInto('parse_results')
       .values({
         message_id: message.id,
@@ -90,15 +102,23 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
         reason: parsed.reason ?? null,
         needs_vision: parsed.needsVision ?? false,
       })
-      .execute()
+      .returning('id')
+      .executeTakeFirstOrThrow()
 
-    const decision = reconcile(parsed, { channelId: message.channelId })
+    // AI-ветка (research/ai-layer.md §4/§8/§10/§11, task-4-brief.md): вызываем AI, ТОЛЬКО когда
+    // детерминированный адаптер сам не смог построить intent (route==='ai' — терсное/free-form/
+    // картинка-only сообщение CH2). CH1 и CH2 A/B/C/D никогда не заходят сюда — деградация AI их
+    // не касается (см. runAiBranch — при отказе возвращает null, а не бросает наружу).
+    const aiParsed: ParsedResult | null =
+      parsed.route === 'ai' ? await runAiBranch(trx, message, normalizedText, instruments, channel.adapter_id, detParseResult.id) : null
+
+    const decision = reconcile(parsed, aiParsed, { channelId: message.channelId })
     const now = new Date()
 
     if (decision.outcome === 'noise') {
       await trx
         .updateTable('messages')
-        .set({ status: 'noise', normalized_text: normalizedText, method: null, updated_at: now })
+        .set({ status: 'noise', normalized_text: normalizedText, method: decision.method, updated_at: now })
         .where('id', '=', message.id)
         .execute()
       return
@@ -107,22 +127,11 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     if (decision.outcome === 'needs_review') {
       await trx
         .updateTable('messages')
-        .set({ status: 'needs_review', normalized_text: normalizedText, method: null, updated_at: now })
-        .where('id', '=', message.id)
-        .execute()
-      return
-    }
-
-    if (decision.outcome === 'skipped') {
-      const created = await ensureWholeMessageSkipped(trx, message, decision.skipReason ?? 'skip')
-      if (created) notifyNeeded = true
-      await trx
-        .updateTable('messages')
         .set({
-          status: 'skipped',
-          status_reason: decision.skipReason ?? null,
+          status: 'needs_review',
+          status_reason: decision.reason ?? null,
           normalized_text: normalizedText,
-          method: 'auto',
+          method: decision.method,
           updated_at: now,
         })
         .where('id', '=', message.id)
@@ -130,7 +139,27 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
       return
     }
 
-    // decision.outcome === 'executing'
+    if (decision.outcome === 'skipped') {
+      // decision.method здесь всегда 'auto' либо 'ai' (reconciler.ts) — never null/'review'.
+      const method: 'auto' | 'ai' = decision.method === 'ai' ? 'ai' : 'auto'
+      const created = await ensureWholeMessageSkipped(trx, message, decision.reason ?? 'skip', method)
+      if (created) notifyNeeded = true
+      await trx
+        .updateTable('messages')
+        .set({
+          status: 'skipped',
+          status_reason: decision.reason ?? null,
+          normalized_text: normalizedText,
+          method,
+          updated_at: now,
+        })
+        .where('id', '=', message.id)
+        .execute()
+      return
+    }
+
+    // decision.outcome === 'executing' — decision.method всегда 'auto' либо 'ai' (never null/'review').
+    const method: 'auto' | 'ai' = decision.method === 'ai' ? 'ai' : 'auto'
     const base: IntentBase = { message, channel, settings, instruments, deps }
     // Гейт "Copy trading" (channel_settings.enabled, DEFAULT false — design spec: "off → каждый
     // action Skipped, ордера не отправляются"). Сообщение по-прежнему парсится и actions
@@ -138,19 +167,143 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     // ExecutionPort не вызывается, символ не захватывается, trade/position не создаются.
     const copySkipReason = settings.enabled === false ? 'copy_disabled' : undefined
     for (const { actionIndex, intent } of decision.decided) {
-      const emitted = await processIntent(trx, base, actionIndex, intent, copySkipReason)
+      const emitted = await processIntent(trx, base, actionIndex, intent, method, copySkipReason)
       if (emitted) notifyNeeded = true
     }
 
     await trx
       .updateTable('messages')
-      .set({ status: 'executed', normalized_text: normalizedText, method: 'auto', updated_at: now })
+      .set({ status: 'executed', normalized_text: normalizedText, method, updated_at: now })
       .where('id', '=', message.id)
       .execute()
   })
 
   if (notifyNeeded) {
     await sql`SELECT pg_notify('domain_events', '')`.execute(db)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AI-ветка (research/ai-layer.md §4/§8/§10/§11, task-4-brief.md): route==='ai' от адаптера ->
+// buildContext -> кэш -> callExtractSignal (Sonnet, эскалация Opus одним повтором) ->
+// normalizeAiOutput -> putCached -> вторая строка parse_results(parser='ai').
+// ---------------------------------------------------------------------------
+
+/** Эскалация Sonnet→Opus (research §8, дословно): needs_human ИЛИ хотя бы один action с
+ *  symbol==='UNKNOWN' ИЛИ confidence < AI_CONFIDENCE_GATE. Проверяется на СЫРОМ выводе модели
+ *  (ДО normalizeAiOutput) — ровно те три поля, что перечислены в исследовании. */
+function needsEscalation(output: ExtractSignalOutput): boolean {
+  if (output.needs_human) return true
+  if (output.confidence < AI_CONFIDENCE_GATE) return true
+  return output.actions.some((a) => a.symbol === 'UNKNOWN')
+}
+
+/**
+ * Выполняет AI-ветку для ОДНОГО сообщения (route==='ai' у детерминированного адаптера).
+ *
+ * ДЕГРАДАЦИЯ (критично, research §11 fail-safe): если callExtractSignal бросает даже ПОСЛЕ
+ * исчерпания своих внутренних ретраев (client.ts: 4 попытки, backoff 2^att c, на 429/500/502/
+ * 503/529/сетевые сбои) — эта функция ЛОВИТ исключение и возвращает `null`, а НЕ пробрасывает
+ * его наружу. Причина: пробрасывание уронило бы ВСЮ транзакцию processMessage (включая уже
+ * записанную детерминированную строку parse_results), а reconcile(parsed, null, ctx) для
+ * route==='ai' сам корректно доводит сообщение до outcome 'needs_review' (reason
+ * 'ai_unavailable') — сообщение НЕ теряется, статус переобрабатываемый, 0 ордеров. CH1 и
+ * CH2-A/B/C/D сообщения в этом же тике/канале НЕ используют эту функцию вовсе — отказ AI их
+ * не блокирует (детерминированный путь независим).
+ *
+ * Порядок вызова (§10): buildContext (позиции+reply+картинки) -> cacheKey -> getCached ->
+ * (промах) callExtractSignal(Sonnet) -> при needsEscalation ОДНИМ повтором callExtractSignal
+ * (Opus) -> putCached финальным (возможно эскалированным) результатом -> normalizeAiOutput ->
+ * вторая строка parse_results(parser='ai', prompt_version) для трассировки/UI.
+ */
+async function runAiBranch(
+  trx: Kysely<DB>,
+  message: PipelineMessage,
+  normalizedText: string,
+  instruments: InstrumentMap,
+  adapterId: string,
+  deterministicParseResultId: string,
+): Promise<ParsedResult | null> {
+  try {
+    const aiContext = await buildContext(trx, {
+      id: message.id,
+      channelId: message.channelId,
+      replyToMsgId: message.replyToMsgId,
+    })
+
+    // "media_ids" ключа кэша (research §10) — sha256 БАЙТОВ картинки (комментарий cache.ts
+    // явно допускает это как эквивалент message_media.id): не требует отдельного похода в БД за
+    // message_media, buildContext уже прочитал файлы с диска.
+    const mediaIds = aiContext.images.map((img) => createHash('sha256').update(img.base64, 'base64').digest('hex'))
+
+    const key = cacheKey({
+      model: MODEL_SONNET,
+      normalizedText,
+      mediaIds,
+      replyParentId: message.replyToMsgId,
+      openPositionsHash: aiContext.openPositionsHash,
+      promptVersion: PROMPT_VERSION,
+    })
+
+    const cacheDb = trx as unknown as Kysely<AiCacheSchema>
+    const callsDb = trx as unknown as Kysely<AiCallsSchema>
+
+    let output = await getCached(cacheDb, key)
+    if (!output) {
+      const callBase = {
+        text: message.text,
+        tMsg: message.msgTs.toISOString(),
+        ...(aiContext.replyParentText !== undefined ? { replyParentText: aiContext.replyParentText } : {}),
+        openPositions: aiContext.openPositions,
+        images: aiContext.images,
+        db: callsDb,
+        messageId: message.id,
+        parseResultId: deterministicParseResultId,
+      }
+
+      const first = await callExtractSignal({ ...callBase, model: MODEL_SONNET })
+      output = first.output
+      let finalModel = MODEL_SONNET
+
+      // Эскалация ОДНИМ повтором (заметка задачи 2: normalizeAiOutput всё равно смаппит
+      // остаточную неопределённость Opus-ответа в route 'ai' -> needs_review реконсилером, второй
+      // эскалации/повторного вызова НЕТ — не зацикливаемся).
+      if (needsEscalation(output)) {
+        const escalated = await callExtractSignal({ ...callBase, model: MODEL_OPUS, escalated: true })
+        output = escalated.output
+        finalModel = MODEL_OPUS
+      }
+
+      await putCached(cacheDb, key, output, finalModel, PROMPT_VERSION)
+    }
+
+    const aiParsed = normalizeAiOutput(output, {
+      isListed: (symbol: string) => instruments.get(symbol)?.status === 'Trading',
+    })
+
+    await trx
+      .insertInto('parse_results')
+      .values({
+        message_id: message.id,
+        parser: 'ai',
+        adapter_id: adapterId,
+        route: aiParsed.route,
+        confidence: aiParsed.confidence.toString(),
+        intents: JSON.stringify(aiParsed.intents),
+        reason: aiParsed.reason ?? null,
+        needs_vision: aiParsed.needsVision ?? false,
+        prompt_version: PROMPT_VERSION,
+      })
+      .execute()
+
+    return aiParsed
+  } catch (err) {
+    // Алерт в лог (задача просит "алерт в лог", отдельная алертинг-инфраструктура вне границ
+    // этой задачи) — без него отказ AI был бы виден только по накоплению needs_review в UI.
+    console.error(
+      `[pipeline] AI недоступен для сообщения ${message.id} (tg=${message.tgMessageId}, канал ${message.channelId}): ${(err as Error).message}`,
+    )
+    return null
   }
 }
 
@@ -248,7 +401,12 @@ async function buildParseContext(trx: Kysely<DB>, message: PipelineMessage, inst
 // ---------------------------------------------------------------------------
 
 /** @returns true, если строка actions реально создана этим вызовом (а не уже существовала). */
-async function ensureWholeMessageSkipped(trx: Kysely<DB>, message: PipelineMessage, reason: string): Promise<boolean> {
+async function ensureWholeMessageSkipped(
+  trx: Kysely<DB>,
+  message: PipelineMessage,
+  reason: string,
+  method: 'auto' | 'ai',
+): Promise<boolean> {
   const existing = await trx
     .selectFrom('actions')
     .select('id')
@@ -271,7 +429,7 @@ async function ensureWholeMessageSkipped(trx: Kysely<DB>, message: PipelineMessa
       side: null,
       symbol: null,
       pair: null,
-      method: 'auto',
+      method,
       status: 'skipped',
       skip_reason: reason,
     })
@@ -302,12 +460,6 @@ interface IntentBase {
   deps: PipelineDeps
 }
 
-interface IntentDescription {
-  type: ActionType
-  side: Side | null
-  symbol: string | null
-}
-
 interface HandlerResult {
   skipReason?: string
   tradeId?: string
@@ -315,20 +467,9 @@ interface HandlerResult {
   symbol?: string
 }
 
-function describeIntent(intent: ParsedIntent): IntentDescription {
-  switch (intent.kind) {
-    case 'entry_signal':
-      return { type: 'open', side: intent.side, symbol: intent.symbol }
-    case 'delta':
-      return { type: OP_TYPE[primaryOp(intent.ops)], side: null, symbol: intent.symbol }
-    case 'add':
-      return { type: 'add', side: null, symbol: intent.symbol }
-    case 'limit_entry':
-      return { type: 'open', side: intent.side, symbol: intent.symbol }
-    case 'market_entry':
-      return { type: 'open', side: intent.side, symbol: intent.symbol }
-  }
-}
+// classifyIntent(intent) (symbol/side/type ActionType) — единственный источник этой классификации
+// (DRY), перенесён в reconciler.ts (нужен И там для сравнения det/ai при реконсиляции, И здесь для
+// заполнения actions.type/side/symbol) — см. импорт вверху файла.
 
 function intentParams(intent: ParsedIntent): unknown {
   switch (intent.kind) {
@@ -349,6 +490,8 @@ function intentParams(intent: ParsedIntent): unknown {
  * Обрабатывает один канонический intent (actionIndex уже назначен reconciler'ом). Идемпотентно:
  * если actions-строка для (message_id, actionIndex) уже существует — предыдущий прогон уже
  * довёл её до терминального состояния, повторно ничего не делаем (не плодим вторую trade/order).
+ * @param method Method итоговой Decision ('auto' — детерминированный путь, 'ai' — AI-путь) —
+ *   пишется в actions.method (design spec §6 / research §12 UI-поле "Method").
  * @param forceSkipReason Если задан (channel_settings.enabled===false, см. processMessage) —
  *   intent НЕ передаётся в handleEntrySignal/handleDelta вовсе: action сразу помечается skipped
  *   с этой причиной, ExecutionPort не вызывается и символ не захватывается.
@@ -359,6 +502,7 @@ async function processIntent(
   base: IntentBase,
   actionIndex: number,
   intent: ParsedIntent,
+  method: 'auto' | 'ai',
   forceSkipReason?: string,
 ): Promise<boolean> {
   const existing = await trx
@@ -369,7 +513,7 @@ async function processIntent(
     .executeTakeFirst()
   if (existing) return false
 
-  const info = describeIntent(intent)
+  const info = classifyIntent(intent)
   const inserted = await trx
     .insertInto('actions')
     .values({
@@ -380,7 +524,7 @@ async function processIntent(
       side: info.side,
       symbol: info.symbol,
       pair: info.symbol,
-      method: 'auto',
+      method,
       status: 'executing',
       params: JSON.stringify(intentParams(intent)),
     })
@@ -402,10 +546,12 @@ async function processIntent(
         result = await handleDelta(trx, base, actionIndex, actionId, intent)
         break
       default:
-        // 'add'/'limit_entry'/'market_entry' — типы CH2/Ф2 (AI). Ни один Ф1-адаптер их не
-        // производит (ch1.adapter.ts даёт только entry_signal/delta; ch2Stub — всегда route='ai'
-        // с пустыми intents), поэтому ветка ниже сейчас недостижима, но исчерпывающий switch
-        // (strict TS) требует явного решения на будущее — needs_review, а не молчаливый крэш.
+        // 'add'/'limit_entry'/'market_entry' — CH2/Ф2 типы: и детерминированные правила B/C
+        // ch2.adapter.ts (задача 3), и AI (normalizeAiOutput mapOpenAction/mapAddAction, задача 2)
+        // МОГУТ их производить. Открытие новой позиции/добор через них — отдельный сайзинг-режим
+        // (channel_settings.add_sizing_mode), вне границ ЭТОЙ задачи (reconciler+AI-ветка+
+        // деградация, task-4-brief.md): needs_review-подобный skip, а не молчаливый крэш и не
+        // угадывание риска/размера — "лучше needs_review, чем неверное исполнение" (research §11).
         result = { skipReason: 'not_implemented_phase1' }
     }
   }
@@ -726,44 +872,9 @@ async function handleEntrySignal(
 // delta -> резолв открытой позиции по символу -> команда/событие.
 // ---------------------------------------------------------------------------
 
-// Приоритет для поля `type` итоговой actions-строки, когда intent несёт НЕСКОЛЬКО ops разом
-// (напр. R2 "MET:{fix,close}" — событие partial_close и команда close_remainder одновременно):
-// команды важнее событий, close_remainder — самый весомый исход (сделка закрылась).
-// tp_set/cancel_pending — новые Ф2-варианты (задача 2, AI-канал, normalize-output.ts): вставлены
-// НИЖЕ Ф1-набора по значимости (обновление TP-лесенки/отмена pending-ордера — не так критичны,
-// как факт закрытия/SL), сам пайплайн-обработчик появится в задаче 4 (handleDelta их пока не
-// исполняет — см. switch(op.op) ниже, где default-ветки для них нет, это осознанно вне
-// границ этой задачи).
-const OP_PRIORITY: readonly DeltaOp['op'][] = [
-  'close_remainder',
-  'sl_breakeven',
-  'sl_set',
-  'sl_cancel',
-  'tp_hit',
-  'sl_hit',
-  'partial_close',
-  'tp_set',
-  'cancel_pending',
-  'hold',
-]
-
-const OP_TYPE: Readonly<Record<DeltaOp['op'], ActionType>> = {
-  close_remainder: 'close',
-  sl_breakeven: 'modify_sl',
-  sl_set: 'modify_sl',
-  sl_cancel: 'cancel_order',
-  tp_hit: 'tp_hit',
-  sl_hit: 'sl_hit',
-  partial_close: 'partial_close',
-  tp_set: 'modify_tp',
-  cancel_pending: 'cancel_order',
-  hold: 'hold',
-}
-
-function primaryOp(ops: readonly DeltaOp[]): DeltaOp['op'] {
-  for (const p of OP_PRIORITY) if (ops.some((o) => o.op === p)) return p
-  return ops[0]?.op ?? 'hold' // ops никогда не пуст здесь (адаптер гарантирует ops.length>0 для delta-intent)
-}
+// Приоритет op'ов для actions.type (OP_PRIORITY/OP_TYPE) и primaryOp — перенесены в
+// reconciler.ts (classifyIntent) — единственный источник этой классификации (DRY), см. импорт
+// вверху файла.
 
 async function handleDelta(
   trx: Kysely<DB>,
@@ -829,10 +940,84 @@ async function handleDelta(
         // "submitted" до явной команды (close_remainder/sl_breakeven/...). Событие уже зафиксировано
         // самой actions-строкой (params.ops), доп. действий не требует.
         break
+      case 'tp_set':
+        // modify_tp (Ф2, AI-канал: "Следующие цели 72.7, 74") — полная замена TP-лесенки.
+        // Примитивы по отдельности (не весь `position`) — trade_id уже сужен до string выше
+        // (гейт no_open_position), а structural-check целого объекта эту сузку не видит.
+        await handleTpSet(trx, base, orderCtx, intent.symbol, position.trade_id, position.size, position.mark_price, op.targets)
+        break
+      case 'cancel_pending': {
+        // Отмена ЕЩЁ НЕ исполненного pending-ордера (лимитный вход/добор) — НЕ путать с
+        // sl_cancel выше (тот снимает уже выставленный стоп-лосс). Ищем последний незакрытый
+        // entry/add-ордер сделки; если такого нет (уже исполнен/сделки не было) — no-op.
+        const pendingEntry = await trx
+          .selectFrom('orders')
+          .select('order_link_id')
+          .where('trade_id', '=', position.trade_id)
+          .where('purpose', 'in', ['entry', 'add'])
+          .where('status', 'in', ['created', 'pending_submit', 'submitted'])
+          .orderBy('created_at', 'desc')
+          .executeTakeFirst()
+        if (pendingEntry) await base.deps.executionPort.cancelOrder(trx, { orderLinkId: pendingEntry.order_link_id })
+        break
+      }
       case 'hold':
         break // явный no-op (research: "hold — никогда не исполняется как ордер")
     }
   }
 
   return { tradeId: position.trade_id, side: position.side, symbol: intent.symbol }
+}
+
+/**
+ * modify_tp (research/ai-layer.md §3, задача 4) — ПОЛНАЯ замена TP-лесенки: отменяет ВСЕ
+ * активные TP-ордера сделки и ставит новую на op.targets, поровну разделив ТЕКУЩИЙ остаток
+ * позиции (buildTpTargets — та же функция, что и вход, отбрасывает нулевые доли при грубом
+ * qtyStep). marker='current_price' резолвится в positions.mark_price (живой тикер, задача 10);
+ * если хотя бы одна цель не резолвилась (current_price без живого mark_price ещё) — операция
+ * НЕ выполняется вовсе (старая лесенка остаётся нетронутой) — fail-safe (research §11: "лучше
+ * needs_review/no-op, чем неверное исполнение"), не гадаем на устаревшей/отсутствующей цене.
+ */
+async function handleTpSet(
+  trx: Kysely<DB>,
+  base: IntentBase,
+  orderCtx: OrderContext,
+  symbol: string,
+  tradeId: string,
+  size: string,
+  markPriceRaw: string | null,
+  targets: ReadonlyArray<{ value?: number; marker?: 'current_price' }>,
+): Promise<void> {
+  const markPrice = markPriceRaw !== null ? new Decimal(markPriceRaw) : null
+  const prices: Decimal[] = []
+  for (const target of targets) {
+    if (target.value !== undefined) {
+      prices.push(new Decimal(target.value))
+    } else if (target.marker === 'current_price' && markPrice !== null) {
+      prices.push(markPrice)
+    }
+  }
+  if (prices.length !== targets.length || prices.length === 0) {
+    console.warn(`[pipeline] modify_tp: не все цели резолвились (current_price без mark_price?), symbol=${symbol} — лесенка не обновлена`)
+    return
+  }
+
+  const instrument = base.instruments.get(symbol)
+  if (!instrument) return // символ вне листинга — не должно происходить (позиция уже открыта на нём)
+
+  const activeTps = await trx
+    .selectFrom('orders')
+    .select('order_link_id')
+    .where('trade_id', '=', tradeId)
+    .where('purpose', '=', 'tp')
+    .where('status', 'in', ['created', 'pending_submit', 'submitted'])
+    .execute()
+  for (const activeTp of activeTps) {
+    await base.deps.executionPort.cancelOrder(trx, { orderLinkId: activeTp.order_link_id })
+  }
+
+  const tpTargets = buildTpTargets(new Decimal(size), prices.map((p) => p.toNumber()), instrument.qtyStep)
+  if (tpTargets.length > 0) {
+    await base.deps.executionPort.placeTpLadder(trx, { ...orderCtx, tps: tpTargets })
+  }
 }
