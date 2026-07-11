@@ -13,6 +13,7 @@
     "ai-proxy:login": "node --env-file-if-exists=.env scripts/ai-proxy-login.mjs",
     "tg:login": "node --env-file-if-exists=.env scripts/tg-login.mjs",
     "tg:dump": "node --env-file-if-exists=.env scripts/tg-dump.mjs",
+    "backtest": "node --env-file-if-exists=.env scripts/backtest.mjs",
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose stop postgres",
     "db:psql": "docker compose exec postgres psql -U ${POSTGRES_USER:-copytrade} -d ${POSTGRES_DB:-copytrade}",
