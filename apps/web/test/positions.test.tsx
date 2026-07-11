@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useParams } from 'react-router-dom'
 import type { ChannelDto, PositionDto, PositionStatsDto } from 'shared/dto.js'
 import type { PositionUpsertPayload } from 'shared/ws-events.js'
@@ -91,6 +91,10 @@ function mockApiByPath(positions: PositionDto[], stats: PositionStatsDto) {
   vi.mocked(apiFetch).mockImplementation(async (path: string) => {
     if (path === '/channels') return CHANNELS
     if (path === '/positions/stats') return stats
+    // Секция Pending (задача 3, Ф4) живёт на этой же странице и шлёт свой GET независимо от
+    // фильтров Positions — этот файл её не тестирует (см. pending.test.tsx), поэтому пустой
+    // список по умолчанию, чтобы не мешать существующим ассертам Positions.
+    if (path === '/orders/pending') return []
     if (path.startsWith('/positions')) return positions
     throw new Error(`неожиданный путь в моке apiFetch: ${path}`)
   })
@@ -165,8 +169,12 @@ describe('PositionsPage', () => {
   it('рендерит все десять заголовков колонок таблицы', async () => {
     renderPositions([positionFixture()])
     await screen.findByText('BTCUSDT')
+    // Секция Pending (задача 3, Ф4) добавляет свою таблицу на ту же страницу — с частично
+    // совпадающими названиями колонок (Symbol/Side тоже есть у Pending), поэтому скоупим
+    // поиск именно на таблицу Positions (первая в DOM), а не на весь screen.
+    const [positionsTable] = screen.getAllByRole('table')
     for (const header of HEADERS) {
-      expect(screen.getByRole('columnheader', { name: header })).toBeInTheDocument()
+      expect(within(positionsTable!).getByRole('columnheader', { name: header })).toBeInTheDocument()
     }
   })
 
@@ -253,6 +261,7 @@ describe('PositionsPage', () => {
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
       if (path === '/channels') return CHANNELS
       if (path === '/positions/stats') return statsFixture()
+      if (path === '/orders/pending') return []
       if (path.startsWith('/positions')) throw new Error('boom')
       throw new Error(`неожиданный путь в моке apiFetch: ${path}`)
     })

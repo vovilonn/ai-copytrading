@@ -4,6 +4,7 @@ import { Search, TrendingDown, TrendingUp } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { ChannelDto, PositionDto, PositionStatsDto } from 'shared/dto.js'
+import { PendingOrders } from '../components/PendingOrders.js'
 import { SegmentedControl, type SegmentOption } from '../components/SegmentedControl.js'
 import { TableStateRow } from '../components/TableStateRow.js'
 import { Card } from '../components/ui/card.js'
@@ -11,7 +12,7 @@ import { Input } from '../components/ui/input.js'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table.js'
 import { apiFetch } from '../lib/api.js'
 import { cn } from '../lib/utils.js'
-import { usePositionsStream } from '../lib/ws.js'
+import { usePendingOrdersStream, usePositionsStream } from '../lib/ws.js'
 
 // design/project/Admin.dc.html:712-713 (posSideOpts/posMarginOpts) — те же значения, что
 // принимает GET /api/positions (side/margin, positions.service.ts).
@@ -148,6 +149,9 @@ export default function PositionsPage() {
   // Реалтайм (задача 10): position.upsert летит в комнату channel:<id> (тот же шлюз, что и
   // action.new/action.skipped) — подписываемся на комнаты ВСЕХ каналов, как useActionsStream.
   usePositionsStream(channels.map((c) => c.id))
+  // Задача 3 (Ф4): order.resolved ускоряет обновление секции Pending в live-режиме — polling
+  // внутри PendingOrders (lib/ws.ts::usePendingOrdersStream) остаётся основным фолбэком.
+  usePendingOrdersStream(channels.map((c) => c.id))
 
   const filters: PositionsFilters = { channel, side, margin, q }
   const {
@@ -261,6 +265,12 @@ export default function PositionsPage() {
           errorMessage="Failed to load positions. Please try again."
         />
       </Card>
+
+      {/* Задача 3 (Ф4, task-3-brief.md): отложенные лимитки на вход с обратным отсчётом TTL —
+          секция на этой же странице (design/project/Admin.dc.html не содержит отдельного
+          pending-экрана, спека §12 — минимальное решение), а не отдельный роут/таб в сайдбаре.
+          Независима от фильтров канала/side/margin/поиска выше — свой собственный запрос. */}
+      <PendingOrders />
     </div>
   )
 }

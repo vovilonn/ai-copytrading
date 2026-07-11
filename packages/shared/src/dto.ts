@@ -1,6 +1,6 @@
 // DTO, общие для API и будущего фронта (apps/web, Ф2+). Ровно как в брифе задачи 8
 // (.superpowers/sdd/task-8-brief.md) — типы контракта, а не доменная модель БД.
-import type { ActionType, Side } from './domain.js'
+import type { ActionType, OrderPurpose, Side } from './domain.js'
 
 export interface ChannelDto {
   id: number
@@ -114,4 +114,31 @@ export interface PositionStatsDto {
   unrealisedPnl: string
   positionValue: string
   marginUsed: string
+}
+
+// Задача 3 (Ф4, task-3-brief.md): отложенные лимитки на вход — submitted limit-ордера
+// purpose IN ('entry','add') с reduce_only=false (apps/api/src/orders/pending.service.ts).
+// TP/SL — тоже limit-ордера, но reduce_only=true и без TTL-свипа (протекторы уже открытой
+// позиции, design spec §9) — на этот экран не попадают, они уже показаны на Positions.
+export interface PendingOrderDto {
+  id: string
+  symbol: string
+  side: Side
+  // Полный OrderPurpose (не сузили до 'entry'|'add' литералом) — тот же DRY-приём, что и
+  // ActionRowDto.type/MessageActionDto.type: фильтр значений — забота backend-запроса
+  // (WHERE purpose IN ('entry','add')), а не сужение типа контракта.
+  purpose: OrderPurpose
+  price: string
+  qty: string
+  channelId: number
+  channelTitle: string
+  tradeRef: string | null
+  orderLinkId: string
+  createdAt: string // ISO orders.created_at
+  submittedAt: string | null // ISO orders.submitted_at
+  // ЭФФЕКТИВНЫЙ дедлайн TTL-свипа (apps/engine/src/main.ts::sweepExpiredLimitOrders) — ISO-строка,
+  // ВСЕГДА определена: COALESCE(orders.ttl_expires_at, orders.created_at + channel_settings.
+  // limit_ttl_sec), а не голая (обычно NULL — движок никогда явно её не проставляет при
+  // вставке ордера) колонка orders.ttl_expires_at. Фронт считает обратный отсчёт до этого момента.
+  ttlExpiresAt: string
 }

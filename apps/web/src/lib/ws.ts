@@ -10,10 +10,12 @@ import type {
   ClientToServerEvents,
   MessageNewPayload,
   MessageUpdatedPayload,
+  OrderResolvedPayload,
   PositionUpsertPayload,
   ServerToClientEvents,
 } from 'shared/ws-events.js'
 import { messagesQueryKey } from '../components/MessageTimeline.js'
+import { pendingOrdersQueryKey } from '../components/PendingOrders.js'
 import { POSITIONS_LIST_KEY, positionsStatsQueryKey } from '../routes/positions.js'
 
 let socket: Socket<ServerToClientEvents, ClientToServerEvents> | null = null
@@ -342,6 +344,61 @@ export function useChannelStatsStream(channelIds: readonly number[]): void {
     return () => {
       s.off('channel.stats', onChannelStats)
       ids.forEach((id) => s.emit('channel.unsubscribe', id))
+    }
+  }, [idsKey, queryClient])
+}
+
+const PENDING_ORDERS_THROTTLE_MS = 1000
+
+/**
+ * Задача 3 (Ф4, task-3-brief.md): `order.resolved` (задача 3 Ф3, apps/engine/src/bybit/
+ * private-ws.ts) летит в комнату channel:<id> на КАЖДЫЙ пуш `order.linear` от Bybit — реальные
+ * fill/cancel в LIVE-режиме. Payload узкий (orderLinkId/status, не собранный PendingOrderDto,
+ * тот же случай, что и action.new — см. useActionsStream) — вместо точечного патча просто
+ * инвалидируем ['orders-pending'] (троттлинг ~1/сек, событие редкое и дискретное, тот же приём,
+ * что и у Actions). Это ДОПОЛНЯЕТ (не заменяет) polling-фолбэк внутри PendingOrders
+ * (components/PendingOrders.tsx, refetchInterval 5с) — polling — единственный способ узнать про
+ * TTL-свип и dry-run филлы, которые НИЧЕГО не публикуют в domain_events (см. комментарий в
+ * PendingOrders.tsx), WS здесь только ускоряет обновление в live-режиме, где событие есть.
+ */
+export function usePendingOrdersStream(channelIds: readonly number[]): void {
+  const queryClient = useQueryClient()
+  const idsKey = channelIds.join(',')
+
+  useEffect(() => {
+    const ids = idsKey === '' ? [] : idsKey.split(',').map(Number)
+    if (ids.length === 0) return
+
+    const s = getSocket()
+    ids.forEach((id) => s.emit('channel.subscribe', id))
+
+    let lastRun = 0
+    let trailingTimer: ReturnType<typeof setTimeout> | undefined
+
+    function invalidate(): void {
+      lastRun = Date.now()
+      void queryClient.invalidateQueries({ queryKey: pendingOrdersQueryKey() })
+    }
+
+    function onOrderResolved(_payload: OrderResolvedPayload): void {
+      const elapsed = Date.now() - lastRun
+      if (elapsed >= PENDING_ORDERS_THROTTLE_MS) {
+        invalidate()
+        return
+      }
+      if (trailingTimer) return
+      trailingTimer = setTimeout(() => {
+        trailingTimer = undefined
+        invalidate()
+      }, PENDING_ORDERS_THROTTLE_MS - elapsed)
+    }
+
+    s.on('order.resolved', onOrderResolved)
+
+    return () => {
+      s.off('order.resolved', onOrderResolved)
+      ids.forEach((id) => s.emit('channel.unsubscribe', id))
+      if (trailingTimer) clearTimeout(trailingTimer)
     }
   }, [idsKey, queryClient])
 }
