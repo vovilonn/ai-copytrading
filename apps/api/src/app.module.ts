@@ -9,6 +9,7 @@ import { ConfigModule } from './config/config.module.js'
 import { DbModule } from './db/db.module.js'
 import { HealthModule } from './health/health.module.js'
 import { InstrumentsModule } from './instruments/instruments.module.js'
+import { MetricsModule } from './metrics/metrics.module.js'
 import { OrdersModule } from './orders/orders.module.js'
 import { PositionsModule } from './positions/positions.module.js'
 import { RealtimeModule } from './realtime/realtime.module.js'
@@ -29,6 +30,7 @@ import { RealtimeModule } from './realtime/realtime.module.js'
     OrdersModule,
     RealtimeModule,
     HealthModule,
+    MetricsModule,
   ],
   providers: [
     // Все роуты закрыты JwtGuard, кроме помеченных @Public() (сейчас — только POST /auth/login).

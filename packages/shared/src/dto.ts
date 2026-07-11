@@ -142,3 +142,62 @@ export interface PendingOrderDto {
   // вставке ордера) колонка orders.ttl_expires_at. Фронт считает обратный отсчёт до этого момента.
   ttlExpiresAt: string
 }
+
+// Ф4 задача 5 (метрики/наблюдаемость, p4-task5-brief.md): GET /api/metrics/ai
+// (apps/api/src/metrics/metrics.controller.ts) — единственная форма наблюдаемости этой задачи
+// (дизайн-навигация не содержит отдельного экрана метрик, см. бриф — сознательно НЕ добавлен
+// новый UI-роут). Читает apps/api/src/db/database.ts::ai_calls (не типизирована в Kysely DB —
+// сырой sql, см. metrics.service.ts) + типизированные actions/trades.
+
+/** Строка агрегата по одной модели (ai_calls.model, напр. 'claude-sonnet-4-5-20250929'). */
+export interface AiModelMetricsDto {
+  model: string
+  calls: number
+  // Доля [0..1], не строка '73%' — API-контракт, форматирование (если понадобится) на клиенте;
+  // текущий потребитель — scripts/metrics.mjs — форматирует сам при печати.
+  cacheHitRate: number
+  escalations: number
+  avgLatencyMs: number
+  p50LatencyMs: number
+  p95LatencyMs: number
+  // Деньги — строка (конвенция всего DTO-контракта, см. ChannelDto.tradeSize и т.п.), '$0.0231'.
+  totalCostUsd: string
+  inputTokens: number
+  cacheReadTokens: number
+  outputTokens: number
+}
+
+export interface AiMetricsDto {
+  totalCalls: number
+  byModel: AiModelMetricsDto[]
+  totalCostUsd: string
+  cacheHitRate: number
+  // count(ai_calls.error IS NOT NULL) — неудачные вызовы (сетевые ошибки/5xx/невалидный ответ).
+  errors: number
+}
+
+// actions.status='executed' — исполнено; actions.skip_reason IS NOT NULL — пропущено (причина);
+// это НЕ дополняющие друг друга подмножества всех actions.status (есть ещё pending/executing/
+// failed/needs_review без skip_reason) — total даёт полный размер таблицы для контекста.
+export interface ActionsMetricsDto {
+  total: number
+  executed: number
+  skipped: number
+  bySkipReason: Record<string, number>
+}
+
+// Опционально по брифу задачи 5 ("если легко — не дублируя сложную логику"): переиспользует ТУ ЖЕ
+// формулу Win Rate, что и apps/api/src/channels/stats.service.ts (packages/shared/src/numbers.ts
+// formatWinRate), но без фильтра по каналу — сводка по ВСЕМ каналам сразу.
+export interface TradesMetricsDto {
+  open: number
+  closed: number
+  cancelled: number
+  winRate: string
+}
+
+export interface MetricsDto {
+  ai: AiMetricsDto
+  actions: ActionsMetricsDto
+  trades: TradesMetricsDto
+}
