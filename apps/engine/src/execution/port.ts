@@ -1,8 +1,10 @@
 import type { Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
-import type { Side, OrderPurpose } from 'shared/domain.js'
+import type { Network, Side, OrderPurpose } from 'shared/domain.js'
+import type { BybitRestClient } from '../bybit/rest-client.js'
 import type { ExecutionMode } from './order-link-id.js'
 import { DryRunAdapter } from './dry-run.adapter.js'
+import { BybitAdapter } from './bybit.adapter.js'
 
 // ExecutionPort — единственная точка ветвления dry_run/live (design spec §14): вся остальная
 // логика (риск, сайзинг, парсинг) работает ОДИНАКОВО в обоих режимах и вызывает только этот
@@ -92,23 +94,32 @@ export interface ExecutionPort {
 }
 
 /**
- * Зависимости порта. Ф1 (DryRunAdapter) не обращается к сети — зависимостей нет. Тип объявлен
- * заранее (пустой объект) под Ф3: BybitAdapter потребует REST-клиент/креды субаккаунта канала.
+ * Зависимости порта. DryRunAdapter (Ф1) не обращается к сети — оба поля игнорирует. BybitAdapter
+ * (Ф3, задача 2) требует REST-клиент Bybit и сеть (testnet/mainnet) — оба поля здесь опциональны
+ * (dry_run их не использует), но фабрика ниже требует их ФАКТИЧЕСКИ для mode==='live' и бросает
+ * явную ошибку, если их нет — тихий запуск BybitAdapter с "undefined" сетью/клиентом был бы хуже,
+ * чем explicit throw на старте.
  */
-export type ExecutionPortDeps = Record<string, never>
+export interface ExecutionPortDeps {
+  rest?: BybitRestClient
+  network?: Network
+}
 
 /**
  * Фабрика — единственное место, где строка EXECUTION_MODE превращается в конкретный адаптер
- * (design spec §14). Вызывающий код (будущий оркестратор исполнения) не импортирует
- * DryRunAdapter/BybitAdapter напрямую, только createExecutionPort + интерфейс ExecutionPort.
+ * (design spec §14). Вызывающий код (оркестратор исполнения) не импортирует DryRunAdapter/
+ * BybitAdapter напрямую, только createExecutionPort + интерфейс ExecutionPort.
  */
-export function createExecutionPort(mode: ExecutionMode, _deps: ExecutionPortDeps = {}): ExecutionPort {
+export function createExecutionPort(mode: ExecutionMode, deps: ExecutionPortDeps = {}): ExecutionPort {
   switch (mode) {
     case 'dry_run':
       return new DryRunAdapter()
     case 'live':
-      // BybitAdapter — задача Ф3 (см. task-6-brief.md). Бросаем явно, а не молча фолбэчим
-      // на dry-run: тихий фолбэк в этом месте означал бы реальные деньги вместо симуляции.
-      throw new Error("createExecutionPort: mode 'live' ещё не реализован — BybitAdapter запланирован на Ф3")
+      if (!deps.rest || !deps.network) {
+        // Тихий фолбэк здесь означал бы реальные деньги без корректно настроенного клиента —
+        // явный throw на старте вместо неопределённого поведения при первом же вызове порта.
+        throw new Error("createExecutionPort: mode 'live' требует deps.rest (BybitRestClient) и deps.network")
+      }
+      return new BybitAdapter(deps.rest, deps.network)
   }
 }
