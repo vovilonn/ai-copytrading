@@ -1,16 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import {
-  CircleMinus,
-  CirclePlus,
-  CircleX,
-  Scissors,
-  Search,
-  Shield,
-  Target,
-  TrendingDown,
-  TrendingUp,
-  type LucideIcon,
-} from 'lucide-react'
+import { Search } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { ActionRowDto, ChannelDto } from 'shared/dto.js'
@@ -18,6 +7,7 @@ import { SegmentedControl, type SegmentOption } from '../components/SegmentedCon
 import { Card } from '../components/ui/card.js'
 import { Input } from '../components/ui/input.js'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table.js'
+import { getActionIcon, normalizeTradeRef } from '../lib/action-display.js'
 import { apiFetch } from '../lib/api.js'
 import { cn } from '../lib/utils.js'
 import { useActionsStream } from '../lib/ws.js'
@@ -45,29 +35,9 @@ const SIDE_OPTIONS: SegmentOption[] = [
   { value: 'short', label: 'SHORT' },
 ]
 
-// Полный набор lucide-имён, которые реально отдаёт backend в ActionRowDto.icon (12 ActionType
-// сворачиваются в эти 8 иконок — packages/shared/src/action-meta.ts: ACTION_META + actionIcon()).
-const ACTION_ICONS: Record<string, LucideIcon> = {
-  'circle-plus': CirclePlus,
-  'circle-x': CircleX,
-  target: Target,
-  scissors: Scissors,
-  shield: Shield,
-  'circle-minus': CircleMinus,
-  'trending-up': TrendingUp,
-  'trending-down': TrendingDown,
-}
-
 const timeFormatter = new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'short' })
 function formatTime(iso: string): string {
   return timeFormatter.format(new Date(iso))
-}
-
-// Бриф: "tradeRef приходит уже с # или без — проверь и приведи к виду #TR-1042". Бэкенд
-// (actions.service.ts: `#${row.human_ref}`) сейчас всегда сам добавляет '#' — проверка здесь
-// идемпотентна и не полагается молча на то, что так будет всегда.
-function normalizeTradeRef(ref: string): string {
-  return ref.startsWith('#') ? ref : `#${ref}`
 }
 
 interface ActionsFilters {
@@ -230,7 +200,7 @@ function ActionTableRow({ action, onChannelClick, onTradeClick }: ActionTableRow
   // dirTextStyle рядом с shortStyle), остальные типы (close/partial_tp/tp_hit/...) его не несут,
   // хотя иконка/цвет иконки у них тоже приходят из action-meta.ts (iconColor).
   const showDir = action.type === 'open' && action.side !== null
-  const Icon = ACTION_ICONS[action.icon] ?? CircleMinus
+  const Icon = getActionIcon(action.icon)
 
   return (
     <TableRow className="hover:bg-white/[.02]">

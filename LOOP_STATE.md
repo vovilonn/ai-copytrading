@@ -134,7 +134,16 @@ Production-ready AI копитрейдинг-платформа:
       появилась без перезагрузки).
 - [x] **Bybit testnet пополнен**: 1000 USDT на UNIFIED-счёте (`totalEquity 999`, доступно 1000) —
       готово к e2e-исполнению в Ф3.
-- [ ] Ф1: детерминированный разбор канала 2088626562 в dry-run (в работе)
+- [x] **Ф1 реализована и принята** (задача 11: `engine` в docker-compose, приёмка на живой БД —
+      см. `.superpowers/sdd/p1-task11-report.md`): `docker compose ps` — postgres/ai-proxy/api/web
+      healthy, tg-ingest/engine running; `/actions` 909 строк (619 при фильтре Type=Open),
+      `/positions` 76 открытых позиций (4 стат-карточки, Liq. price заполнен у всех, mark price
+      меняется живым потоком в пределах ~6с), `/channels/2088626562` — action-строки под
+      сообщениями (иконка+тип+пара+Trade #TR-x) теперь РЕАЛЬНО рендерятся (см. грабли ниже).
+      trades=110, actions=909, positions(size<>0)=76, orders=478. Идемпотентность подтверждена:
+      сброшены 516 executed-сообщений в received, после реобработки — 0 дублей
+      (message_id,action_index) в actions и 0 дублей order_link_id в orders, счётчики не
+      изменились. `pnpm test`/`pnpm typecheck` зелёные (309 тестов, 6 пакетов).
 - [ ] Ф2: AI-слой и форум
 - [ ] Ф3: live-исполнение на Bybit testnet (баланс есть)
 - [ ] Ф4: история, Win Rate, реплей-бэктест
@@ -191,3 +200,52 @@ Production-ready AI копитрейдинг-платформа:
 - Media-контроллер `api` читает файлы с диска (`var/media/...` относительно корня репозитория) —
   контейнеру `api` тоже нужен том `./var:/app/var`, не только `tg-ingest` (иначе картинки в
   таймлайне не отдаются, 404).
+
+## Грабли Ф1 (задача 11 — engine в compose, приёмка, две полировки)
+
+- **`positions.liq_price` был NULL с самого task-6**, хотя `risk/leverage.ts liqPrice()` уже
+  вызывается в `pipeline.ts` (гейт `unsafe_stop`) — значение считалось и тут же выбрасывалось,
+  не долетая до `DryRunAdapter.placeEntry`. Полировка А — пробросить уже посчитанный `projectedLiq`
+  через новое поле `EntryOrder.liqPrice` (не пересчитывать второй раз, mmr не всегда под рукой
+  в адаптере). Тесты `dry-run.adapter.test.ts` пришлось точечно обновить (11 вызовов placeEntry
+  без liqPrice — поле сделано обязательным, а не optional, чтобы забытый liqPrice не проходил
+  тайпчек молча).
+- **Идемпотентный `ON CONFLICT (order_link_id) DO NOTHING` в `placeEntry` — короткое замыкание
+  ДО обновления positions**: значит простой сброс `messages.status='received'` и реобработка НЕ
+  бэкфиллит `liq_price` (или любое другое новое поле) для уже существующих открытых позиций —
+  ордер с тем же `orderLinkId` уже есть, `positions` не трогается вовсе. На реальной dev-БД у всех
+  76 уже открытых (до фикса) позиций `liq_price` остался NULL после реплея. Разово забэкенден
+  прямым SQL UPDATE (та же формула long/short, mmr из `instruments`, network='testnet') —
+  осознанный one-off бэкфилл dry-run-данных, не тронувший код/`.env`/схему. Для НОВЫХ входов
+  (после пересборки engine) `liq_price` пишется автоматически.
+- **Троттлинг тикеров (задача 10) — ОДНА карта таймстампов на «применить тик» — этого мало**:
+  1/сек на символ всё ещё даёт ~76 WS-событий/сек суммарно при 76+ открытых позициях, каждое
+  триггерит патч React Query кэша на фронте. Полировка Б — ВТОРАЯ, независимая карта таймстампов
+  (`lastEmittedAt`, порог `EMIT_THROTTLE_MS=2000`) гейтит именно эмит `position.upsert` в
+  `domain_events`; `positions.mark_price`/`unrealised_pnl` в БД по-прежнему пишутся на каждый
+  прошедший 1-секундный тик (дёшево). `applyMarkPriceTick` получил `opts.emit` (default true —
+  обратная совместимость со старыми тестами и прямыми вызовами); `outbox.publisher.ts` в `api`
+  рассылает КАЖДУЮ неопубликованную строку `domain_events` почти немедленно (NOTIFY-driven) —
+  поэтому троттлить нужно именно эмит события, а не что-то на стороне API/фронта, иначе поздно.
+- **Фронт молчаливо НЕ рендерил action-строки под сообщениями таймлайна** — `MessageTimeline.tsx`
+  с задачи 12 (Ф0) содержал буквальный комментарий "появится в Ф1", но при реализации Ф1
+  (`apps/api` — task 7/8) отрисовку так и не добавили: `MessageActionDto[]` из
+  `GET /channels/:id/messages` уже полностью готов (icon/type/pair/tradeRef/skipReason), а
+  компонент рисовал только точку/AI-саммари. Приёмка §4.2 брифа явно требует видеть
+  "иконка+тип+пара+Trade #TR-x" под сообщением — без этого честная приёмка невозможна, поэтому
+  доделано here: `ActionRow` в `MessageTimeline.tsx` (переиспользует `actionIconColor`/
+  `actionSummary` из `shared/action-meta.ts`, те же, что и `actions.tsx`) + `NodeTile` теперь берёт
+  иконку/цвет первого action вместо иконки-заглушки `Layers`. `getActionIcon`/`normalizeTradeRef`
+  вынесены в новый `apps/web/src/lib/action-display.tsx`, чтобы не дублировать маппинг иконок
+  между `actions.tsx` и `MessageTimeline.tsx` (DRY). `MessageRow` теперь использует
+  `useNavigate()` — тест `timeline.test.tsx` пришлось обернуть в `MemoryRouter` (тот же паттерн,
+  что уже был в `actions.test.tsx`/`positions.test.tsx`).
+- **`engine` в compose — единственный писатель, но БЕЗ healthcheck**: `main.ts` сам гоняет
+  миграции при старте (idempotent) и не слушает никакой сети — задача явно просит
+  `depends_on: postgres (service_healthy)` и НЕ просит зависимость от `api`/`ai-proxy`. На деле
+  это безопасно только потому, что `channels`/`instruments` в dev-БД уже засеяны с прошлых фаз
+  (постоянный volume `postgres-data`) — на чистой БД `engine` первые тики просто нашёл бы 0
+  каналов и молча ждал бы следующего опроса (5с) или NOTIFY, без порчи данных.
+- BIGINT/unsafe_stop-гейт/copy_disabled-гейт/префикс алиасов монет — унаследованные грабли задач
+  7-10 (см. соответствующие `.superpowers/sdd/task-*-report.md`), в рамках задачи 11 не
+  затрагивались повторно, отдельных новых сюрпризов не дали.

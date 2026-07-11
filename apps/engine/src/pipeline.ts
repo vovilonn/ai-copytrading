@@ -686,6 +686,9 @@ async function handleEntrySignal(
     price: entryPrice.toString(),
     leverage: leverage.toString(),
     legId: leg.legId,
+    // Полировка А (task-11-brief.md): projectedLiq уже посчитан выше для гейта safeStop —
+    // переиспользуем то же значение, чтобы positions.liq_price не оставался '—' на UI.
+    liqPrice: projectedLiq.toString(),
   })
 
   if (intent.tps.length > 0) {

@@ -18,7 +18,7 @@
     "db:psql": "docker compose exec postgres psql -U ${POSTGRES_USER:-copytrade} -d ${POSTGRES_DB:-copytrade}",
     "up": "docker compose up -d --build",
     "down": "docker compose down",
-    "logs": "docker compose logs -f api tg-ingest web",
+    "logs": "docker compose logs -f api tg-ingest engine web",
     "test": "pnpm -r --workspace-concurrency=1 test",
     "typecheck": "pnpm -r typecheck"
   },

@@ -49,6 +49,13 @@ export interface EntryOrder extends OrderContext {
   leverage: string
   /** trade_legs.id — лега (entry/add), которую заполняет этот ордер. */
   legId: string
+  /**
+   * Симулированная цена ликвидации на выбранном плече (task-11-brief.md, полировка А):
+   * risk/leverage.ts liqPrice({entry,side,lev,mmr}) — та же формула, что pipeline.ts уже
+   * считает ДО этого вызова для гейта "safeStop" (проверка, что SL за ликвидацией). Передаём
+   * готовое значение сюда, а не пересчитываем внутри адаптера — избегаем второго похода за mmr.
+   */
+  liqPrice: string
 }
 
 /** Одна цель TP-лесенки (design spec §9 / research bybit-execution.md §4: reduceOnly limit). */

@@ -108,6 +108,8 @@ describe('DryRunAdapter.placeEntry', () => {
       qty: '100',
       price: '50000',
       leverage: '10',
+      // entry*(1 - 1/lev + mmr) = 50000*(1 - 0.1 + 0.005) = 45250 (leverage.ts §liqPrice, mmr=0.005)
+      liqPrice: '45250',
     })
 
     // формат ключа — пример из брифа order-link-id.ts (D<ord:2>-<tgMessageId>-<actionIndex:2>-<purpose><legIndex>)
@@ -140,6 +142,8 @@ describe('DryRunAdapter.placeEntry', () => {
     // task-6-brief.md: mark_price = avg_price "на момент открытия" (реальный фид — задача 9)
     expect(position.mark_price).toBe('50000.0000000000')
     expect(position.side).toBe('long')
+    // Полировка А (task-11-brief.md): liq_price записан вместе с позицией, а не остаётся NULL.
+    expect(position.liq_price).toBe('45250.0000000000')
   })
 
   it('limit -> orders(submitted), без executions/positions (филла в Ф1 не будет)', async () => {
@@ -160,6 +164,7 @@ describe('DryRunAdapter.placeEntry', () => {
       qty: '50',
       price: '150',
       leverage: '3',
+      liqPrice: '195',
     })
 
     const order = await db.selectFrom('orders').selectAll().where('id', '=', result.orderId).executeTakeFirstOrThrow()
@@ -198,6 +203,7 @@ describe('DryRunAdapter.placeEntry', () => {
       qty: '10',
       price: '3000',
       leverage: '5',
+      liqPrice: '2410',
     }
 
     const first = await adapter.placeEntry(db, params)
@@ -246,6 +252,7 @@ describe('DryRunAdapter.placeEntry', () => {
       qty: '100',
       price: '10',
       leverage: '5',
+      liqPrice: '8.05',
     })
 
     // Доливка — новая лега (leg_index=1, kind='add'), тот же tradeId/symbol/channel.
@@ -266,6 +273,7 @@ describe('DryRunAdapter.placeEntry', () => {
       qty: '50',
       price: '20',
       leverage: '5',
+      liqPrice: '16.1',
     })
 
     const position = await db
@@ -299,6 +307,7 @@ describe('DryRunAdapter.placeTpLadder', () => {
       qty: '300',
       price: '2',
       leverage: '5',
+      liqPrice: '1.61',
     })
 
     const result = await adapter.placeTpLadder(db, {
@@ -353,6 +362,7 @@ describe('DryRunAdapter.setStopLoss', () => {
       qty: '1000',
       price: '0.5',
       leverage: '5',
+      liqPrice: '0.4025',
     })
 
     const result = await adapter.setStopLoss(db, {
@@ -402,6 +412,7 @@ describe('DryRunAdapter.closePosition', () => {
       qty: '200',
       price: '7',
       leverage: '5',
+      liqPrice: '5.635',
     })
 
     const result = await adapter.closePosition(db, {
@@ -461,6 +472,7 @@ describe('DryRunAdapter.closePosition', () => {
       qty: '100',
       price: '80',
       leverage: '5',
+      liqPrice: '64.4',
     })
 
     await adapter.closePosition(db, {
@@ -512,6 +524,7 @@ describe('DryRunAdapter.cancelOrder', () => {
       qty: '40',
       price: '12',
       leverage: '5',
+      liqPrice: '9.66',
     })
 
     await adapter.cancelOrder(db, { orderLinkId: entry.orderLinkId })
@@ -538,6 +551,7 @@ describe('DryRunAdapter.cancelOrder', () => {
       qty: '20',
       price: '30',
       leverage: '5',
+      liqPrice: '24.15',
     })
 
     await adapter.cancelOrder(db, { orderLinkId: entry.orderLinkId })

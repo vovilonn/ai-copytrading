@@ -107,6 +107,30 @@ services:
       replicas: 1
     restart: unless-stopped
 
+  engine:
+    build:
+      context: .
+      dockerfile: apps/engine/Dockerfile
+    image: bybit-copytrade-engine:local
+    container_name: bybit-copytrade-engine
+    env_file:
+      - .env
+    environment:
+      # Та же переопределённая переменная, что у api/tg-ingest (задача 13): внутри сети compose
+      # postgres слушает свой контейнерный порт 5432, а не опубликованный на хосте POSTGRES_PORT.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-copytrade}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-copytrade}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      # Ровно одна реплика: engine — единственный писатель в trades/orders/positions
+      # (ExecutionPort, design spec §14) — вторая реплика продублировала бы обработку сообщений
+      # (advisory-lock в main.ts защищает от гонки внутри процесса, но не отменяет решение
+      # держать ровно одну реплику по умолчанию).
+      replicas: 1
+    # Ничего не слушает по сети (кроме исходящих подключений к Postgres/Bybit) — портов не публикует.
+    restart: unless-stopped
+
   web:
     build:
       context: .

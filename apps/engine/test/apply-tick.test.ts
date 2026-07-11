@@ -150,4 +150,24 @@ describe('applyMarkPriceTick', () => {
     const events = await db.selectFrom('domain_events').selectAll().execute()
     expect(events).toHaveLength(0)
   })
+
+  it('task-11 полировка Б: {emit:false} обновляет mark_price/unrealised_pnl, но НЕ публикует position.upsert', async () => {
+    await seedPosition(CHANNEL_LONG, 'BTCUSDT', 'long', '0.42', '62400')
+
+    const notifyNeeded = await applyMarkPriceTick(db, 'BTCUSDT', '63180', { emit: false })
+    expect(notifyNeeded).toBe(false) // нет свежего domain_events -> звать pg_notify незачем
+
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', CHANNEL_LONG)
+      .where('symbol', '=', 'BTCUSDT')
+      .executeTakeFirstOrThrow()
+    // Запись в БД — как и с emit:true, троттлинг WS не должен ронять актуальность mark_price.
+    expect(row.mark_price).toBe('63180.0000000000')
+    expect(Number(row.unrealised_pnl)).toBeCloseTo(327.6, 6)
+
+    const events = await db.selectFrom('domain_events').selectAll().where('type', '=', 'position.upsert').execute()
+    expect(events).toHaveLength(0)
+  })
 })

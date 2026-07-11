@@ -1,7 +1,10 @@
 import { useInfiniteQuery, type QueryKey } from '@tanstack/react-query'
-import { Image as ImageIcon, Layers, Sparkles } from 'lucide-react'
+import { ArrowUpRight, Image as ImageIcon, Sparkles } from 'lucide-react'
 import { useState } from 'react'
-import type { MessageDto } from 'shared/dto.js'
+import { useNavigate } from 'react-router-dom'
+import { actionIconColor, actionSummary } from 'shared/action-meta.js'
+import type { MessageActionDto, MessageDto } from 'shared/dto.js'
+import { getActionIcon, normalizeTradeRef } from '../lib/action-display.js'
 import { apiFetch } from '../lib/api.js'
 import { useChannelStream } from '../lib/ws.js'
 
@@ -76,10 +79,11 @@ export function MessageTimeline({ channelId }: MessageTimelineProps) {
 
 function MessageRow({ message }: { message: MessageDto }) {
   const hasActions = message.actions.length > 0
+  const navigate = useNavigate()
 
   return (
     <div className="relative flex gap-[18px] pb-[26px]" data-testid="message-row">
-      <NodeTile hasActions={hasActions} />
+      <NodeTile actions={message.actions} />
       <div className="min-w-0 flex-1 pt-[5px]">
         <div className="mb-2 flex items-center gap-[9px]">
           <span className="font-mono text-[11.5px] text-muted-2">{formatTime(message.time)}</span>
@@ -91,16 +95,59 @@ function MessageRow({ message }: { message: MessageDto }) {
           <MediaTile key={media.url} media={media} />
         ))}
 
-        {/* Блок actions (1..N строк) появится в Ф1 — в Ф0 message.actions всегда [], поэтому
-            рендерится только AI-саммари для сообщений без действий (design:234-243). */}
-        {!hasActions && message.aiSummary ? <AiSummary text={message.aiSummary} /> : null}
+        {/* Блок actions (1..N строк, task-11-brief.md — приёмка Ф1): под сигналом видны все
+            распознанные действия сообщения (иконка+тип+пара+ссылка на сделку или Skipped),
+            design/project/Admin.dc.html:214-226. AI-саммари (Ф2) по-прежнему рисуется только
+            для сообщений без действий — CH1 (Ф1) его не производит вовсе. */}
+        {hasActions ? (
+          <div className="mt-[11px] flex flex-col gap-2">
+            {message.actions.map((action, i) => (
+              <ActionRow key={i} action={action} onTradeClick={(ref) => navigate(`/positions?tr=${encodeURIComponent(ref)}`)} />
+            ))}
+          </div>
+        ) : message.aiSummary ? (
+          <AiSummary text={message.aiSummary} />
+        ) : null}
       </div>
     </div>
   )
 }
 
-function NodeTile({ hasActions }: { hasActions: boolean }) {
-  if (!hasActions) {
+function ActionRow({ action, onTradeClick }: { action: MessageActionDto; onTradeClick: (ref: string) => void }) {
+  const Icon = getActionIcon(action.icon)
+  const color = actionIconColor(action.type, action.side)
+
+  return (
+    <div className="flex flex-wrap items-center gap-[10px]" data-testid="timeline-action-row">
+      <Icon size={15} color={color} className="flex-none" />
+      <span className="text-[12.5px] font-semibold tracking-[.02em]" style={{ color }}>
+        {actionSummary(action.type, null)}
+      </span>
+      {action.pair ? <span className="font-mono text-[12.5px] leading-none text-muted-2">{action.pair}</span> : null}
+      {action.skipReason ? (
+        <span
+          title={action.skipReason}
+          className="inline-flex items-center rounded-[5px] bg-skipped-bg px-2 py-[3px] text-[10.5px] font-bold uppercase tracking-[.04em] text-skipped"
+        >
+          Skipped
+        </span>
+      ) : action.tradeRef ? (
+        <button
+          type="button"
+          onClick={() => onTradeClick(action.tradeRef!)}
+          className="inline-flex cursor-pointer items-center gap-[5px] rounded-md border-none bg-white/5 px-[9px] py-1 font-mono text-xs font-semibold text-[#d4d4d8] transition-colors hover:bg-[rgba(255,106,31,.12)] hover:text-accent-hover"
+        >
+          {`Trade ${normalizeTradeRef(action.tradeRef)}`}
+          <ArrowUpRight size={13} className="flex-none" />
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
+function NodeTile({ actions }: { actions: readonly MessageActionDto[] }) {
+  const first = actions[0]
+  if (!first) {
     return (
       <div
         className="relative z-[1] flex h-8 w-8 flex-none items-center justify-center bg-black"
@@ -115,14 +162,16 @@ function NodeTile({ hasActions }: { hasActions: boolean }) {
     )
   }
 
-  // Плитка узла с иконкой действия — заготовка на Ф1 (design/project/Admin.dc.html:200-203).
-  // В Ф0 message.actions всегда пуст, эта ветка вживую не достижима.
+  // Плитка узла с иконкой ПЕРВОГО действия сообщения (design/project/Admin.dc.html:198-203) —
+  // сообщений с несколькими actions в CH1 мало (управляющие reply редко несут больше одного op),
+  // а сама плитка узла — это "что вообще произошло тут", не полный список (он ниже, в ActionRow).
+  const Icon = getActionIcon(first.icon)
   return (
     <div
       className="relative z-[1] flex h-8 w-8 flex-none items-center justify-center rounded-[9px] border border-white/[.12] bg-[#161618]"
       data-testid="node-tile"
     >
-      <Layers size={16} color="#e5e5e5" />
+      <Icon size={16} color={actionIconColor(first.type, first.side)} className="flex-none" />
     </div>
   )
 }

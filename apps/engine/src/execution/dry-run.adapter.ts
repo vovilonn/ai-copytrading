@@ -76,11 +76,15 @@ export class DryRunAdapter implements ExecutionPort {
       // Симулированный fill: mark_price = avg_price "на момент открытия" (task-6-brief.md —
       // реальный live-фид подключит задача 9). Одна атомарная SQL-формула обслуживает и
       // первый вход (INSERT), и доливку/add (ON CONFLICT — средневзвешенная цена по size).
+      // liq_price (task-11-brief.md, полировка А) — просто последнее известное значение (тот же
+      // приём, что и mark_price/leverage на ON CONFLICT), НЕ средневзвешенное: цена ликвидации
+      // пересчитывается целиком на новом плече/avg_price при каждом входе, а не складывается.
       await sql`
-        INSERT INTO positions (channel_id, symbol, trade_id, side, size, avg_price, mark_price, leverage, updated_at)
+        INSERT INTO positions (channel_id, symbol, trade_id, side, size, avg_price, mark_price, liq_price, leverage, updated_at)
         VALUES (
           ${order.channelId}, ${order.symbol}, ${order.tradeId}::uuid, ${order.side}::side_t,
-          ${order.qty}::numeric, ${order.price}::numeric, ${order.price}::numeric, ${order.leverage}::numeric, now()
+          ${order.qty}::numeric, ${order.price}::numeric, ${order.price}::numeric, ${order.liqPrice}::numeric,
+          ${order.leverage}::numeric, now()
         )
         ON CONFLICT (channel_id, symbol) DO UPDATE SET
           trade_id = EXCLUDED.trade_id,
@@ -89,6 +93,7 @@ export class DryRunAdapter implements ExecutionPort {
           avg_price = (COALESCE(positions.avg_price, 0) * positions.size + EXCLUDED.avg_price * EXCLUDED.size)
                       / NULLIF(positions.size + EXCLUDED.size, 0),
           mark_price = EXCLUDED.mark_price,
+          liq_price = EXCLUDED.liq_price,
           leverage = EXCLUDED.leverage,
           updated_at = now()
       `.execute(tx)

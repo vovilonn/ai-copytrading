@@ -45,4 +45,12 @@ describe('shouldApplyTick (троттлинг ~1/сек на символ)', () 
     const last = new Map([['BTCUSDT', 1000]])
     expect(shouldApplyTick(last, 'ETHUSDT', 1100)).toBe(true)
   })
+
+  it('task-11 полировка Б: свой (более длинный) порог для эмита position.upsert через 4й аргумент', () => {
+    const lastEmittedAt = new Map([['BTCUSDT', 1000]])
+    // 1500мс спустя — прошло бы дефолтный DB-порог (1000мс), но не прошло 2000мс WS-порог.
+    expect(shouldApplyTick(lastEmittedAt, 'BTCUSDT', 2500, 2000)).toBe(false)
+    // 3000мс спустя — прошли уже оба порога.
+    expect(shouldApplyTick(lastEmittedAt, 'BTCUSDT', 3000, 2000)).toBe(true)
+  })
 })

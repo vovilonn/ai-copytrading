@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 import type { MessageDto } from 'shared/dto.js'
 import type { MessageNewPayload, MessageUpdatedPayload } from 'shared/ws-events.js'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -39,7 +40,12 @@ function renderTimeline(initial: MessageDto[]) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   render(
     <QueryClientProvider client={queryClient}>
-      <MessageTimeline channelId={CHANNEL_ID} />
+      {/* task-11-brief.md: таймлайн теперь рисует "Trade #TR-x" через useNavigate() (переход
+          на /positions?tr=...) — компоненту нужен контекст роутера, как и во всех остальных
+          страничных тестах (actions.test.tsx/positions.test.tsx/channels.test.tsx). */}
+      <MemoryRouter initialEntries={['/channels/1']}>
+        <MessageTimeline channelId={CHANNEL_ID} />
+      </MemoryRouter>
     </QueryClientProvider>,
   )
   return queryClient
@@ -89,6 +95,37 @@ describe('MessageTimeline', () => {
     const img = document.querySelector('img')
     expect(img).not.toBeNull()
     expect(img?.getAttribute('src')).toBe('/media/abc-123')
+  })
+
+  it('task-11 приёмка Ф1: сообщение с actions рисует строку(и) action — иконка+тип+пара+ссылка на сделку', async () => {
+    renderTimeline([
+      messageFixture({
+        actions: [
+          { type: 'open', side: 'long', pair: 'BTCUSDT', tradeRef: '#TR-1042', skipReason: null, icon: 'trending-up' },
+        ],
+      }),
+    ])
+    const row = await screen.findByTestId('timeline-action-row')
+    expect(row).toHaveTextContent('Open position')
+    expect(row).toHaveTextContent('BTCUSDT')
+    expect(row).toHaveTextContent('Trade #TR-1042')
+    // Узел рисует плитку с иконкой действия (не серую точку), раз actions непустые.
+    const tile = screen.getByTestId('node-tile')
+    expect(tile.querySelector('svg')).not.toBeNull()
+    expect(screen.queryByTestId('node-dot')).toBeNull()
+  })
+
+  it('task-11 приёмка Ф1: skip_reason рисует бейдж Skipped вместо ссылки на сделку', async () => {
+    renderTimeline([
+      messageFixture({
+        actions: [
+          { type: 'open', side: null, pair: 'ETHUSDT', tradeRef: null, skipReason: 'symbol_busy', icon: 'trending-up' },
+        ],
+      }),
+    ])
+    const row = await screen.findByTestId('timeline-action-row')
+    expect(row).toHaveTextContent('Skipped')
+    expect(row).not.toHaveTextContent('Trade')
   })
 
   it('сообщение с aiSummary и пустыми actions рендерит блок саммари с иконкой sparkles', async () => {

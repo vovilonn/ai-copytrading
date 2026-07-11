@@ -12,6 +12,13 @@ const WS_HOSTS: Record<Network, string> = {
 }
 
 const THROTTLE_MS = 1000
+// Полировка Б (task-11-brief.md): при 76+ открытых позициях троттлинг ТИКА ~1/сек на символ
+// (THROTTLE_MS выше) всё ещё даёт ~76 WS-событий/сек суммарно по всем символам — ощутимо для UI
+// (каждое приводит к патчу React Query кэша на фронте). positions.mark_price в БД по-прежнему
+// пишем на каждый прошедший THROTTLE_MS тик (дёшево, один UPDATE), а вот сам эмит position.upsert
+// в domain_events (= WS-рассылка, outbox api публикует НЕМЕДЛЕННО по NOTIFY) троттлим ОТДЕЛЬНО,
+// реже — не чаще раза в EMIT_THROTTLE_MS на символ.
+const EMIT_THROTTLE_MS = 2000
 const SUBSCRIPTION_REFRESH_MS = 5000
 // Bybit требует периодический ping, иначе разрывает публичное WS-соединение по таймауту
 // (задокументировано в v5 WS connect-доке; не покрыто research'ем §12, но проверено эмпирически
@@ -56,9 +63,10 @@ export interface TickersFeedLogger {
  * и в dry-run. Держит подписку синхронизированной с реально открытыми позициями — периодически
  * перечитывает набор символов из БД (openPositionSymbols) и досылает subscribe/unsubscribe на
  * разницу (diffSubscriptions). На каждый тик с markPrice — троттлинг ~1/сек на символ
- * (shouldApplyTick), дальше applyMarkPriceTick пишет mark_price/unrealised_pnl и публикует
- * position.upsert. Реконнект с экспоненциальным backoff — тот же паттерн, что и LISTEN-клиент
- * в main.ts/outbox.publisher.ts.
+ * (shouldApplyTick), дальше applyMarkPriceTick пишет mark_price/unrealised_pnl; публикация
+ * position.upsert в WS троттлится ОТДЕЛЬНО и реже — ~раз в EMIT_THROTTLE_MS на символ (задача 11,
+ * полировка Б), тем же shouldApplyTick с другой картой таймстампов и порогом. Реконнект с
+ * экспоненциальным backoff — тот же паттерн, что и LISTEN-клиент в main.ts/outbox.publisher.ts.
  */
 export class TickersFeed {
   private ws: WebSocket | null = null
@@ -69,6 +77,9 @@ export class TickersFeed {
   private pingTimer: ReturnType<typeof setInterval> | null = null
   private readonly subscribed = new Set<string>()
   private readonly lastAppliedAt = new Map<string, number>()
+  // Отдельная от lastAppliedAt карта (полировка Б, task-11-brief.md): DB-запись и WS-эмит
+  // троттлятся с разным периодом (THROTTLE_MS vs EMIT_THROTTLE_MS), общий таймстамп смешал бы их.
+  private readonly lastEmittedAt = new Map<string, number>()
 
   constructor(
     private readonly db: Kysely<DB>,
@@ -173,9 +184,14 @@ export class TickersFeed {
     if (!shouldApplyTick(this.lastAppliedAt, tick.symbol, now)) return
     this.lastAppliedAt.set(tick.symbol, now)
 
-    const notifyNeeded = await applyMarkPriceTick(this.db, tick.symbol, tick.markPrice)
+    // Полировка Б: решаем ОТДЕЛЬНО от DB-троттлинга выше, публиковать ли position.upsert в этот
+    // раз (~раз в EMIT_THROTTLE_MS на символ) — mark_price в БД обновится в любом случае.
+    const shouldEmit = shouldApplyTick(this.lastEmittedAt, tick.symbol, now, EMIT_THROTTLE_MS)
+    if (shouldEmit) this.lastEmittedAt.set(tick.symbol, now)
+
+    const emitted = await applyMarkPriceTick(this.db, tick.symbol, tick.markPrice, { emit: shouldEmit })
     // Тот же приём, что и pipeline.ts/outbox.publisher.ts: NOTIFY после успешной записи —
     // будит OutboxPublisher api немедленно, не дожидаясь его 5-секундного периодического опроса.
-    if (notifyNeeded) await sql`SELECT pg_notify('domain_events', '')`.execute(this.db)
+    if (emitted) await sql`SELECT pg_notify('domain_events', '')`.execute(this.db)
   }
 }
