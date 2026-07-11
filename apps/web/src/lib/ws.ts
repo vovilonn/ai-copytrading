@@ -2,14 +2,18 @@ import type { InfiniteData } from '@tanstack/react-query'
 import { useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { io, type Socket } from 'socket.io-client'
-import type { MessageDto } from 'shared/dto.js'
+import type { Side } from 'shared/domain.js'
+import type { MessageDto, PositionDto } from 'shared/dto.js'
+import { computeRoi, formatDecimal, signedMoney } from 'shared/numbers.js'
 import type {
   ClientToServerEvents,
   MessageNewPayload,
   MessageUpdatedPayload,
+  PositionUpsertPayload,
   ServerToClientEvents,
 } from 'shared/ws-events.js'
 import { messagesQueryKey } from '../components/MessageTimeline.js'
+import { POSITIONS_LIST_KEY, positionsStatsQueryKey } from '../routes/positions.js'
 
 let socket: Socket<ServerToClientEvents, ClientToServerEvents> | null = null
 
@@ -134,6 +138,172 @@ export function useActionsStream(channelIds: readonly number[]): void {
       s.off('action.skipped', onActionEvent)
       ids.forEach((id) => s.emit('channel.unsubscribe', id))
       if (trailingTimer) clearTimeout(trailingTimer)
+    }
+  }, [idsKey, queryClient])
+}
+
+// Бриф задачи 10: карточки статистики Positions обновляются РЕЖЕ строк таблицы (раз в 2-3 сек) —
+// уже не 1/сек, как action.new выше: тикеры mark price летят за КАЖДУЮ открытую позицию, суммарно
+// заметно чаще одиночных действий Actions.
+const POSITIONS_STATS_THROTTLE_MS = 2500
+const POSITIONS_STRUCTURAL_THROTTLE_MS = 2500
+
+/** Trailing-throttle: первый вызов после паузы — сразу, дальше не чаще period мс, но всегда
+ *  выполняется финальный отложенный вызов (та же логика, что инлайн в useActionsStream выше,
+ *  вынесена в хелпер — usePositionsStream нужны ДВЕ независимые троттлинг-очереди сразу). */
+function createTrailingThrottle(fn: () => void, periodMs: number): { trigger: () => void; cancel: () => void } {
+  let lastRun = 0
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  function run(): void {
+    lastRun = Date.now()
+    fn()
+  }
+
+  return {
+    trigger(): void {
+      const elapsed = Date.now() - lastRun
+      if (elapsed >= periodMs) {
+        run()
+        return
+      }
+      if (timer) return
+      timer = setTimeout(() => {
+        timer = undefined
+        run()
+      }, periodMs - elapsed)
+    },
+    cancel(): void {
+      if (timer) clearTimeout(timer)
+      timer = undefined
+    },
+  }
+}
+
+/** (mark−avg)·size для long, (avg−mark)·size для short — тот же расчёт, что apps/engine/src/
+ *  market-data/pnl.ts (Decimal), здесь — plain number: точности double достаточно на уровне
+ *  отображения (та же логика, что и pnlOf/notionalOf в apps/api/src/positions/positions.service.ts,
+ *  которые тоже считают агрегаты на Number, не Decimal). */
+function computeLivePnl(side: Side, size: string, avgPrice: string | null, markPrice: string | null): number {
+  const avg = avgPrice !== null ? Number(avgPrice) : 0
+  const mark = markPrice !== null ? Number(markPrice) : avg
+  const sizeNum = Number(size)
+  return side === 'long' ? (mark - avg) * sizeNum : (avg - mark) * sizeNum
+}
+
+/**
+ * position.upsert (apps/engine: pipeline.ts emitPositionUpsert И market-data/apply-tick.ts —
+ * ОБА пишут одинаковый ПОЛНЫЙ снимок строки positions на момент публикации, не дельту) —
+ * поэтому каждое поле payload'а можно применить напрямую, форматируя теми же функциями
+ * (formatDecimal/signedMoney/computeRoi), что и обычный GET /api/positions
+ * (positions.service.ts) — точечно пропатченная строка визуально неотличима от свежерасчитанной.
+ * tp/liq/marginMode/source/tradeRef payload не несёт (см. shared/ws-events.ts) — берутся из
+ * текущей строки как есть (spread `...current`).
+ */
+function patchPositionRow(current: PositionDto, payload: PositionUpsertPayload): PositionDto {
+  const side = payload.side ?? current.side
+  const mark =
+    payload.markPrice !== null
+      ? formatDecimal(payload.markPrice)
+      : payload.avgPrice !== null
+        ? formatDecimal(payload.avgPrice)
+        : current.mark
+  const entry = payload.avgPrice !== null ? formatDecimal(payload.avgPrice) : current.entry
+  const leverage = `${payload.leverage !== null ? formatDecimal(payload.leverage) : '0'}x`
+  const sl = payload.stopLoss !== null ? formatDecimal(payload.stopLoss) : null
+
+  const pnl = computeLivePnl(side, payload.size, payload.avgPrice, payload.markPrice)
+  const notional = Math.abs(Number(payload.size)) * Number(mark)
+  const levNum = payload.leverage !== null ? Number(payload.leverage) : 0
+  const margin = levNum > 0 ? notional / levNum : notional
+
+  return {
+    ...current,
+    side,
+    size: formatDecimal(payload.size),
+    entry,
+    mark,
+    leverage,
+    sl,
+    unrealisedPnl: signedMoney(pnl),
+    roi: computeRoi(pnl, margin),
+  }
+}
+
+/**
+ * Реалтайм страницы Positions (задача 10): `position.upsert` летит В ТУ ЖЕ комнату channel:<id>,
+ * что и action.new (см. useActionsStream) — тот же приём подписки на комнаты ВСЕХ каналов сразу.
+ *
+ * СТРАТЕГИЯ (обоснование, task-10-brief.md явно предлагает выбрать): точечный патч строки, а
+ * НЕ инвалидация всего списка. Причина — частота: mark price тикает до ~1 раза в секунду НА
+ * КАЖДУЮ открытую позицию (движок троттлит именно так, apps/engine/src/market-data/tickers-feed.ts),
+ * то есть при N открытых позициях — до N событий/сек постоянно, пока рынок жив. Инвалидация
+ * всего списка на каждое такое событие означала бы до N лишних GET /api/positions в секунду
+ * (то же самое, что просто polling, только через WS) — тогда как payload уже содержит всё
+ * нужное, чтобы пересчитать mark/PnL/ROI строки на клиенте без похода на сервер. Actions,
+ * для сравнения, троттлит через инвалидацию ровно потому, что там события редкие и дискретные
+ * (реальные торговые сигналы, не рыночный шум), payload не несёт готовой строки, а сам список
+ * short — инвалидация раз в секунду там дёшева и достаточна.
+ *
+ * Точечный патч работает, только если строка УЖЕ есть в закэшированном списке (совпадение по
+ * channelId+symbol). Если нет — тик по позиции, которую страница ещё не видела (новая открытая
+ * позиция, или тик прилетел раньше, чем card успела подгрузить свежий список), или каналы —
+ * догоняем обычным (троттлленным, раз в 2.5с) invalidateQueries. Стат-карточки — своя,
+ * независимая троттлинг-очередь той же частоты (2.5с, бриф просит "реже").
+ */
+export function usePositionsStream(channelIds: readonly number[]): void {
+  const queryClient = useQueryClient()
+  const idsKey = channelIds.join(',')
+
+  useEffect(() => {
+    const ids = idsKey === '' ? [] : idsKey.split(',').map(Number)
+    if (ids.length === 0) return
+
+    const s = getSocket()
+    ids.forEach((id) => s.emit('channel.subscribe', id))
+
+    const statsThrottle = createTrailingThrottle(
+      () => void queryClient.invalidateQueries({ queryKey: positionsStatsQueryKey() }),
+      POSITIONS_STATS_THROTTLE_MS,
+    )
+    const listFallback = createTrailingThrottle(
+      () => void queryClient.invalidateQueries({ queryKey: [POSITIONS_LIST_KEY], exact: false }),
+      POSITIONS_STRUCTURAL_THROTTLE_MS,
+    )
+
+    function onPositionUpsert(payload: PositionUpsertPayload): void {
+      let matched = false
+
+      queryClient.setQueriesData<PositionDto[]>({ queryKey: [POSITIONS_LIST_KEY], exact: false }, (old) => {
+        if (!old) return old
+        const idx = old.findIndex((p) => p.channelId === payload.channelId && p.symbol === payload.symbol)
+        if (idx === -1) return old
+        matched = true
+
+        // size=0 — позиция закрылась: GET /api/positions её больше не вернёт (size<>0 —
+        // фильтр backend'а, positions.service.ts), убираем строку сразу, не дожидаясь рефетча.
+        if (Number(payload.size) === 0) {
+          return old.filter((_, i) => i !== idx)
+        }
+
+        const current = old[idx]
+        if (!current) return old
+        const copy = old.slice()
+        copy[idx] = patchPositionRow(current, payload)
+        return copy
+      })
+
+      if (!matched) listFallback.trigger()
+      statsThrottle.trigger()
+    }
+
+    s.on('position.upsert', onPositionUpsert)
+
+    return () => {
+      s.off('position.upsert', onPositionUpsert)
+      ids.forEach((id) => s.emit('channel.unsubscribe', id))
+      statsThrottle.cancel()
+      listFallback.cancel()
     }
   }, [idsKey, queryClient])
 }

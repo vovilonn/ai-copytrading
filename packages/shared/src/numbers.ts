@@ -29,6 +29,29 @@ export function formatDecimal(value: string): string {
 }
 
 /**
+ * '+$327.60' / '-$24.00' — денежная сумма со знаком (design/project/Admin.dc.html:667 signedMoney,
+ * apps/api/src/positions/positions.service.ts). Вынесено сюда (задача 10): точечный патч строки
+ * Positions по live-тику mark price (apps/web/src/lib/ws.ts) обязан форматировать PnL ТЕМ ЖЕ
+ * способом, что и обычный GET-ответ — иначе после первого тика строка визуально "дёрнется"
+ * (смена числа знаков после запятой/разделителя), выдавая факт точечного патча.
+ */
+export function signedMoney(n: number): string {
+  const sign = n >= 0 ? '+' : '-'
+  return `${sign}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+function signedPct(n: number): string {
+  const sign = n >= 0 ? '+' : '-'
+  return `${sign}${Math.abs(n).toFixed(1)}%`
+}
+
+/** ROI = pnl/margin·100, '+6.2%' — 0%, если margin<=0 (см. computeRoi в positions.service.ts). */
+export function computeRoi(pnl: number, margin: number): string {
+  if (margin <= 0) return signedPct(0)
+  return signedPct((pnl / margin) * 100)
+}
+
+/**
  * Разбивает "лесенку" целей, размеченную keycap-эмодзи (1️⃣, 2️⃣, 3️⃣…), на числа.
  * Keycap — это цифра + необязательный variation selector (U+FE0F) + enclosing
  * keycap (U+20E3); сплитим по этой последовательности, а не по самой цифре, чтобы

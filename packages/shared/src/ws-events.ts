@@ -1,7 +1,8 @@
 // Контракт realtime-событий (задача 9): общий и для api (сервер socket.io), и для будущего
 // фронта (apps/web, Ф2+) — типы событий объявляются один раз здесь, а не дублируются на
 // клиенте и сервере.
-import type { ActionRowDto, MessageDto, PositionDto } from './dto.js'
+import type { Side } from './domain.js'
+import type { ActionRowDto, MessageDto } from './dto.js'
 
 export interface MessageNewPayload {
   channelId: number
@@ -39,8 +40,28 @@ export interface ActionSkippedPayload {
   action: ActionRowDto
 }
 
+/**
+ * Задача 10: ЭТО и есть реальный Ф1-контракт (в отличие от Action*Payload выше, оставшихся
+ * "целевой формой Ф2+", поскольку никакой код пока не читает их поля) — apps/engine/src/
+ * pipeline.ts (emitPositionUpsert) и apps/engine/src/market-data/apply-tick.ts (живой тик
+ * mark price) пишут в domain_events РОВНО эту форму, OutboxPublisher рассылает её как есть.
+ * Фронт (lib/ws.ts: usePositionsStream/patchPositionRow) точечно патчит строку таблицы Positions
+ * этими полями — unrealisedPnl/roi пересчитываются на клиенте из avgPrice/markPrice/size/side/
+ * leverage форматированием shared/numbers.ts (formatDecimal/signedMoney/computeRoi) — той же
+ * формулой, что и apps/api/src/positions/positions.service.ts (не тронут в этой задаче, его
+ * приватные копии этих функций оставлены как есть — shared/numbers.ts здесь новый общий источник
+ * только для фронта), чтобы точечный патч был визуально неотличим от обычного GET-ответа.
+ */
 export interface PositionUpsertPayload {
-  position: PositionDto
+  channelId: number
+  symbol: string
+  side: Side | null
+  size: string
+  avgPrice: string | null
+  markPrice: string | null
+  leverage: string | null
+  stopLoss: string | null
+  tradeId: string | null
 }
 
 export interface PositionClosePayload {

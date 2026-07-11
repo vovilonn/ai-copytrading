@@ -6,6 +6,7 @@ import { loadConfig } from 'api/config/config.schema.js'
 import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
 import { createExecutionPort } from './execution/port.js'
+import { TickersFeed } from './market-data/tickers-feed.js'
 import { processMessage, type PipelineDeps, type PipelineMessage } from './pipeline.js'
 
 // Запускается из apps/engine (pnpm --filter engine dev), а .env лежит в корне репозитория —
@@ -93,6 +94,11 @@ async function main(): Promise<void> {
   const executionPort = createExecutionPort(config.executionMode)
   const deps: PipelineDeps = { executionPort, network: config.bybitNetwork, equity: '1000' }
 
+  // Задача 10: публичный WS-фид mark price для символов с открытыми позициями — независим от
+  // пайплайна разбора выше (не участвует в EXECUTION_MODE, публичный поток доступен без ключа
+  // и в dry-run, см. task-10-brief.md).
+  const tickersFeed = new TickersFeed(db, config.bybitNetwork)
+
   let stopped = false
   let draining = false
   let pollTimer: NodeJS.Timeout | null = null
@@ -161,6 +167,7 @@ async function main(): Promise<void> {
   pollTimer = setInterval(() => {
     tick().catch((err) => console.error('[engine] периодический опрос:', err))
   }, POLL_INTERVAL_MS)
+  tickersFeed.start()
 
   console.log(`[engine] воркер запущен: пайплайн разбора и исполнения (${config.executionMode}) активен`)
 
@@ -172,6 +179,7 @@ async function main(): Promise<void> {
     console.log(`[engine] получен ${signal}, завершаюсь...`)
     if (pollTimer) clearInterval(pollTimer)
     if (reconnectTimer) clearTimeout(reconnectTimer)
+    tickersFeed.stop()
     const closeListener = listenClient ? listenClient.end().catch(() => {}) : Promise.resolve()
     closeListener
       .then(() => db.destroy())

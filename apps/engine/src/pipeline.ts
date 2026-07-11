@@ -463,7 +463,10 @@ async function processIntent(
   return true
 }
 
-async function emitPositionUpsert(trx: Kysely<DB>, channelId: number, symbol: string): Promise<void> {
+// Экспортирована для переиспользования в apps/engine/src/market-data/apply-tick.ts (задача 10):
+// живой тик mark price публикует ТОТ ЖЕ формат position.upsert, что и исполнение сделок здесь —
+// один код, читающий актуальную строку positions и пишущий domain_events, вместо двух копий.
+export async function emitPositionUpsert(trx: Kysely<DB>, channelId: number, symbol: string): Promise<void> {
   const position = await trx
     .selectFrom('positions')
     .selectAll()

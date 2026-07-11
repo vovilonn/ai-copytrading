@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseNumbers, toNum, splitKeycaps } from '../src/numbers.js'
+import { parseNumbers, toNum, splitKeycaps, signedMoney, computeRoi } from '../src/numbers.js'
 
 describe('parseNumbers', () => {
   it('62 000$ — разделитель тысяч обычный пробел U+0020', () => {
@@ -46,6 +46,39 @@ describe('toNum', () => {
 
   it('десятичная точка без изменений', () => {
     expect(toNum('0.0728')).toBe(0.0728)
+  })
+})
+
+describe('signedMoney', () => {
+  it('положительное -> "+$327.60"', () => {
+    expect(signedMoney(327.6)).toBe('+$327.60')
+  })
+
+  it('отрицательное -> "-$24.00"', () => {
+    expect(signedMoney(-24)).toBe('-$24.00')
+  })
+
+  it('ноль -> знак плюс ("+$0.00", design: uPnl>=0 считается зелёным/plus)', () => {
+    expect(signedMoney(0)).toBe('+$0.00')
+  })
+
+  it('разделитель тысяч у крупных сумм', () => {
+    expect(signedMoney(26535)).toBe('+$26,535.00')
+  })
+})
+
+describe('computeRoi', () => {
+  it('pnl=327.6, margin=5307 -> "+6.2%"', () => {
+    expect(computeRoi(327.6, 5307)).toBe('+6.2%')
+  })
+
+  it('отрицательный pnl -> "-2.2%"', () => {
+    expect(computeRoi(-24, 1080)).toBe('-2.2%')
+  })
+
+  it('margin<=0 -> "+0.0%" (деление на ноль исключено)', () => {
+    expect(computeRoi(100, 0)).toBe('+0.0%')
+    expect(computeRoi(100, -5)).toBe('+0.0%')
   })
 })
 
