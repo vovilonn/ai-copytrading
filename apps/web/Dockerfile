@@ -1,18 +1,34 @@
-# apps/web — статика Vite за nginx (выбор вместо `vite preview`: сам Vite документирует preview
-# как инструмент ДЛЯ ЛОКАЛЬНОЙ проверки прод-сборки, а не как прод-сервер; nginx отдаёт статику
-# без node-рантайма в финальном образе и даёт полноценный reverse-proxy с апгрейдом до
-# websocket для /socket.io, который нужен по брифу задачи 13).
-FROM node:22-alpine AS builder
-WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@10.28.1 --activate
-# Монорепо целиком: apps/web зависит от workspace-пакета 'shared' (packages/shared/src/*),
-# а `pnpm install --frozen-lockfile` требует консистентности всех участников lockfile.
-COPY . .
-RUN pnpm install --frozen-lockfile
-# "build" = "tsc --noEmit && vite build" (apps/web/package.json) — типchecking + сборка в dist/.
-RUN pnpm --filter web build
+# syntax=docker/dockerfile:1
+# apps/web — статика Vite за nginx. Multi-stage: build (Node + полный install + vite build) →
+# runtime (nginx со статикой, без node-рантайма). nginx выбран вместо `vite preview` (Vite
+# документирует preview как локальный инструмент, а не прод-сервер) и даёт reverse-proxy с
+# websocket-апгрейдом для /socket.io. Прод-прунинг тут не нужен: в финальный образ идёт только
+# собранный dist/, node_modules сборки остаётся в build-стадии.
 
+# ── base: закреплённый Node + pnpm через corepack ───────────────────────────
+FROM node:22-alpine AS base
+ENV PNPM_HOME="/pnpm" PATH="/pnpm:$PATH" CI=1
+RUN corepack enable && corepack prepare pnpm@10.28.1 --activate
+WORKDIR /app
+
+# ── fetch: только lockfile → pnpm store в BuildKit-кеше ──────────────────────
+FROM base AS fetch
+COPY pnpm-lock.yaml ./
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm fetch --frozen-lockfile
+
+# ── build: офлайн-install из store + сборка Vite (tsc --noEmit && vite build) ─────────────────
+FROM fetch AS build
+RUN apk add --no-cache python3 make g++
+COPY . .
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm install --frozen-lockfile --offline
+RUN pnpm --filter=web build
+
+# ── runtime: nginx со статикой, без node ─────────────────────────────────────
 FROM nginx:1.27-alpine AS runtime
 COPY apps/web/nginx.conf /etc/nginx/conf.d/default.conf
-COPY --from=builder /app/apps/web/dist /usr/share/nginx/html
+COPY --from=build /app/apps/web/dist /usr/share/nginx/html
 EXPOSE 80
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1/healthz || exit 1

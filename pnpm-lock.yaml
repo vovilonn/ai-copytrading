@@ -42,6 +42,9 @@ importers:
       cookie-parser:
         specifier: ^1.4.7
         version: 1.4.7
+      dotenv:
+        specifier: ^16.4.0
+        version: 16.6.1
       jose:
         specifier: ^6.0.0
         version: 6.2.3
@@ -63,6 +66,9 @@ importers:
       socket.io:
         specifier: ^4.8.1
         version: 4.8.3(bufferutil@4.1.0)(utf-8-validate@5.0.10)
+      tsx:
+        specifier: ^4.19.0
+        version: 4.23.0
       zod:
         specifier: ^4.0.0
         version: 4.4.3
@@ -79,9 +85,6 @@ importers:
       '@types/supertest':
         specifier: ^6.0.2
         version: 6.0.3
-      dotenv:
-        specifier: ^16.4.0
-        version: 16.6.1
       socket.io-client:
         specifier: ^4.8.1
         version: 4.8.3(bufferutil@4.1.0)(utf-8-validate@5.0.10)
@@ -91,9 +94,6 @@ importers:
       test-db:
         specifier: workspace:*
         version: link:../../packages/test-db
-      tsx:
-        specifier: ^4.19.0
-        version: 4.23.0
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
@@ -109,6 +109,9 @@ importers:
       decimal.js:
         specifier: ^10.6.0
         version: 10.6.0
+      dotenv:
+        specifier: ^16.4.0
+        version: 16.6.1
       kysely:
         specifier: ^0.28.0
         version: 0.28.17
@@ -118,22 +121,19 @@ importers:
       shared:
         specifier: workspace:*
         version: link:../../packages/shared
+      tsx:
+        specifier: ^4.19.0
+        version: 4.23.0
     devDependencies:
       '@types/pg':
         specifier: ^8.11.0
         version: 8.20.0
-      dotenv:
-        specifier: ^16.4.0
-        version: 16.6.1
       fast-check:
         specifier: ^4.9.0
         version: 4.9.0
       test-db:
         specifier: workspace:*
         version: link:../../packages/test-db
-      tsx:
-        specifier: ^4.19.0
-        version: 4.23.0
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
@@ -146,6 +146,9 @@ importers:
       api:
         specifier: workspace:*
         version: link:../api
+      dotenv:
+        specifier: ^16.4.0
+        version: 16.6.1
       kysely:
         specifier: ^0.28.0
         version: 0.28.17
@@ -155,19 +158,16 @@ importers:
       telegram:
         specifier: ^2.26.22
         version: 2.26.22
+      tsx:
+        specifier: ^4.19.0
+        version: 4.23.0
     devDependencies:
       big-integer:
         specifier: ^1.6.52
         version: 1.6.52
-      dotenv:
-        specifier: ^16.4.0
-        version: 16.6.1
       test-db:
         specifier: workspace:*
         version: link:../../packages/test-db
-      tsx:
-        specifier: ^4.19.0
-        version: 4.23.0
       typescript:
         specifier: ^5.7.0
         version: 5.9.3

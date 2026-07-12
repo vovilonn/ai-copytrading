@@ -9,15 +9,15 @@
   },
   "dependencies": {
     "api": "workspace:*",
+    "dotenv": "^16.4.0",
     "kysely": "^0.28.0",
     "shared": "workspace:*",
-    "telegram": "^2.26.22"
+    "telegram": "^2.26.22",
+    "tsx": "^4.19.0"
   },
   "devDependencies": {
     "big-integer": "^1.6.52",
-    "dotenv": "^16.4.0",
     "test-db": "workspace:*",
-    "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   }

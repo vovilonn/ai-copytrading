@@ -1,12 +1,28 @@
 node_modules
+**/node_modules
 var
 .git
+.gitignore
 .env
+.env.example
 temp
 .superpowers
 .ai-proxy
+.claude
+.vscode
+.idea
 
-# Артефакты сборок и локальные логи — не нужны в контексте сборки образов.
+# Артефакты сборок, кеши и локальные логи — не нужны в контексте сборки образов.
 **/dist
+**/coverage
+**/.turbo
+**/*.tsbuildinfo
 .ai-proxy/logs
 *.log
+
+# Документация/дизайн-референсы и Docker-мета — код их не импортирует, в образ не нужны.
+docs
+design
+Dockerfile*
+docker-compose.yml
+README.md

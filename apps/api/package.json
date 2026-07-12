@@ -21,6 +21,7 @@
     "@nestjs/websockets": "^11.0.0",
     "bcryptjs": "^3.0.2",
     "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.0",
     "jose": "^6.0.0",
     "kysely": "^0.28.0",
     "pg": "^8.13.0",
@@ -28,6 +29,7 @@
     "rxjs": "^7.8.1",
     "shared": "workspace:*",
     "socket.io": "^4.8.1",
+    "tsx": "^4.19.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
@@ -35,11 +37,9 @@
     "@types/express": "^5.0.0",
     "@types/pg": "^8.11.0",
     "@types/supertest": "^6.0.2",
-    "dotenv": "^16.4.0",
     "socket.io-client": "^4.8.1",
     "supertest": "^7.1.0",
     "test-db": "workspace:*",
-    "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   }
