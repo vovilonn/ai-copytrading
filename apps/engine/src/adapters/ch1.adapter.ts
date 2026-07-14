@@ -30,7 +30,7 @@ export function parseCh1(ctx: ParseContext): ParsedResult {
     tryNoiseKeywords(text) ??
     tryDeltaReply(text, ctx) ??
     tryDeltaStandalone(text, ctx) ??
-    fallbackNoise()
+    fallback(ctx)
   )
 }
 
@@ -54,10 +54,15 @@ const ACTION_LEXICON: ReadonlyArray<{ readonly op: LexOp; readonly re: RegExp }>
   { op: 'sl_hit', re: /выбило по стоп|по стоп-лоссу|закрыто по стоп/ },
   {
     op: 'close_remainder', // "close"
-    re: /закрыва(ю|ем)|закрыть|остаток\s+(закрыва|зафиксир|ушел)|зафиксировал (позици|остаток|полностью)|прикрываю позици/,
+    // «фиксируюсь по текущим полностью» (msg #DUSK) — это ВЕСЬ остаток, а не половина:
+    // без этой ветки фраза падала в partial_close и закрывала 50% вместо 100%.
+    re: /закрыва(ю|ем)|закрыть|остаток\s+(закрыва|зафиксир|ушел)|зафиксировал (позици|остаток|полностью)|прикрываю позици|фиксир[а-я]*[^.\n]{0,25}полностью|полностью[^.\n]{0,25}фиксир[а-я]*/,
   },
   { op: 'hold', re: /продолжаю удерживать/ }, // no-op — никогда не исполняется как ордер
 ]
+
+/** Шаблон полного закрытия — им гасим partial_close на фразах вида «фиксируюсь полностью». */
+const FULL_CLOSE_RE = ACTION_LEXICON.find((l) => l.op === 'close_remainder')!.re
 
 function toDeltaOp(op: LexOp): DeltaOp {
   switch (op) {
@@ -76,12 +81,48 @@ function toDeltaOp(op: LexOp): DeltaOp {
   }
 }
 
+/**
+ * «Ничего пока НЕ фиксирую, держите крепко» — отрицание переворачивает смысл фразы. Голый
+ * лексикон видел здесь «фиксирую» и порождал partial_close, т.е. закрывал половину позиции
+ * ровно там, где автор просил не трогать её. Под отрицанием fix/close не порождаем вовсе —
+ * пустой набор ops уводит сообщение в AI, который и разбирает такие формулировки.
+ */
+// \b и \w в JS определены по ASCII — на кириллице /\bне/ и /фиксиру\w*/ НЕ матчатся вовсе
+// (именно поэтому первая версия гейта молча пропускала отрицание). Границу слева задаём
+// lookbehind по кириллице, хвосты слов — явным классом [а-я] (normalize уже сделал ё→е).
+const CLOSE_NEGATION_RE = /(?<![а-я])не\s+(?:буду\s+|планирую\s+|собираюсь\s+)?(?:фиксир[а-я]*|закрыв[а-я]*|закрыть)/
+
+/**
+ * Явная доля фиксации: «25% фиксирую», «зафиксировал 50%», «закрыл 30%». Без неё пайплайн
+ * подставлял бы дефолтную половину — для «Пробит хай, 25% фиксирую» это вдвое больший объём.
+ * Процент читаем только вплотную к глаголу фиксации: «профит 30%» долей закрытия не является.
+ */
+// Каноничная форма доли фиксации — глагол ПЕРЕД числом: «фиксирую 50%», «закрыл 30%».
+const FRACTION_AFTER_RE = /(?:фиксир[а-я]*|зафиксировал[а-я]*|закрыл[а-я]*|фикс)\s*(\d{1,3})\s*%/
+// Число ПЕРЕД глаголом: «50% фиксирую». Но НЕ процент прибыли: «+30% фиксирую 50%» — здесь «30» это
+// профит (стоит после «+»), а доля закрытия — «50» справа от глагола. Поэтому (а) эту форму пробуем
+// ТОЛЬКО когда формы «глагол→число» в тексте нет, и (б) отвергаем число, идущее сразу после «+».
+const FRACTION_BEFORE_RE = /(?<![+\d])(\d{1,3})\s*%\s*(?:фиксир[а-я]*|зафиксировал[а-я]*|закрыл[а-я]*|фикс)/
+
+function partialCloseOp(normalized: string): DeltaOp {
+  const m = FRACTION_AFTER_RE.exec(normalized) ?? FRACTION_BEFORE_RE.exec(normalized)
+  const pct = Number(m?.[1])
+  // Доля вне (0;100) — мусор от опечатки, а не намерение: пусть долю определит AI.
+  if (!Number.isFinite(pct) || pct <= 0 || pct >= 100) return { op: 'partial_close' }
+  return { op: 'partial_close', fraction: pct / 100 }
+}
+
 /** Прогоняет фрагмент текста (уже нормализованный внутри) через весь action-лексикон. */
 function extractOps(segment: string): DeltaOp[] {
   const normalized = normalize(segment)
+  const negated = CLOSE_NEGATION_RE.test(normalized)
   const ops: DeltaOp[] = []
   for (const { op, re } of ACTION_LEXICON) {
-    if (re.test(normalized)) ops.push(toDeltaOp(op))
+    if (!re.test(normalized)) continue
+    if (negated && (op === 'partial_close' || op === 'close_remainder')) continue
+    // «фиксируюсь полностью» ловится обоими шаблонами — побеждает полное закрытие.
+    if (op === 'partial_close' && FULL_CLOSE_RE.test(normalized)) continue
+    ops.push(op === 'partial_close' ? partialCloseOp(normalized) : toDeltaOp(op))
   }
   return ops
 }
@@ -149,17 +190,29 @@ function tryEntrySignal(text: string, ctx: ParseContext): ParsedResult | null {
   const presentCount = [symbol, side, entry, sl].filter((v) => v !== null).length
   const confidence = Math.min(1, 0.6 + 0.1 * presentCount)
 
+  // ── Regex понял, что это сигнал, но собрать его целиком не смог ────────────────────────────────
+  //
+  // Раньше такие сообщения уходили в skip и НЕ торговались: канал сменил формат стопа/тикера — и бот
+  // молча переставал открывать сделки, а в UI это выглядело как обычный пропуск. Теперь любая
+  // НЕУВЕРЕННОСТЬ шаблона отдаётся AI (route='ai'): он читает текст свободно, поэтому переживает
+  // смену формата, понимает «стоп за 72», «беру соль», картинку с графиком.
+  //
+  // Дальше решает reconciler (reconcileAiRoute): AI разобрал уверенно → исполняем из AI (method='ai');
+  // AI тоже не уверен → needs_review, ноль ордеров. Числа при этом всегда берутся у того, кто их
+  // реально нашёл, — молчаливой потери сигнала больше нет ни в одной ветке.
   if (sl === null) {
-    return { route: 'skip', confidence, intents: [], reason: 'no_SL' }
+    return { route: 'ai', confidence, intents: [], reason: 'no_SL' }
   }
   if (symbol === null) {
-    return { route: 'skip', confidence, intents: [], reason: 'symbol_unknown' }
+    return { route: 'ai', confidence, intents: [], reason: 'symbol_unknown' }
   }
+  // ЕДИНСТВЕННОЕ исключение: символ распознан, но не торгуется на бирже. AI здесь бессилен —
+  // инструмента просто нет в листинге, и звать модель значит жечь деньги ради того же ответа.
   if (!ctx.isListed(symbol)) {
     return { route: 'skip', confidence, intents: [], reason: 'symbol_not_listed' }
   }
   if (side === null || entry === null) {
-    return { route: 'skip', confidence, intents: [], reason: 'incomplete_signal' }
+    return { route: 'ai', confidence, intents: [], reason: 'incomplete_signal' }
   }
 
   const intent: ParsedIntent = {
@@ -264,9 +317,35 @@ function tryDeltaStandalone(text: string, ctx: ParseContext): ParsedResult | nul
 }
 
 // ---------------------------------------------------------------------------
-// Фолбэк — ни одно правило не сработало (пустые/медиа-только сообщения и т.п.)
+// Фолбэк — ни одно правило не сработало.
+//
+// ЗДЕСЬ ЖИВЁТ НОВЫЙ ФОРМАТ КАНАЛА. Раньше сюда проваливалось всё непонятое и молча становилось
+// 'noise': смени автор шаблон сигнала — и бот тихо перестал бы торговать, а в UI это выглядело бы
+// как обычная болтовня. Никакой ошибки, никакого следа.
+//
+// Теперь непонятое уходит в AI: он не привязан к шаблону и разберёт сигнал в любой формулировке
+// (или на картинке с графиком). Regex остаётся быстрым и бесплатным путём для известного формата,
+// AI — страховкой для всего остального. Ровно ради этого он в боте и есть.
+//
+// Бесплатно отсекаем только то, где разбирать заведомо нечего: пустое сообщение без картинки
+// (сервисные посты, стикеры) — звать модель на пустоту смысла нет. Явный шум (обзоры/анонсы) отсечён
+// раньше по ключевым словам (tryNoiseKeywords), до этой точки он не доходит.
 // ---------------------------------------------------------------------------
 
-function fallbackNoise(): ParsedResult {
-  return { route: 'noise', confidence: 0, intents: [] }
+function fallback(ctx: ParseContext): ParsedResult {
+  const hasText = (ctx.message.text ?? '').trim().length > 0
+  const hasMedia = ctx.message.media !== null || ctx.message.mediaFile !== null
+
+  if (!hasText && !hasMedia) {
+    return { route: 'noise', confidence: 0, intents: [] }
+  }
+
+  // needsVision: картинка может нести сам сигнал (скрин графика с уровнями) — пусть AI её посмотрит.
+  return {
+    route: 'ai',
+    confidence: 0,
+    intents: [],
+    reason: 'unknown_format',
+    ...(hasMedia ? { needsVision: true } : {}),
+  }
 }

@@ -1,5 +1,6 @@
+import { normalize } from '../normalize.js'
 import { extractCoins, extractSide } from '../symbol-resolver.js'
-import { parseNumbers, splitKeycaps, toNum } from 'shared/numbers.js'
+import { parseNumbers, parseNumbersWithIndex, splitKeycaps, toNum } from 'shared/numbers.js'
 import type { DeltaOp, ParseContext, ParsedIntent, ParsedResult } from 'shared/domain.js'
 
 /**
@@ -27,7 +28,7 @@ export function parseCh2(ctx: ParseContext): ParsedResult {
     tryMarketEntry(text, ctx) ??
     tryDeltaSl(text, ctx) ??
     tryAiLexicon(text) ??
-    fallbackNoise()
+    fallback(text, ctx)
   )
 }
 
@@ -65,10 +66,71 @@ function resolveSymbolFromText(text: string, ctx: ParseContext): string | null {
  * пояснение прошлого действия, а не новое. Такие сообщения не должны исполняться как дельты
  * ни через D (sl/стоп встречается, но это не приказ), ни через общий E/F-лексикон.
  */
-const SUGGESTION_MARKER_RE = /можно|лучше|с\s+учетом/i
+// Границы слова обязательны: без них «можно» матчится ВНУТРИ «во-зможно» и глушит настоящие
+// сигналы («...возможно зря перестраховывался. Если лимитку не заденет то буду искать вход по
+// рынку» уходил в noise). \b здесь не годится — он ASCII-only и не создаёт границу перед кириллицей.
+const SUGGESTION_MARKER_RE = /(?<![\p{L}])(можно|лучше)(?![\p{L}])|с\s+учетом/iu
 
-function fallbackNoise(): ParsedResult {
-  return { route: 'noise', confidence: 0, intents: [] }
+// ---------------------------------------------------------------------------
+// ФОЛБЭК CH2.
+//
+// Раньше сюда проваливалось ВСЁ непонятое и молча становилось noise: «SOL long» и «вход с текущих
+// BTC long, риск 2%» получали status='noise', method=NULL — модель не вызывалась НИ РАЗУ. И это в
+// канале, созданном ИМЕННО под AI-разбор свободного текста.
+//
+// РАЗНИЦА С CH1 — ЦЕНА. CH1 это канал сигналов, болтовни там нет. CH2 — форумный чат: «всё
+// непонятое → AI» даёт 57 сообщений из 100 в модель, половина из них — «Не задело», «Надеюсь вниз
+// не полетим» и пустые медиа-посты. Поэтому перед фолбэком стоит БЕСПЛАТНЫЙ гейт: сообщение должно
+// упоминать монету ИЛИ торговый маркер. Замер на test/fixtures/ch2.jsonl (100 реальных сообщений
+// форума): 46 → ai вместо 57, при этом ни один настоящий ордер не потерян.
+// ---------------------------------------------------------------------------
+
+/** Явный шум темы: анонсы/обзоры/рефки — разбирать нечего (аналог NOISE_KEYWORDS_RE в ch1). */
+const NOISE_KEYWORDS_RE = /обзор|анонс|созвон|zoom|копитрейд|вебинар|подпис|итоги\s+недел/i
+
+/**
+ * Торговый маркер: глагол действия с ордером/позицией либо направление. Стем, а не точное слово
+ * («доливаться», «лимитку», «тэйк»→«тейк» после normalize). `\b` не годится — он ASCII-only и не
+ * создаёт границу перед кириллицей (та же грабля, что в symbol-resolver.ts).
+ */
+// СТЕМЫ — граница только СЛЕВА: «зайд» обязан ловить «зайду»/«зайдём», «закры» — «закрыл»/
+// «закрываю». Правая граница здесь всё ломала: «зайду» = «зайд» + «у», и сигнал «зайду от 76.3»
+// молча уходил в noise.
+const TRADE_STEM_RE =
+  /(?<![\p{L}\p{N}])(вход|войд|войти|захож|заход|зайд|заш[её]л|бер[уё]|взял|купил|прода|долив|доли[влью]|усредн|добра|добор|фикс|закры|прикрыва|тейк|таргет|стоп(?!роцент)|лимитк|лимит|отложк|плеч|перезах|маркет|лонг|шорт)/iu
+// КОРОТКИЕ токены — граница с обеих сторон, иначе «тп» поймает «тпру», а «sl» — «slow».
+const TRADE_TOKEN_RE = /(?<![\p{L}\p{N}])(тп|tp|sl|long|short|relong)(?![\p{L}\p{N}])|🎯|🛑|📈|📉/iu
+
+function hasTradeMarker(t: string): boolean {
+  return TRADE_STEM_RE.test(t) || TRADE_TOKEN_RE.test(t)
+}
+
+/** Монета в тексте: коин-слово (extractCoins) или структурный хэштег #TICKERUSDT. */
+function hasCoin(text: string, ctx: ParseContext): boolean {
+  if (CLEAN_HASHTAG_RE.test(text)) return true
+  return extractCoins(text).some((coin) => ctx.resolveSymbol(coin) !== null)
+}
+
+function fallback(text: string, ctx: ParseContext): ParsedResult {
+  const noise: ParsedResult = { route: 'noise', confidence: 0, intents: [] }
+  if (text.trim().length === 0) return noise // медиа-only/сервисные сообщения — разбирать нечего
+
+  // normalize() обязательна: без неё «тэйк» не совпадёт с «тейк», а регистр убьёт половину маркеров.
+  const t = normalize(text)
+  if (SUGGESTION_MARKER_RE.test(t)) return noise // «можно…», «лучше…» — совет, а не приказ
+  if (NOISE_KEYWORDS_RE.test(t)) return noise // обзор/анонс/рефка
+
+  if (hasCoin(text, ctx) || hasTradeMarker(t)) {
+    const hasMedia = ctx.message.media !== null || ctx.message.mediaFile !== null
+    return {
+      route: 'ai',
+      confidence: 0,
+      intents: [],
+      reason: 'unknown_format',
+      ...(hasMedia ? { needsVision: true } : {}),
+    }
+  }
+  return noise // «привет, как дела», «да, согласен полностью» — в модель не тащим
 }
 
 // ---------------------------------------------------------------------------
@@ -187,8 +249,10 @@ function tryMarketEntry(text: string, ctx: ParseContext): ParsedResult | null {
 // D. DELTA_SL с тикером (research §2 D, conf 0.75 → DET; без тикера → 0.4 AI)
 // ---------------------------------------------------------------------------
 
-const SL_GATE_RE = /\bsl\b|стоп/i
+const SL_GATE_RE = /\bsl\b|стоп[а-яё]*/i
 const BE_MARKER_RE = /на твх|в бу|б\/у/i
+/** «50%», «50 %» — доля фиксации, а не цена: вырезаем перед поиском цены стопа. */
+const PERCENT_NUM_RE = /\d+(?:[.,]\d+)?\s*%/g
 
 /**
  * Извлекает DeltaOp из ОДНОЙ строки, уже прошедшей гейт SL_GATE_RE. be — раньше price:
@@ -198,8 +262,23 @@ const BE_MARKER_RE = /на твх|в бу|б\/у/i
  */
 function extractSlOpFromLine(line: string): DeltaOp | null {
   if (BE_MARKER_RE.test(line)) return { op: 'sl_breakeven' }
-  const price = parseNumbers(line)[0]
-  return price !== undefined ? { op: 'sl_set', price } : null
+
+  const marker = SL_GATE_RE.exec(line)
+  if (marker === null) return null
+
+  // Цена стопа — число, БЛИЖАЙШЕЕ к слову «стоп», хоть справа («стоп 70000»), хоть слева
+  // («74600 стоп по битку» — привычная манера автора CH2). Ни «первое число строки» (брало «50»
+  // из «Фикс 50% BTC, стоп 70000» → стоп $50 на BTC), ни «только хвост после маркера» (терял
+  // цену, стоящую ПЕРЕД словом) не годятся. Проценты вырезаем, сохраняя позиции (замена на
+  // пробелы той же длины), иначе «50%» сдвинула бы индексы и «ближайшее» посчиталось бы неверно.
+  const masked = line.replace(PERCENT_NUM_RE, (m) => ' '.repeat(m.length))
+  const markerMid = marker.index + marker[0].length / 2
+  const numbers = parseNumbersWithIndex(masked)
+  if (numbers.length === 0) return null
+  const nearest = numbers.reduce((best, n) =>
+    Math.abs(n.index - markerMid) < Math.abs(best.index - markerMid) ? n : best,
+  )
+  return { op: 'sl_set', price: nearest.value }
 }
 
 function tryDeltaSl(text: string, ctx: ParseContext): ParsedResult | null {

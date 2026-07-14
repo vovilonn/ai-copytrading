@@ -17,6 +17,17 @@ export function parseNumbers(text: string): number[] {
   return (text.match(NUM) ?? []).map(toNum)
 }
 
+/** То же, но с позицией каждого числа в строке — нужно, когда важно, какое число ближе к
+ *  якорному слову (напр. цена стопа рядом с «стоп», хоть слева, хоть справа от него). */
+export function parseNumbersWithIndex(text: string): { value: number; index: number }[] {
+  const re = new RegExp(NUM.source, 'g')
+  const out: { value: number; index: number }[] = []
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    out.push({ value: toNum(m[0]), index: m.index })
+  }
+  return out
+}
+
 /**
  * NUMERIC из Postgres приходит строкой вида '500.00000000' — обрезает незначащие нули для
  * отображения (design/project/Admin.dc.html показывает '$500'/'10x', а не '$500.00000000').

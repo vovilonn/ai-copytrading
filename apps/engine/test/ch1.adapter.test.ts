@@ -116,9 +116,27 @@ describe('ch1.adapter — агрегат покрытия на 100 реальн�
     expect(skip).toBe(5)
   })
 
-  it('AI — 0 (CH1 полностью детерминирован, research §0: AI=0 для CH1)', () => {
+  // Раньше здесь стояло AI=0 («CH1 полностью детерминирован»). Это правило снято СОЗНАТЕЛЬНО:
+  // при таком поведении смена формата канала означала молчаливую потерю сигналов — regex не матчился,
+  // сообщение уходило в noise, и бот тихо переставал торговать. Теперь любая НЕУВЕРЕННОСТЬ шаблона
+  // (нет стопа / не узнан тикер / неполный сигнал / формат вообще незнаком) отдаётся AI.
+  //
+  // Этот тест сторожит ЦЕНУ решения: AI должен оставаться РЕДКИМ путём, а не вызываться на каждом
+  // обзоре. На 100 реальных сообщениях канала regex по-прежнему разбирает всё сам (56 execute),
+  // обзоры отсекаются бесплатно по ключевым словам, и в AI уходят единицы. Если это число поползёт
+  // вверх — значит regex деградировал и мы начали жечь деньги на болтовне.
+  it('AI — редкий фолбэк, а не основной путь: единицы из 100 сообщений', () => {
     const ai = results.filter((r) => r.result.route === 'ai').length
-    expect(ai).toBe(0)
+    expect(ai).toBeGreaterThan(0) // фолбэк жив: непонятое НЕ теряется молча
+    expect(ai).toBeLessThanOrEqual(5) // но и не подменяет собой regex
+  })
+
+  it('обзоры/анонсы по-прежнему отсекаются БЕСПЛАТНО (в AI не уходят)', () => {
+    const reviews = results.filter((r) => /#btc\s*обзор/i.test(r.message.text))
+    expect(reviews.length).toBeGreaterThan(0)
+    for (const { message, result } of reviews) {
+      expect(result.route, `обзор ${message.id} ушёл в AI — это лишние деньги`).toBe('noise')
+    }
   })
 
   it('ложных SIGNAL из обзоров = 0: ни одно "#BTC обзор" не даёт entry_signal', () => {
@@ -252,5 +270,88 @@ describe('ch1.adapter — SL/Риск с пробелом-разделителе
     // пробел-разделитель тысяч до `$` в конце — ни при каком бэктрекинге группы вся SL_RE не
     // матчится вообще (а не "откусывает" число до пробела, как можно было бы наивно предположить).
     expect(/sl:?\s*([\d.,]+)\s*\$/i.test('SL: 61 500$')).toBe(false)
+  })
+})
+
+// Главный сценарий отказоустойчивости: автор канала сменил формат сигнала.
+// Раньше такое сообщение молча становилось 'noise' — бот тихо переставал торговать, и заметить это
+// можно было только по отсутствию сделок. Теперь непонятое уходит в AI (он не привязан к шаблону).
+describe('ch1.adapter — смена формата канала не теряет сигнал (уходит в AI)', () => {
+  function ctxFor(text: string, media: string | null = null): ParseContext {
+    return {
+      channelId: '2088626562',
+      message: { id: 1, text, date: '2026-07-13T10:00:00Z', replyToMsgId: null, groupedId: null, media, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('НОВЫЙ формат сигнала (regex не знает такой шаблон) -> route ai, а не молчаливый noise', () => {
+    const result = parseCh1(ctxFor('SOL/USDT — лонг от 76.3, стоп за 72.5, цели 80 и 83'))
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('unknown_format')
+  })
+
+  it('знакомый шаблон, но стоп в НЕЗНАКОМОМ виде -> route ai (сигнал не теряется из-за no_SL)', () => {
+    const text = '#SOL/USDT 📈 LONG\n\nДиапазон входа: 76.30-76.45$\n\nTP: 80$\n\nСтоп ставим на 72.5'
+    const result = parseCh1(ctxFor(text))
+    expect(result.route).toBe('ai') // раньше здесь был skip(no_SL) и сделка не открывалась
+    expect(result.reason).toBe('no_SL')
+  })
+
+  it('картинка без текста (скрин графика) -> route ai с needsVision', () => {
+    const result = parseCh1(ctxFor('', 'MessageMediaPhoto'))
+    expect(result.route).toBe('ai')
+    expect(result.needsVision).toBe(true)
+  })
+
+  it('пустое сообщение без картинки -> noise (звать AI на пустоту незачем)', () => {
+    expect(parseCh1(ctxFor('')).route).toBe('noise')
+  })
+
+  it('символ не торгуется на бирже -> по-прежнему skip, а не AI (модель тут бессильна)', () => {
+    const text = '#GRASS/USDT 📈 LONG\n\nДиапазон входа: 1.0-1.1$\n\nTP: 1.5$\n\nSL: 0.9$'
+    const result = parseCh1({ ...ctxFor(text), isListed: () => false })
+    expect(result.route).toBe('skip')
+    expect(result.reason).toBe('symbol_not_listed')
+  })
+})
+
+// Регресс-барьер: partial_close стал исполняемой командой, поэтому лексикон обязан различать
+// отрицание, полное закрытие и явную долю — иначе это неверные ордера на реальные деньги
+// (адверсариальная проверка на дампе БД).
+describe('ch1.adapter — доля/отрицание/полное закрытие фиксации', () => {
+  function ctx(text: string): ParseContext {
+    return {
+      channelId: '2088626562',
+      message: { id: 1, text, date: '2026-07-13T00:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, () => true),
+      isListed: () => true,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+  const ops = (text: string) => parseCh1(ctx(text)).intents.flatMap((i) => (i.kind === 'delta' ? i.ops : []))
+
+  it('отрицание «не фиксирую» не даёт partial_close (уходит в AI)', () => {
+    const r = parseCh1(ctx('#DOGE — Ничего пока не фиксирую, держите крепко!'))
+    expect(r.route).toBe('ai')
+    expect(r.intents).toHaveLength(0)
+  })
+
+  it('«фиксируюсь полностью» -> close_remainder, а не половина', () => {
+    expect(ops('#DUSK — Фиксируюсь по текущим полностью')).toEqual([{ op: 'close_remainder' }])
+  })
+
+  it('явная доля «25% фиксирую» -> fraction=0.25', () => {
+    expect(ops('#CLO — Пробит хай, 25% фиксирую')).toContainEqual({ op: 'partial_close', fraction: 0.25 })
+  })
+
+  it('процент прибыли не путается с долей: «+30% фиксирую 50%» -> 0.5', () => {
+    expect(ops('#BTC Первый тейк +30% фиксирую 50% и стоп в б/у')).toContainEqual({ op: 'partial_close', fraction: 0.5 })
   })
 })

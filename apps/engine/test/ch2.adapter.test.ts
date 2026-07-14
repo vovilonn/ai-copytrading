@@ -101,16 +101,22 @@ describe('ch2.adapter — агрегат покрытия на 100 реальн�
     expect(det).toBeLessThanOrEqual(38)
   })
 
-  it('AI (route ai) — факт 34 (research: 31, ±3)', () => {
+  // Раньше здесь стояло 28..34: всё, что не попало в узкий AI_LEXICON_RE, молча уходило в noise —
+  // и модель не вызывалась даже на «SOL long» и «вход с текущих BTC long, риск 2%». Теперь непонятое
+  // с монетой ИЛИ торговым маркером уходит в AI (фолбэк, как в CH1). Замер на этой же фикстуре: 46.
+  // Верхняя граница сторожит ЦЕНУ: если доля AI поползёт вверх — значит гейт стал пропускать болтовню.
+  it('AI (route ai) — фолбэк непонятого: 46 из 100 (было 34, всё остальное молча гасилось в noise)', () => {
     const ai = results.filter((r) => r.result.route === 'ai').length
-    expect(ai).toBeGreaterThanOrEqual(28)
-    expect(ai).toBeLessThanOrEqual(34)
+    expect(ai).toBeGreaterThanOrEqual(42)
+    expect(ai).toBeLessThanOrEqual(50)
   })
 
-  it('NOISE — факт 30 (research: 34, ±3 плюс 1 документированное отклонение)', () => {
+  // Бесплатно отсекается только то, где разбирать нечего: пустые медиа-посты, обзоры/анонсы,
+  // советы («можно…», «лучше…») и болтовня без монеты и без торговых слов.
+  it('NOISE — 18 из 100: бесплатно гасится болтовня, но не сигналы', () => {
     const noise = results.filter((r) => r.result.route === 'noise').length
-    expect(noise).toBeGreaterThanOrEqual(30)
-    expect(noise).toBeLessThanOrEqual(37)
+    expect(noise).toBeGreaterThanOrEqual(15)
+    expect(noise).toBeLessThanOrEqual(22)
   })
 
   it('route — ровно один из четырёх для каждого сообщения', () => {
@@ -199,10 +205,15 @@ describe('ch2.adapter — точечные проверки (task-3-brief.md)', 
     expect(result.route).toBe('ai')
   })
 
-  it('аналитический абзац без order-фразы → route noise (221349, 221351, 221390 — обзорные посты темы)', () => {
+  // Раньше эти посты гасились в noise ШАБЛОНОМ. Теперь они упоминают монету («на битке…»), поэтому
+  // уходят в AI — и решение «сигнал это или рассуждение» принимает модель, а не regex. Это осознанная
+  // плата: лучше отдать модели лишний абзац аналитики (она вернёт noise), чем молча потерять сигнал,
+  // написанный в непривычной формулировке.
+  it('аналитический абзац с упоминанием монеты → отдаётся AI, а не гасится шаблоном (221349, 221351, 221390)', () => {
     for (const id of [221349, 221351, 221390]) {
       const { message, result } = byId(id)
-      expect(result.route, `msg ${id}: ${message.text.slice(0, 40)}`).toBe('noise')
+      expect(result.route, `msg ${id}: ${message.text.slice(0, 40)}`).toBe('ai')
+      expect(result.intents, `msg ${id} — шаблон не должен выдумывать intent`).toEqual([])
     }
   })
 
@@ -277,5 +288,78 @@ describe('ch2.adapter — точечные проверки (task-3-brief.md)', 
     const { result } = byId(221393)
     expect(result.route).toBe('ai')
     expect(result.intents).toHaveLength(0)
+  })
+})
+
+// Регрессия на живых сообщениях заказчика в тестовом канале. До фолбэка ВСЕ они получали
+// status='noise', method=NULL — модель не вызывалась ни разу, и канал, созданный ровно под AI-разбор
+// свободного текста, не торговал вообще ничем.
+describe('ch2.adapter — свободный текст доходит до AI (регрессия тестового канала)', () => {
+  function ctxFor(text: string): ParseContext {
+    return {
+      channelId: '4322601605',
+      message: { id: 1, text, date: '2026-07-13T15:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('«SOL long» -> AI (раньше молчаливый noise)', () => {
+    expect(parseCh2(ctxFor('SOL long')).route).toBe('ai')
+  })
+
+  it('«вход с текущий BTC long, риск 2%» -> AI', () => {
+    expect(parseCh2(ctxFor('вход с текущий BTC long, риск 2%')).route).toBe('ai')
+  })
+
+  // Стемы обязаны ловить словоформы: «зайд» → «зайду». С границей справа этот сигнал уходил в noise.
+  it('«зайду от 76.3» (лимитный вход без монеты в тексте) -> AI', () => {
+    expect(parseCh2(ctxFor('зайду от 76.3')).route).toBe('ai')
+  })
+
+  it('«долил соль» -> AI', () => {
+    expect(parseCh2(ctxFor('долил соль')).route).toBe('ai')
+  })
+
+  it('болтовня без монеты и торговых слов -> noise (в модель не тащим)', () => {
+    expect(parseCh2(ctxFor('привет, как дела')).route).toBe('noise')
+    expect(parseCh2(ctxFor('да, согласен полностью')).route).toBe('noise')
+  })
+
+  it('обзор/анонс -> noise бесплатно', () => {
+    expect(parseCh2(ctxFor('Итоги недели: обзор рынка')).route).toBe('noise')
+  })
+})
+
+// Цена стопа — число рядом со словом «стоп», хоть слева, хоть справа. «Первое число строки» ставило
+// $50 на BTC из «Фикс 50% BTC, стоп 70000»; «только хвост после маркера» терял «74600 стоп по битку».
+describe('ch2.adapter — цена стопа берётся у маркера, а не соседнее число', () => {
+  function ctx(text: string): ParseContext {
+    return {
+      channelId: '4322601605',
+      message: { id: 1, text, date: '2026-07-13T00:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+  const sl = (text: string) =>
+    parseCh2(ctx(text)).intents.flatMap((i) => (i.kind === 'delta' ? i.ops : [])).find((o) => o.op === 'sl_set')
+
+  it('цена ПЕРЕД маркером: «74600 стоп по битку» -> 74600', () => {
+    expect(sl('74600 стоп по битку')).toEqual({ op: 'sl_set', price: 74600 })
+  })
+
+  it('процент не берётся за цену: «Фикс 50% BTC, стоп 70000» -> 70000, а не 50', () => {
+    expect(sl('Фикс 50% BTC, стоп 70000')).toEqual({ op: 'sl_set', price: 70000 })
+  })
+
+  it('среди целей выбирается число у маркера: «цели 75000 76000 стоп 74600 по битку» -> 74600', () => {
+    expect(sl('цели 75000 76000 стоп 74600 по битку')).toEqual({ op: 'sl_set', price: 74600 })
   })
 })
