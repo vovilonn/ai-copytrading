@@ -408,3 +408,26 @@ gunzip -c /backup/db-YYYY-MM-DD.sql.gz | docker compose exec -T postgres psql -U
 - [ ] у каналов выставлены `trade_size`, `max_leverage`, `max_symbol_notional`;
 - [ ] бэкап базы и `.env` снят и проверен восстановлением;
 - [ ] каналы включаются по одному, первые сделки сверены с интерфейсом Bybit.
+
+---
+
+## 13. Вендоренный `ai-proxy` и push protection GitHub
+
+`ai-proxy/` — вложенная копия открытого проекта [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+(`go.mod`: `github.com/router-for-me/CLIProxyAPI/v7`), из которой compose собирает контейнер прокси.
+Это чужой код, и в нём лежат ПУБЛИЧНЫЕ OAuth-константы провайдеров — так устроены desktop-клиенты
+любого OAuth-приложения.
+
+Две из них (Google Client ID + Client Secret провайдера Antigravity) распознаются сканером GitHub
+как секреты и блокируют `git push`. Значения по умолчанию **вычищены из репозитория и из истории**
+(`internal/auth/antigravity/constants.go` — пустые строки). На нас это не влияет: мы используем
+провайдер Claude, а не Antigravity. Если он когда-нибудь понадобится, тот же файл читает значения
+из окружения:
+
+```bash
+CLIPROXY_ANTIGRAVITY_OAUTH_CLIENT_ID=...
+CLIPROXY_ANTIGRAVITY_OAUTH_CLIENT_SECRET=...
+```
+
+⚠️ При обновлении вендоренной копии из апстрима константы вернутся и снова заблокируют пуш — их
+нужно занулять заново.
