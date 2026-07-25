@@ -1,16 +1,16 @@
 import { createReadStream } from 'node:fs'
 import { access } from 'node:fs/promises'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { Controller, Get, Inject, NotFoundException, Param, Res } from '@nestjs/common'
 import type { Response } from 'express'
+import { resolveMediaRoot } from '../config/config.schema.js'
 import { ChannelsService } from './channels.service.js'
 
 // message_media.storage_path хранится относительным ("var/media/<key>/<id>_<i>.jpg", см.
-// apps/tg-ingest/src/ingest.service.ts, MEDIA_ROOT_REL) — относительно корня репозитория,
-// где запускается воркер. apps/api/src/channels лежит на 4 уровня глубже корня.
-const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url))
-const MEDIA_ROOT = path.join(REPO_ROOT, 'var', 'media')
+// apps/tg-ingest/src/ingest.service.ts, MEDIA_ROOT_REL), а корень на диске берём из MEDIA_ROOT —
+// «N уровней вверх от import.meta.url» в прод-образе указывает мимо /app (pnpm deploy сплющивает
+// apps/api/src → src), и картинки в UI переставали отдаваться. См. config.schema.ts.
+const MEDIA_ROOT = resolveMediaRoot(process.env.MEDIA_ROOT)
 
 @Controller('media')
 export class MediaController {

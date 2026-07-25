@@ -260,7 +260,7 @@ export async function closeTrade(tx: Kysely<DB>, params: CloseTradeParams): Prom
  *  что и сам переход в 'closed' (outbox-паттерн задачи 9: событие не может потеряться при
  *  крэше между UPDATE trades и коммитом). cancelled сознательно исключён из WHERE — та же
  *  формула, что и apps/api/src/channels/stats.service.ts (не дублируем округление отдельно). */
-async function emitChannelStats(tx: Kysely<DB>, channelId: number): Promise<void> {
+export async function emitChannelStats(tx: Kysely<DB>, channelId: number): Promise<void> {
   const { rows } = await sql<{ decided: string; wins: string }>`
     SELECT count(*) FILTER (WHERE is_win IS NOT NULL)::text AS decided,
            count(*) FILTER (WHERE is_win)::text AS wins

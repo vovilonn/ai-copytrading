@@ -32,7 +32,10 @@ import { sql, type Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 import type { Network, OrderStatus, Side } from 'shared/domain.js'
 import { closeTrade, releaseSymbol } from '../state/trades.js'
+import { recalcTradeMoney } from '../state/recalc-trade.js'
 import { emitPositionUpsert } from '../pipeline.js'
+import { attributeExecution } from './sync/attribute.js'
+import { isEngineOrderLinkId } from '../execution/order-link-id.js'
 import type { BybitRestClient } from './rest-client.js'
 
 // 'demo' — Bybit DEMO TRADING (p3-task6-demo): приватный WS demo проверен вживую (auth success)
@@ -292,6 +295,41 @@ interface SymbolAttribution {
 }
 
 /**
+ * Гонка «пуш раньше коммита». Market-ордер уходит на биржу ИЗНУТРИ ещё не закоммиченной транзакции
+ * pipeline (транзакция → acquireSymbol → placeEntry/createOrder → TP-лесенка → UPDATE trades →
+ * COMMIT). Биржа исполняет его за миллисекунды и шлёт пуш, а этот обработчик читает БД на ДРУГОМ
+ * соединении пула в READ COMMITTED — незакоммиченных symbol_ownership/orders он не видит. Раньше
+ * такой пуш выбрасывался НАВСЕГДА (warn + return): позиция не попадала в `positions`, а значит
+ * становилась не только невидимой в UI, но и НЕУПРАВЛЯЕМОЙ — pipeline резолвит сделку для дельт
+ * (close/sl_breakeven/tp_set) исключительно через `positions.size <> 0`.
+ *
+ * Ждём коммит ограниченное время (~6.2с суммарно, с запасом на типичную транзакцию ~1с), после чего
+ * возвращаемся к прежнему поведению (warn + drop): пуш действительно чужой (ручная торговля с того
+ * же аккаунта), и дропнуть его — корректно. Потолок попыток обязателен, иначе чужой символ подвесил
+ * бы обработчик навсегда. Соседние фреймы не блокируются: handleMessage вызывается на каждый фрейм
+ * без await, а порядок восстанавливают seq-водяной знак (positions) и гейт терминального статуса.
+ */
+const ATTRIBUTION_RETRY_DELAYS_MS = [200, 400, 800, 1600, 3200] as const
+
+/** Окно «сделка закрылась только что» для атрибуции хвостового пуша — с запасом на задержку
+ *  биржи, но без риска приписать пуш давно завершённой сделке. */
+const RECENT_CLOSE_WINDOW_MS = 5 * 60_000
+
+/** Терминальные статусы ордера: назад не понижаются (см. applyOrderPush). */
+const TERMINAL_ORDER_STATUSES: readonly OrderStatus[] = ['filled', 'cancelled', 'rejected']
+
+async function resolveWithRetry<T>(lookup: () => Promise<T | undefined | null>): Promise<T | null> {
+  const first = await lookup()
+  if (first) return first
+  for (const delay of ATTRIBUTION_RETRY_DELAYS_MS) {
+    await new Promise((resolve) => setTimeout(resolve, delay))
+    const retry = await lookup()
+    if (retry) return retry
+  }
+  return null
+}
+
+/**
  * "symbol → activeTradeId восстанавливаем из своей БД" (research §14). Порядок:
  *  1) активное владение symbol_ownership (released_at IS NULL) — обычный путь, сделка ещё
  *     не закрыта в нашем журнале на момент прихода пуша;
@@ -317,6 +355,24 @@ async function attributeSymbol(db: Kysely<DB>, symbol: string): Promise<SymbolAt
     .executeTakeFirst()
   if (lastKnown) return { channelId: lastKnown.channel_id, tradeId: lastKnown.trade_id }
 
+  //  3) фолбэк на НЕДАВНО закрытую сделку. С тех пор как пайплайн зануляет зеркало сам, сразу
+  //     после своего же полного закрытия (pipeline.ts::finalizeClosedPositions), фолбэк (2) на
+  //     `size <> 0` до финального пуша уже не доживает — и КАЖДОЕ штатное закрытие писало в лог
+  //     предупреждение «владение символом не найдено». Предупреждение, которое горит в НОРМАЛЬНОМ
+  //     потоке, перестают читать — а оно должно означать реальную аномалию (чужая ручная торговля
+  //     тем же аккаунтом). Пуш здесь применяется идемпотентно (тот же ноль), побочные эффекты
+  //     закрытия не срабатывают: `hadOpenPosition` уже false.
+  const recentlyClosed = await db
+    .selectFrom('positions')
+    .innerJoin('trades', 'trades.id', 'positions.trade_id')
+    .select(['positions.channel_id as channel_id', 'positions.trade_id as trade_id'])
+    .where('positions.symbol', '=', symbol)
+    .where('trades.closed_at', 'is not', null)
+    .where('trades.closed_at', '>', new Date(Date.now() - RECENT_CLOSE_WINDOW_MS))
+    .orderBy('trades.closed_at', 'desc')
+    .executeTakeFirst()
+  if (recentlyClosed) return { channelId: recentlyClosed.channel_id, tradeId: recentlyClosed.trade_id }
+
   return null
 }
 
@@ -333,7 +389,8 @@ export async function applyPositionPush(
   push: PositionPush,
   rest: BybitPrivateWsRestClient,
 ): Promise<boolean> {
-  const attribution = await attributeSymbol(db, push.symbol)
+  // Ретрай — на случай, что транзакция pipeline ещё не закоммитила symbol_ownership (см. resolveWithRetry).
+  const attribution = await resolveWithRetry(() => attributeSymbol(db, push.symbol))
   if (!attribution) {
     console.warn(`[private-ws] пуш position по ${push.symbol}: владение символом не найдено в БД — пропускаю`)
     return false
@@ -369,7 +426,28 @@ export async function applyPositionPush(
       if (current && current.bybit_seq !== null && push.seq < current.bybit_seq) return
     }
 
-    await sql`
+    // ⚠️ ПЛОСКИЙ ПУШ НЕ ОЗНАЧАЕТ ЗАКРЫТИЕ, ЕСЛИ МЫ НИКОГДА НЕ ВИДЕЛИ ОТКРЫТОЙ ПОЗИЦИИ.
+    //
+    // Bybit при открытии присылает промежуточный пуш позиции с size=0 (слот заведён, филла ещё нет).
+    // Раньше он безвредно отбрасывался — владение символом ещё не было закоммичено. Но с ретраем
+    // атрибуции (resolveWithRetry) такой пуш ДОЖИДАЕТСЯ коммита и применяется — и код трактовал его
+    // как «позиция закрылась»: закрывал сделку, снимал владение символом и делал cancelAll, СНИМАЯ
+    // ЗАЩИТНЫЙ СТОП с только что открытой позиции. Живой случай: BTC остался висеть на 20x без стопа.
+    //
+    // Закрываем сделку по flat-пушу ТОЛЬКО если в зеркале уже была НЕНУЛЕВАЯ позиция, то есть мы
+    // действительно видели её открытой. Если нет — это стаб/переупорядоченный пуш: обновим зеркало,
+    // но сделку не тронем. Пропустить реальное закрытие не страшно — его догонит реконсиляция
+    // (шаг Б: «в журнале open, на бирже позиции нет → закрыть»), а вот закрыть живую позицию и
+    // снять с неё стоп — потеря денег.
+    const mirrored = await trx
+      .selectFrom('positions')
+      .select('size')
+      .where('channel_id', '=', channelId)
+      .where('symbol', '=', push.symbol)
+      .executeTakeFirst()
+    const hadOpenPosition = mirrored !== undefined && !new Decimal(mirrored.size).isZero()
+
+    const applied = await sql<{ channel_id: number }>`
       INSERT INTO positions (
         channel_id, symbol, trade_id, side, size, avg_price, mark_price, liq_price,
         leverage, unrealised_pnl, cur_realised_pnl, take_profit, stop_loss, position_status,
@@ -398,12 +476,29 @@ export async function applyPositionPush(
         position_status = EXCLUDED.position_status,
         bybit_seq = EXCLUDED.bybit_seq,
         updated_at = now()
+      -- Водяной знак ВНУТРИ апдейта, а не только в SELECT выше (найдено живым e2e: зеркало
+      -- оставалось с размером до закрытия, хотя на бирже позиции уже не было). Фреймы WS
+      -- обрабатываются КОНКУРЕНТНО — handleMessage вызывается на каждый фрейм без await, — и две
+      -- транзакции успевают прочитать один и тот же старый seq до того, как любая из них
+      -- закоммитится. Та, что коммитится второй, затирала более свежее состояние (классический
+      -- lost update): позиция «воскресала» уже закрытой. Проверка в SELECT остаётся быстрым
+      -- путём (она же гасит побочные эффекты closeTrade/cancelAll), а этот WHERE делает решение
+      -- атомарным — ровно тот же приём, что уже стоит в REST-пути (reconcile.ts::upsertPosition).
+      WHERE positions.bybit_seq IS NULL
+         OR EXCLUDED.bybit_seq IS NULL
+         OR EXCLUDED.bybit_seq >= positions.bybit_seq
+      RETURNING channel_id
     `.execute(trx)
+
+    // Гейт выше мог ПОДАВИТЬ апдейт (пришёл устаревший фрейм, пока мы ждали блокировку строки).
+    // Тогда и всё остальное делать нельзя: `hadOpenPosition` прочитан ДО апдейта, и на его
+    // основании мы бы закрыли сделку и сняли защиту с ЖИВОЙ позиции по данным из прошлого.
+    if (applied.rows.length === 0) return
 
     await emitPositionUpsert(trx, channelId, push.symbol)
     notifyNeeded = true
 
-    if (isFlat && tradeId) {
+    if (isFlat && tradeId && hadOpenPosition) {
       // Полное закрытие (§11: size→0): закрыть #TR-x, освободить владение символом — обе явно,
       // как того требует бриф задачи (closeTrade сам по себе уже освобождает symbol_ownership
       // по tradeId, releaseSymbol здесь — идемпотентный no-op в норме, но гарантирует
@@ -475,21 +570,38 @@ export async function recalcTradeRealizedPnl(trx: Kysely<DB>, tradeId: string): 
 export async function applyExecutionPush(db: Kysely<DB>, push: ExecutionPush): Promise<boolean> {
   let inserted = false
 
+  // Гонка «филл раньше коммита» (та же, что у applyOrderPush/applyPositionPush): ордер уходит на
+  // биржу ВНУТРИ ещё не закоммиченной транзакции пайплайна, а исполнение прилетает за
+  // миллисекунды. Ждём появления СВОЕЙ строки orders ДО открытия транзакции — иначе исполнение
+  // ложится в БД сиротой (trade_id=NULL, PnL сделки не пересчитан) и ждёт реконсиляции 10 минут.
+  // Ждём только для СВОЕГО ключа: чужой (ручной ордер оператора, пустой у trading-stop) ждать
+  // бессмысленно — его строки не будет никогда.
+  if (isEngineOrderLinkId(push.orderLinkId)) {
+    await resolveWithRetry(() =>
+      db.selectFrom('orders').select('id').where('order_link_id', '=', push.orderLinkId).executeTakeFirst(),
+    )
+  }
+
   await db.transaction().execute(async (trx) => {
-    const order = push.orderLinkId
-      ? await trx
-          .selectFrom('orders')
-          .select(['id', 'trade_id', 'leg_id'])
-          .where('order_link_id', '=', push.orderLinkId)
-          .executeTakeFirst()
-      : undefined
+    const execTs = push.execTime ? new Date(Number(push.execTime)) : new Date()
+
+    // Атрибуция единой функцией (та же, что и в REST-догоне). Раньше здесь был голый лукап по
+    // order_link_id, из-за чего РУЧНЫЕ действия оператора на бирже (закрытие/частичная фиксация)
+    // и филлы сработавшего trading-stop (у него orderLinkId ПУСТОЙ) оставались с trade_id=NULL —
+    // и PnL сделки не пересчитывался вовсе. Живой след этого бага: TR-1204 с realized_pnl=0 при
+    // реальном убытке. Ретрай атрибуции (гонка «пуш раньше коммита») делает resolveWithRetry ниже.
+    const attribution = await attributeExecution(trx, {
+      orderLinkId: push.orderLinkId,
+      symbol: push.symbol,
+      execTs,
+    })
 
     const row = await trx
       .insertInto('executions')
       .values({
-        order_id: order?.id ?? null,
-        trade_id: order?.trade_id ?? null,
-        leg_id: order?.leg_id ?? null,
+        order_id: attribution.orderId,
+        trade_id: attribution.tradeId,
+        leg_id: attribution.legId,
         bybit_exec_id: push.execId,
         order_link_id: push.orderLinkId,
         symbol: push.symbol,
@@ -499,10 +611,12 @@ export async function applyExecutionPush(db: Kysely<DB>, push: ExecutionPush): P
         closed_size: push.closedSize,
         leaves_qty: push.leavesQty,
         exec_fee: push.execFee ?? '0',
+        // WS отдаёт ТОЧНЫЙ пофилльный PnL (брутто) — в отличие от REST, где его нет вовсе.
         exec_pnl: push.execPnl ?? '0',
         exec_type: push.execType,
+        source: 'ws',
         is_maker: push.isMaker,
-        exec_ts: push.execTime ? new Date(Number(push.execTime)) : new Date(),
+        exec_ts: execTs,
       })
       .onConflict((oc) => oc.column('bybit_exec_id').doNothing())
       .returning('id')
@@ -511,8 +625,19 @@ export async function applyExecutionPush(db: Kysely<DB>, push: ExecutionPush): P
     if (!row) return // дубль bybit_exec_id — уже обработан, не пересчитываем повторно
     inserted = true
 
-    if (order?.trade_id) {
-      await recalcTradeRealizedPnl(trx, order.trade_id)
+    if (attribution.tradeId) {
+      // Ручное вмешательство: канал больше не двигает SL/TP этой сделки (решение оператора главнее).
+      if (attribution.kind === 'manual') {
+        await trx
+          .updateTable('trades')
+          .set({ manual_override: true, needs_review: true, updated_at: new Date() })
+          .where('id', '=', attribution.tradeId)
+          .execute()
+        console.warn(
+          `[private-ws] исполнение мимо наших ордеров по ${push.symbol} — ручное действие оператора, сделка помечена manual_override`,
+        )
+      }
+      await recalcTradeMoney(trx, attribution.tradeId)
     }
   })
 
@@ -529,8 +654,19 @@ export async function applyOrderPush(db: Kysely<DB>, push: OrderPush): Promise<b
   const status = mapOrderStatus(push.orderStatus)
   let notifyNeeded = false
 
+  // Та же гонка, что и в applyPositionPush: строку `orders` коммитит транзакция pipeline ПОЗЖЕ, чем
+  // биржа успевает прислать пуш филла. Раньше это был тихий no-op БЕЗ какого-либо репара (reconcile
+  // не трогает orders.status вовсе) — статус реально исполненного входа навсегда застревал в
+  // 'submitted'. Это не косметика: cancel_pending (pipeline) выбирает ордера по status IN
+  // ('created','pending_submit','submitted') и отправил бы отмену уже исполненного ордера → Bybit
+  // 110001 → откат транзакции дельты.
+  const exists = await resolveWithRetry(() =>
+    db.selectFrom('orders').select('id').where('order_link_id', '=', push.orderLinkId).executeTakeFirst(),
+  )
+  if (!exists) return false // ордер не наш (ручной/чужой) — корректный drop
+
   await db.transaction().execute(async (trx) => {
-    const updated = await trx
+    let query = trx
       .updateTable('orders')
       .set({
         status,
@@ -540,10 +676,17 @@ export async function applyOrderPush(db: Kysely<DB>, push: OrderPush): Promise<b
         ...(status === 'cancelled' ? { cancelled_at: new Date() } : {}),
       })
       .where('order_link_id', '=', push.orderLinkId)
-      .returning(['id', 'channel_id', 'symbol', 'trade_id'])
-      .executeTakeFirst()
 
-    if (!updated) return // ордер этого движка не найден — чужой/гонка записи, не ошибка
+    // Ретрай выше означает, что пуши по одному ордеру могут примениться не в порядке прихода (у
+    // order.linear нет seq-водяного знака, в отличие от position). Задержавшийся 'New' не должен
+    // откатывать уже записанный 'Filled'.
+    if (!TERMINAL_ORDER_STATUSES.includes(status)) {
+      query = query.where('status', 'not in', TERMINAL_ORDER_STATUSES)
+    }
+
+    const updated = await query.returning(['id', 'channel_id', 'symbol', 'trade_id']).executeTakeFirst()
+
+    if (!updated) return // статус уже терминальный (переупорядоченный пуш) — не понижаем
 
     await trx
       .insertInto('domain_events')
@@ -585,6 +728,13 @@ export interface BybitPrivateWsOptions {
   db: Kysely<DB>
   rest: BybitPrivateWsRestClient
   log?: BybitPrivateWsLogger
+  /**
+   * Время БИРЖИ (rest.serverNowMs) — им подписывается `expires` в auth. Локальные часы для этого
+   * негодны ровно по той же причине, что и в REST: уехавшая на секунды VM даёт биржевую метку из
+   * прошлого/будущего, auth не проходит, и приватный поток молча замолкает — позиции и филлы
+   * перестают доезжать в зеркало. Не задано — падаем на Date.now (тесты/dry-run).
+   */
+  nowMs?: () => number
 }
 
 /**
@@ -663,7 +813,7 @@ export class BybitPrivateWs {
 
   /** `op:auth` (§11): `args=[apiKey, expires, signature]`, `expires=now+10000ms`. */
   private authenticate(): void {
-    const expires = Date.now() + AUTH_EXPIRES_MS
+    const expires = (this.opts.nowMs ?? Date.now)() + AUTH_EXPIRES_MS
     const signature = signWsAuth(this.opts.apiSecret, expires)
     this.sendSafe({ op: 'auth', args: [this.opts.apiKey, expires, signature] })
   }

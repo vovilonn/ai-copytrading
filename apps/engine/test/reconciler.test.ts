@@ -184,3 +184,4 @@ describe('reconcile — деградация (AI недоступен): ai=null 
     expect(decision.decided).toEqual([])
   })
 })
+

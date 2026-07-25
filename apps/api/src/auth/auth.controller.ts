@@ -29,11 +29,11 @@ export class AuthController {
   @HttpCode(204)
   async login(@Body() body: LoginBody, @Res({ passthrough: true }) res: Response): Promise<void> {
     if (typeof body?.username !== 'string' || typeof body?.password !== 'string') {
-      throw new UnauthorizedException('Неверный логин или пароль')
+      throw new UnauthorizedException('Invalid username or password')
     }
 
     const user = await this.auth.validateCredentials(body.username, body.password)
-    if (!user) throw new UnauthorizedException('Неверный логин или пароль')
+    if (!user) throw new UnauthorizedException('Invalid username or password')
 
     const token = await this.auth.signToken(user)
     res.cookie(SESSION_COOKIE, token, sessionCookieOptions())

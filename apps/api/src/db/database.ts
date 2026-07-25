@@ -171,6 +171,11 @@ export interface DB {
     opened_at: Date | null
     closed_at: Date | null
     updated_at: Generated<Date>
+    // Реконсиляция с Bybit (007_reconcile_sync): needs_review — сделка разошлась с биржей и требует
+    // разбора оператором; manual_override — оператор вмешался руками на бирже, после чего канал
+    // больше не двигает SL/TP этой сделки. Обе с DEFAULT false ⇒ Generated<> (см. messages выше).
+    needs_review: Generated<boolean>
+    manual_override: Generated<boolean>
   }
   trade_legs: {
     id: Generated<string>
@@ -267,10 +272,23 @@ export interface DB {
     leaves_qty: Generated<string>
     exec_fee: Generated<string>
     exec_pnl: Generated<string>
+    // exec_type — 'Trade' | 'Funding' | 'AdlTrade' | 'BustTrade' | 'Settle' (существует с 001_initial).
+    // 'Funding' — не сделка: идёт только в комиссии, не влияет на размер/среднюю цену (см. 007).
     exec_type: string | null
     is_maker: boolean | null
     exec_ts: Date
     created_at: Generated<Date>
+    // Реконсиляция с Bybit (007_reconcile_sync):
+    // bybit_order_id — единственный ключ для джойна с /v5/position/closed-pnl (orderLinkId он не отдаёт);
+    // source — 'ws' | 'rest': патч PnL из closed-pnl имеет право трогать ТОЛЬКО 'rest'-строки
+    //   (у 'ws' есть точный execPnl на каждый филл, /v5/execution/list его не возвращает вовсе).
+    //   DEFAULT 'ws' в схеме ⇒ Generated<>;
+    // create_type — 'CreateByUser' | 'CreateByClosing' (закрытие из UI Bybit) | 'CreateByStopLoss' | ...;
+    // bybit_seq — BIGINT, читается number'ом (см. setTypeParser INT8 выше), как positions.bybit_seq.
+    bybit_order_id: string | null
+    source: Generated<'ws' | 'rest'>
+    create_type: string | null
+    bybit_seq: number | null
   }
   // Зеркало позиций (реконсиляция + realtime + Active Positions, PK (channel_id, symbol)).
   // mark_price/liq_price/unrealised_pnl — реальный live-фид подключит задача 9; в Ф1
@@ -323,9 +341,19 @@ export interface DB {
     currency: Generated<string>
     created_at: Generated<Date>
   }
-  // остальные таблицы схемы (processed_messages, ai_calls, ai_cache, audit_log, app_state)
-  // объявляются здесь же по мере использования в Ф1–Ф4. Пока созданы миграцией, но не
-  // типизированы — тесты, которым нужен сырой SQL, используют sql`...`.
+  // Глобальное состояние (создана ещё 001_initial.ts, типизируется здесь впервые): key/value-хранилище
+  // под execution mode при live-переключении и КУРСОРЫ РЕКОНСИЛЯЦИИ (007_reconcile_sync) — до какого
+  // времени/страницы догнана история executions и closed-pnl после даунтайма.
+  // value — JSONB, поэтому unknown (как domain_events.payload/actions.params выше): форму конкретного
+  // курсора валидирует владеющий им модуль, а не типы БД.
+  app_state: {
+    key: string
+    value: unknown
+    updated_at: Generated<Date>
+  }
+  // остальные таблицы схемы (processed_messages, ai_calls, ai_cache, audit_log) объявляются здесь же
+  // по мере использования в Ф1–Ф4. Пока созданы миграцией, но не типизированы — тесты, которым нужен
+  // сырой SQL, используют sql`...`.
 }
 
 export function createDb(url: string): Kysely<DB> {

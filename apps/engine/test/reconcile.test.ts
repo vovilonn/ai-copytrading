@@ -8,7 +8,7 @@ import type { Side, TradeStatus } from 'shared/domain.js'
 import { acquireSymbol, addLeg, openTrade } from '../src/state/trades.js'
 import { DryRunAdapter } from '../src/execution/dry-run.adapter.js'
 import { BybitAdapter, type BybitAdapterRestClient } from '../src/execution/bybit.adapter.js'
-import { BybitRestClient, type Order, type Position } from '../src/bybit/rest-client.js'
+import { BybitRestClient, type ClosedPnl, type Execution, type Order, type Position } from '../src/bybit/rest-client.js'
 import { reconcileOnStart, type ReconcileRestClient } from '../src/bybit/reconcile.js'
 
 // reconcileOnStart (Ф3, задача 4; research bybit-execution.md §14): позиция на бирже без TR в
@@ -114,6 +114,7 @@ function createMockBybitRest(): BybitAdapterRestClient {
       return { orderId: `ex-order-${orderSeq}`, orderLinkId: params.orderLinkId, ok: true as const, idempotent: false }
     }),
     setTradingStop: vi.fn(async () => ({ ok: true as const })),
+    cancelAll: vi.fn(async () => ({ ok: true as const })),
     cancelOrder: vi.fn(async () => ({ ok: true as const })),
   }
 }
@@ -238,6 +239,7 @@ function makeOrder(overrides: Partial<Order> & { symbol: string; orderLinkId: st
 function makeRest(
   positions: Position[],
   openOrders: Order[] = [],
+  history: { executions?: Execution[]; orders?: Order[]; closedPnl?: ClosedPnl[] } = {},
 ): { rest: ReconcileRestClient; cancelOrderCalls: Array<{ symbol: string; orderLinkId: string }> } {
   const cancelOrderCalls: Array<{ symbol: string; orderLinkId: string }> = []
   const rest: ReconcileRestClient = {
@@ -250,6 +252,11 @@ function makeRest(
       cancelOrderCalls.push(params)
       return { ok: true as const }
     }),
+    // Догон истории (исполнения/PnL/статусы ордеров). По умолчанию биржа отдаёт пустую историю —
+    // тогда этот блок ничего не меняет, и тесты снапшот-сверки проверяют ровно то же, что и раньше.
+    getExecutions: vi.fn(async () => history.executions ?? []),
+    getOrderHistory: vi.fn(async () => history.orders ?? []),
+    getClosedPnl: vi.fn(async () => history.closedPnl ?? []),
   }
   return { rest, cancelOrderCalls }
 }
@@ -266,7 +273,7 @@ describe('reconcileOnStart', () => {
     const { rest } = makeRest([makePosition({ symbol: 'UNKNOWNUSDT', side: 'Buy', size: '10' })])
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0, reattributedExecutions: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
 
     const audit = await auditLogRows()
     expect(audit).toEqual([{ action: 'unknown_position', entity_id: 'UNKNOWNUSDT' }])
@@ -291,7 +298,7 @@ describe('reconcileOnStart', () => {
     )
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 1, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
+    expect(result).toEqual({ opened: 1, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open')
@@ -326,7 +333,7 @@ describe('reconcileOnStart', () => {
     const { rest } = makeRest([]) // на бирже вообще ничего не открыто
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 1, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
+    expect(result).toEqual({ opened: 0, closed: 1, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
 
     const liveTrade = await db.selectFrom('trades').selectAll().where('id', '=', live.tradeId).executeTakeFirstOrThrow()
     expect(liveTrade.status).toBe('closed')
@@ -371,7 +378,7 @@ describe('reconcileOnStart', () => {
     ])
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open') // статус не тронут
@@ -390,7 +397,7 @@ describe('reconcileOnStart', () => {
     expect(position.trade_id).toBe(seeded.tradeId)
   })
 
-  it('createdTime-защита: позиция биржи старше локального opened_at -> НЕ синкается, флагуется', async () => {
+  it('ЧУЖАЯ позиция (не трогали задолго до нашего opened_at, наших ордеров на символе нет) -> НЕ синкается, флагуется', async () => {
     const openedAt = new Date()
     const seeded = await seedTrade({
       symbol: 'OLDUSDT',
@@ -408,13 +415,16 @@ describe('reconcileOnStart', () => {
         side: 'Buy',
         size: '99',
         avgPrice: '999',
-        // на 10 минут раньше нашего opened_at — "чужая" позиция (research §14), не наша
+        // Позицию не трогали за 10 минут до нашего входа — наш вход её не создавал: ручная/
+        // пред-существующая "чужая" позиция (research §14). Бэкдейтим ОБА поля: createdTime сам по
+        // себе ничего не доказывает (Bybit переиспользует слот символа), решает updatedTime.
         createdTime: String(openedAt.getTime() - 10 * 60_000),
+        updatedTime: String(openedAt.getTime() - 10 * 60_000),
       }),
     ])
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0, reattributedExecutions: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 1, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open') // не закрыт — позиция формально существует на символе
@@ -422,6 +432,135 @@ describe('reconcileOnStart', () => {
 
     const audit = await auditLogRows()
     expect(audit.map((r) => r.action)).toEqual(['ambiguous_position'])
+  })
+
+  // Регрессия «позиция не видна в UI» (13.07.2026): Bybit НЕ сбрасывает position.createdTime при
+  // закрытии/повторном открытии — это водяной знак СЛОТА символа, а не текущей позиции. Старый гейт
+  // сравнивал его с opened_at, поэтому КАЖДЫЙ повторный вход по уже торговавшемуся символу уходил в
+  // ambiguous и не попадал в `positions` → позиция невидима в админке И неуправляема из канала
+  // (pipeline резолвит сделку для дельт через positions.size <> 0).
+  it('повторный вход по уже торговавшемуся символу (createdTime — старый слот Bybit, updatedTime свежий) -> позиция НАША, синкается', async () => {
+    const openedAt = new Date()
+    const seeded = await seedTrade({
+      symbol: 'REPEATUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      avgEntry: '50',
+      size: '1',
+      openedAt,
+    })
+
+    const { rest } = makeRest([
+      makePosition({
+        symbol: 'REPEATUSDT',
+        side: 'Buy',
+        size: '0.1',
+        avgPrice: '76.41',
+        // Слот символа заведён двое суток назад (первая в истории сделка по нему)...
+        createdTime: String(openedAt.getTime() - 2 * 24 * 3600_000),
+        // ...а филл НАШЕГО входа случился за 245 мс до коммита нашей строки (биржа исполняет ордер
+        // ещё внутри транзакции pipeline).
+        updatedTime: String(openedAt.getTime() - 245),
+      }),
+    ])
+
+    // openOrders пуст намеренно: проверяем именно таймстемп-путь, а не подтверждение по orderLinkId.
+    const result = await reconcileOnStart(db, rest)
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
+
+    const position = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('symbol', '=', 'REPEATUSDT')
+      .executeTakeFirstOrThrow()
+    expect(new Decimal(position.size).toString()).toBe('0.1')
+    expect(position.trade_id).toBe(seeded.tradeId)
+  })
+
+  it('orderLinkId сильнее таймстемпа: единственный кандидат со СТАРЫМ updatedTime, но на символе висит наш ордер этой сделки -> синкается', async () => {
+    const openedAt = new Date()
+    const seeded = await seedTrade({
+      symbol: 'LINKEDUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      avgEntry: '50',
+      size: '1',
+      openedAt,
+    })
+
+    const { rest } = makeRest(
+      [
+        makePosition({
+          symbol: 'LINKEDUSDT',
+          side: 'Buy',
+          size: '2',
+          avgPrice: '60',
+          // Таймстемп-гейт сказал бы «чужая»...
+          createdTime: String(openedAt.getTime() - 10 * 60_000),
+          updatedTime: String(openedAt.getTime() - 10 * 60_000),
+        }),
+      ],
+      // ...но на символе висит НАШ ордер именно этой сделки — детерминированное доказательство владения.
+      [makeOrder({ symbol: 'LINKEDUSDT', orderLinkId: seeded.orderLinkId })],
+    )
+
+    const result = await reconcileOnStart(db, rest)
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
+
+    const position = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('symbol', '=', 'LINKEDUSDT')
+      .executeTakeFirstOrThrow()
+    expect(new Decimal(position.size).toString()).toBe('2')
+    expect(position.trade_id).toBe(seeded.tradeId)
+  })
+
+  // Блокер, вскрытый на живой позиции: Bybit отдаёт ПУСТУЮ СТРОКУ вместо числа (liqPrice="" у
+  // cross-позиции без риска ликвидации). `''::numeric` в Postgres — ошибка, которая рвала ВСЮ
+  // транзакцию реконсиляции, а на старте (reconcileOnStart вызывается без catch) положила бы движок
+  // в boot-loop — ровно в тот момент, когда гейт выше начал бы до этой строки доходить.
+  it('пустые числовые поля биржи (liqPrice="", markPrice="", takeProfit="") -> upsert не падает, поля NULL', async () => {
+    const openedAt = new Date()
+    const seeded = await seedTrade({
+      symbol: 'EMPTYUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      avgEntry: '50',
+      size: '1',
+      openedAt,
+    })
+
+    const { rest } = makeRest([
+      makePosition({
+        symbol: 'EMPTYUSDT',
+        side: 'Buy',
+        size: '0.1',
+        avgPrice: '76.41',
+        liqPrice: '',
+        markPrice: '',
+        takeProfit: '',
+        stopLoss: '72.59',
+        updatedTime: String(openedAt.getTime() - 245),
+      }),
+    ])
+
+    const result = await reconcileOnStart(db, rest)
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
+
+    const position = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('symbol', '=', 'EMPTYUSDT')
+      .executeTakeFirstOrThrow()
+    expect(position.liq_price).toBeNull()
+    expect(position.take_profit).toBeNull()
+    expect(position.trade_id).toBe(seeded.tradeId)
+    // SL биржи доезжает до карточки — иначе оператор увидит «—» при реально выставленном стопе.
+    expect(new Decimal(position.stop_loss!).toString()).toBe('72.59')
   })
 })
 
@@ -443,7 +582,7 @@ describeLive('reconcileOnStart (живой testnet) — требует BYBIT_LIV
 
     const result = await reconcileOnStart(db, client)
     console.log('[live] reconcileOnStart() =', JSON.stringify(result))
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
   })
 })
 
@@ -604,7 +743,7 @@ describe('reconcileOnStart — I1 (Important финального ревью Ф3
     const { rest } = makeRest([]) // позиций на бирже нет — трогает только Шаг В (переатрибуция), не А/Б
 
     const result = await reconcileOnStart(db, rest)
-    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 1 })
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 1 })
 
     const execution = await db
       .selectFrom('executions')
@@ -621,9 +760,132 @@ describe('reconcileOnStart — I1 (Important финального ревью Ф3
     // Идемпотентность: повторный reconcile не ломает уже привязанные строки (WHERE order_id IS
     // NULL исключает их) — счётчик 0, realized_pnl не портится повторным пересчётом.
     const second = await reconcileOnStart(db, rest)
-    expect(second).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
+    expect(second).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
 
     const tradeAfterSecond = await db.selectFrom('trades').select('realized_pnl').where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
     expect(new Decimal(tradeAfterSecond.realized_pnl).toString()).toBe('12.5')
+  })
+})
+
+describe('reconcileOnStart — шаг Б2: фантомные строки зеркала', () => {
+  it('зануляет зеркало ЗАКРЫТОЙ сделки, если позиции на бирже нет (потерянный пуш WS)', async () => {
+    // Живой e2e (3 прогона из 5): пайплайн закрыл сделку сам, а финальный пуш `position size=0`
+    // до зеркала не дошёл — строка осталась с прежним размером. Шаг Б её не видел (он чинит
+    // только ОТКРЫТЫЕ сделки), и оператор навсегда видел в UI позицию, которой на бирже нет;
+    // handleDelta (ищет сделку по `positions.size <> 0`) мог начать ею «управлять».
+    const symbol = 'PHANTOM1USDT'
+    const { tradeId } = await seedTrade({ symbol, side: 'long', live: true, status: 'closed' })
+    await db
+      .insertInto('positions')
+      .values({
+        channel_id: CHANNEL_ID,
+        symbol,
+        trade_id: tradeId,
+        side: 'long',
+        size: '3',
+        avg_price: '100',
+        bybit_seq: 7,
+        // Строка старше снапшота: реконсиляция не имеет права трогать то, что WS узнал позже.
+        updated_at: new Date(Date.now() - 60_000),
+      })
+      // DryRunAdapter уже мог создать строку зеркала при входе — тест интересует её СОСТОЯНИЕ,
+      // а не факт вставки.
+      .onConflict((oc) =>
+        oc.columns(['channel_id', 'symbol']).doUpdateSet((eb) => ({
+          size: eb.ref('excluded.size'),
+          side: eb.ref('excluded.side'),
+          trade_id: eb.ref('excluded.trade_id'),
+          updated_at: eb.ref('excluded.updated_at'),
+        })),
+      )
+      .execute()
+
+    const result = await reconcileOnStart(db, makeRest([]).rest)
+
+    expect(result.phantomsZeroed).toBe(1)
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(row.size).toBe('0.0000000000')
+  })
+
+  it('НЕ трогает зеркало dry-run-сделки — у неё на бирже ничего и не было', async () => {
+    const symbol = 'PHANTOM2USDT'
+    const { tradeId } = await seedTrade({ symbol, side: 'long', live: false, status: 'closed' })
+    await db
+      .insertInto('positions')
+      .values({
+        channel_id: CHANNEL_ID,
+        symbol,
+        trade_id: tradeId,
+        side: 'long',
+        size: '5',
+        avg_price: '10',
+        updated_at: new Date(Date.now() - 60_000),
+      })
+      // DryRunAdapter уже мог создать строку зеркала при входе — тест интересует её СОСТОЯНИЕ,
+      // а не факт вставки.
+      .onConflict((oc) =>
+        oc.columns(['channel_id', 'symbol']).doUpdateSet((eb) => ({
+          size: eb.ref('excluded.size'),
+          side: eb.ref('excluded.side'),
+          trade_id: eb.ref('excluded.trade_id'),
+          updated_at: eb.ref('excluded.updated_at'),
+        })),
+      )
+      .execute()
+
+    const result = await reconcileOnStart(db, makeRest([]).rest)
+
+    expect(result.phantomsZeroed).toBe(0)
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(row.size).toBe('5.0000000000')
+  })
+
+  it('НЕ трогает зеркало, обновлённое ПОЗЖЕ снапшота биржи (WS знает свежее)', async () => {
+    const symbol = 'PHANTOM3USDT'
+    const { tradeId } = await seedTrade({ symbol, side: 'long', live: true, status: 'closed' })
+    await db
+      .insertInto('positions')
+      .values({
+        channel_id: CHANNEL_ID,
+        symbol,
+        trade_id: tradeId,
+        side: 'long',
+        size: '2',
+        avg_price: '9',
+        // Свежее момента снапшота: позиция могла открыться уже ПОСЛЕ того, как мы спросили биржу.
+        updated_at: new Date(Date.now() + 60_000),
+      })
+      // DryRunAdapter уже мог создать строку зеркала при входе — тест интересует её СОСТОЯНИЕ,
+      // а не факт вставки.
+      .onConflict((oc) =>
+        oc.columns(['channel_id', 'symbol']).doUpdateSet((eb) => ({
+          size: eb.ref('excluded.size'),
+          side: eb.ref('excluded.side'),
+          trade_id: eb.ref('excluded.trade_id'),
+          updated_at: eb.ref('excluded.updated_at'),
+        })),
+      )
+      .execute()
+
+    const result = await reconcileOnStart(db, makeRest([]).rest)
+
+    expect(result.phantomsZeroed).toBe(0)
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(row.size).toBe('2.0000000000')
   })
 })

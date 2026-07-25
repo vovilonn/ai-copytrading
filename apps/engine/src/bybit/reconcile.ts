@@ -27,13 +27,23 @@ import type { DB } from 'api/db/database.js'
 import type { Side, TradeStatus } from 'shared/domain.js'
 import { acquireSymbol, closeTrade } from '../state/trades.js'
 import { emitPositionUpsert } from '../pipeline.js'
-import { recalcTradeRealizedPnl } from './private-ws.js'
+import { recalcTradesMoney } from '../state/recalc-trade.js'
+import { attributeExecution } from './sync/attribute.js'
+import { backfillExecutions } from './sync/backfill-executions.js'
+import { backfillClosedPnl } from './sync/backfill-closed-pnl.js'
+import { syncOrderStatuses } from './sync/sync-orders.js'
+import { BOOTSTRAP_LOOKBACK_MS, OVERLAP_MS, readCursor, writeCursor } from './sync/cursor.js'
 import type { BybitRestClient, Order, Position } from './rest-client.js'
 
-/** Узкий срез BybitRestClient — тот же приём, что и BybitAdapterRestClient/BybitPrivateWsRestClient:
- *  реконсиляция читает position/list+order/realtime, и (M1 ниже) умеет отменить ПО ОДНОМУ
- *  осиротевший reduceOnly-остаток — не полный мутирующий набор BybitAdapterRestClient. */
-export type ReconcileRestClient = Pick<BybitRestClient, 'getPositions' | 'getOpenOrders' | 'cancelOrder'>
+/** Узкий срез BybitRestClient — тот же приём, что и BybitAdapterRestClient/BybitPrivateWsRestClient.
+ *  Кроме снапшота (position/list + order/realtime) и отмены осиротевших остатков, реконсиляция теперь
+ *  ДОЧИТЫВАЕТ ИСТОРИЮ: execution/list (что реально исполнилось, включая ручные действия оператора),
+ *  position/closed-pnl (реальный PnL закрытий — execution/list его не отдаёт) и order/history
+ *  (терминальные статусы ордеров, которых WS мог не донести). */
+export type ReconcileRestClient = Pick<
+  BybitRestClient,
+  'getPositions' | 'getOpenOrders' | 'cancelOrder' | 'getExecutions' | 'getOrderHistory' | 'getClosedPnl'
+>
 
 export interface ReconcileResult {
   /** Позиция на бирже атрибутирована по orderLinkId к сделке журнала, которая не была 'open' —
@@ -64,6 +74,12 @@ export interface ReconcileResult {
    * периодичность, что и orphansCancelled выше).
    */
   reattributedExecutions: number
+  /** Фантомные строки зеркала (ненулевой size у сделки, которой на бирже нет) — занулены (шаг Б2). */
+  phantomsZeroed: number
+  /** Сверка не выполнена (сбой Bybit/сети) — состояние журнала может расходиться с биржей.
+   *  Проставляется вызывающим (main.ts), а не самой reconcileOnStart: та либо отработала целиком,
+   *  либо бросила. Нужен, чтобы старт движка не падал в crash-loop из-за 5xx биржи. */
+  degraded?: boolean
 }
 
 // execution/order-link-id.ts::MODE_PREFIX.live — не экспортирован оттуда (сознательно не трогаем
@@ -76,10 +92,24 @@ const LIVE_ORDER_LINK_PREFIX = 'K'
 const LIVE_JOURNAL_STATUSES: readonly TradeStatus[] = ['pending', 'open', 'partially_closed']
 const OPEN_STATUSES: ReadonlySet<TradeStatus> = new Set(['open', 'partially_closed'])
 
-// createdTime-защита (§14): позиция на бирже старше локального opened_at более чем на этот буфер —
-// не наша (нельзя было открыть ПОСЛЕ того, как биржа уже показывает более старую позицию), не
-// синкаем вслепую. Буфер покрывает сетевую задержку/рассинхрон часов между вызовом входа и ответом.
-const CREATED_TIME_TOLERANCE_MS = 60_000
+/**
+ * Допуск гейта «чужой позиции» (шаг А) и recency-гейта свежих сделок F2/F8 (шаги Б/Г) — один на оба,
+ * они симметричны.
+ *
+ * ⚠️ НИКОГДА не сравнивайте с opened_at поле `position.createdTime`. В Bybit V5 это «время, когда
+ * позиция по ЭТОМУ СИМВОЛУ была создана ВПЕРВЫЕ»: биржа переиспользует слот позиции по символу и НЕ
+ * сбрасывает createdTime при закрытии/повторном открытии. Проверено живьём: у только что открытой
+ * SOLUSDT createdTime=11.07 13:13 (первая в истории аккаунта позиция по символу), а реальный филл
+ * (updatedTime) — 13.07 08:39. Разрыв createdTime↔opened_at растёт БЕЗ ГРАНИЦ с возрастом символа на
+ * аккаунте, поэтому никакой конечный допуск его не покрывает — каждый ПОВТОРНЫЙ вход по уже
+ * торговавшемуся символу детерминированно уходил в ambiguous и не попадал в `positions`.
+ *
+ * Корректный носитель сигнала — `updatedTime` («последнее касание позиции»): он бампается филлом
+ * входа, поэтому для НАШЕЙ позиции всегда ≈ opened_at (филл на бирже физически предшествует коммиту
+ * нашей строки — на SOLUSDT разрыв был 245 мс). Здесь разрыв ОГРАНИЧЕН СВЕРХУ длительностью
+ * транзакции pipeline (~1с), и 60с покрывают его с запасом.
+ */
+const POSITION_STALENESS_TOLERANCE_MS = 60_000
 
 interface LocalTrade {
   id: string
@@ -90,6 +120,73 @@ interface LocalTrade {
   opened_at: Date | null
 }
 
+export interface HistorySyncResult {
+  executionsInserted: number
+  manualActions: number
+  pnlPatched: number
+  tradesRecalculated: number
+  ordersSynced: number
+  /** Даунтайм оказался длиннее ретенции биржи (2 года) — часть истории невосстановима. */
+  truncated: boolean
+}
+
+/**
+ * Догон истории с биржи по водяному знаку: исполнения → реальный PnL → пересчёт денег → статусы
+ * ордеров. Именно этот блок закрывает требование «полная синхронизация, даже если сервис лежал
+ * день, и подтягиваются ручные действия с биржи».
+ */
+async function syncHistory(db: Kysely<DB>, rest: ReconcileRestClient): Promise<HistorySyncResult> {
+  const nowMs = Date.now()
+  const oldestLiveTradeMs = await findOldestLiveTradeMs(db)
+
+  // 1. Исполнения. exec_pnl у REST-строк ещё 0 — его отдаёт только closed-pnl (шаг 2).
+  const execs = await backfillExecutions(db, rest, nowMs, oldestLiveTradeMs)
+
+  // 2. Реальный PnL закрытий (включая РУЧНЫЕ) → патч exec_pnl REST-строк.
+  const pnl = await backfillClosedPnl(db, rest, nowMs, oldestLiveTradeMs)
+
+  // 3. Пересчёт денег затронутых сделок — ТОЛЬКО после того, как PnL проставлен.
+  const affected = [...new Set([...execs.affectedTradeIds, ...pnl.affectedTradeIds])]
+  const tradesRecalculated = affected.length
+    ? await db.transaction().execute((trx) => recalcTradesMoney(trx, affected))
+    : 0
+
+  // 4. Статусы ордеров: единственный писатель раньше был WS, репара не существовало вовсе.
+  const historyFrom = (await readCursor(db, 'sync:order_history')) ?? nowMs - BOOTSTRAP_LOOKBACK_MS
+  const orders = await syncOrderStatuses(db, rest, historyFrom - OVERLAP_MS, nowMs)
+  await writeCursor(db, 'sync:order_history', nowMs)
+
+  if (execs.inserted > 0 || pnl.patched > 0 || orders.updated > 0) {
+    console.log(
+      `[reconcile] догон истории: исполнений +${execs.inserted} (ручных ${execs.manual}, ` +
+        `непривязанных ${execs.unattributed}), PnL проставлен ${pnl.patched}, ` +
+        `сделок пересчитано ${tradesRecalculated}, статусов ордеров ${orders.updated}`,
+    )
+  }
+
+  return {
+    executionsInserted: execs.inserted,
+    manualActions: execs.manual,
+    pnlPatched: pnl.patched,
+    tradesRecalculated,
+    ordersSynced: orders.updated,
+    truncated: execs.truncated || pnl.truncated,
+  }
+}
+
+/** Самая старая ЖИВАЯ сделка журнала — чтобы при первом запуске не обрезать её филлы окном в 7 дней. */
+async function findOldestLiveTradeMs(db: Kysely<DB>): Promise<number | null> {
+  const row = await db
+    .selectFrom('trades')
+    .select('opened_at')
+    .where('status', 'in', LIVE_JOURNAL_STATUSES)
+    .where('opened_at', 'is not', null)
+    .orderBy('opened_at', 'asc')
+    .limit(1)
+    .executeTakeFirst()
+  return row?.opened_at ? row.opened_at.getTime() : null
+}
+
 /**
  * Процедура старта (§14, дословно шаги 1-4; шаг 5 — переподписка WS-водяного знака — забота
  * задачи 3/main.ts, не этой функции): читает `position/list`+`order/realtime`, сливает с локальным
@@ -98,6 +195,23 @@ interface LocalTrade {
  * оставляет "половину" исправлений). Сетевые READ-вызовы — ДО транзакции (не держат её открытой).
  */
 export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient): Promise<ReconcileResult> {
+  // ==========================================================================================
+  // ДОГОН ИСТОРИИ (шаги 1-4) — ДО снапшота позиций. Порядок здесь принципиален и менять его нельзя.
+  //
+  // WS не переигрывает пропущенное: всё, что случилось на бирже, пока движок лежал (или пока WS был
+  // в обрыве), не попадёт в журнал никогда — если не дочитать это REST-ом. Сюда же попадают РУЧНЫЕ
+  // действия оператора (закрытие, частичная фиксация), у которых нет наших ордеров.
+  //
+  // Почему деньги считаются ДО закрытия сделок (шаг Б ниже): closeTrade выводит is_win из ТЕКУЩЕГО
+  // realized_pnl. Закрыть сделку раньше, чем дочитаны её филлы, — значит навсегда записать is_win,
+  // посчитанный по нулевому PnL, и получить лживый Win Rate канала.
+  // ==========================================================================================
+  const historyResult = await syncHistory(db, rest).catch((err) => {
+    // Догон истории не должен ронять сверку позиций: она чинит более важное (что реально открыто).
+    console.error('[reconcile] догон истории не удался — продолжаю со сверкой позиций:', err)
+    return null
+  })
+
   // F2/F8 (адверсариальное ревью): момент снапшота getPositions (T0). getPositions() читается ДО
   // транзакции; localLiveTrades — внутри неё (READ COMMITTED), поэтому reconcile может увидеть
   // только что открытую параллельным пайплайном сделку (opened_at>T0), которой ещё нет в снапшоте.
@@ -119,6 +233,7 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
   let closed = 0
   let flagged = 0
   let reattributedExecutions = 0
+  let phantomsZeroed = 0
 
   await db.transaction().execute(async (trx) => {
     const localLiveTrades = await trx
@@ -152,15 +267,25 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
 
       if (openCandidates.length === 1) {
         const trade = openCandidates[0]!
-        if (!positionPredatesLocalOpen(pos, trade.opened_at)) {
+        // Владение доказывается ДВУМЯ независимыми способами, достаточно любого:
+        //  1) ДЕТЕРМИНИРОВАННО — на символе висит НАШ ('K'-префикс) ордер, привязанный именно к этой
+        //     сделке. orderLinkId генерируем мы сами (order-link-id.ts), это не догадка по времени.
+        //     Тот же механизм, что и attributeBySymbolOrders ниже; раньше он был недостижим при
+        //     единственном кандидате — и это была половина бага «позиция не видна в UI».
+        //  2) ЭВРИСТИЧЕСКИ — позицию трогали на бирже не раньше нашего входа. Нужен как фолбэк,
+        //     когда наших ордеров на символе уже не висит: TP исполнились, а SL — trading-stop, для
+        //     которого Bybit вообще не отдаёт orderLinkId.
+        const confirmed = await attributeBySymbolOrders(trx, pos.symbol, openOrders)
+        const ownedByOurOrders = confirmed !== null && confirmed.tradeId === trade.id
+        if (ownedByOurOrders || !positionUntouchedBeforeLocalOpen(pos, trade.opened_at)) {
           await syncMatchedTrade(trx, trade.channel_id, trade.id, pos)
           continue
         }
       }
 
       if (openCandidates.length >= 1) {
-        // >1 кандидат на один символ ИЛИ единственный отбракован createdTime-защитой — не
-        // угадываем, какой из них реальный владелец позиции.
+        // >1 кандидат на символ ИЛИ единственный не подтверждён НИ нашим orderLinkId, НИ свежестью
+        // позиции ⇒ пред-существующая/«чужая» позиция. Не угадываем владельца, не перетираем журнал.
         await logAmbiguousPosition(
           trx,
           pos,
@@ -205,6 +330,34 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
       closed++
     }
 
+    // --- Шаг Б2: ФАНТОМНЫЕ строки зеркала (найдено живым e2e) ---
+    //
+    // Шаг Б выше чинит только сделки, ОТКРЫТЫЕ в журнале. Но зеркало может остаться ненулевым и
+    // у уже ЗАКРЫТОЙ сделки: финальный пуш `position size=0` не дошёл (потерянный/переупорядоченный
+    // фрейм WS), а закрытие в журнале выполнил сам пайплайн. Такая строка не лечилась НИКЕМ —
+    // оператор видел в UI позицию, которой на бирже нет, а handleDelta (ищет сделку по
+    // `positions.size <> 0`) мог начать ею «управлять».
+    //
+    // Условия намеренно консервативные: (1) на бирже такой позиции сейчас нет; (2) строка зеркала
+    // не свежее снапшота — иначе мы затрём то, что WS узнал ПОЗЖЕ нашего похода на биржу;
+    // (3) сделка строки — наша ЖИВАЯ (есть 'K'-ордер), чтобы не трогать зеркала dry-run-сделок.
+    const phantoms = await sql<{ channel_id: number; symbol: string }>`
+      UPDATE positions p SET size = 0, updated_at = now()
+      WHERE p.size <> 0
+        AND NOT (p.symbol = ANY(${[...positionSymbols]}::text[]))
+        AND p.updated_at < ${new Date(snapshotAtMs)}
+        AND EXISTS (
+          SELECT 1 FROM orders o
+           WHERE o.trade_id = p.trade_id
+             AND o.order_link_id LIKE ${`${LIVE_ORDER_LINK_PREFIX}%`}
+        )
+      RETURNING p.channel_id, p.symbol
+    `.execute(trx)
+    for (const row of phantoms.rows) {
+      await emitPositionUpsert(trx, row.channel_id, row.symbol)
+      phantomsZeroed++
+    }
+
     // --- Шаг В (I1 финального ревью Ф3): переатрибуция осиротевших execution. ---
     reattributedExecutions = await reattributeOrphanedExecutions(trx)
   })
@@ -216,8 +369,17 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
   // F8 (адверсариальное ревью): дополнительно НЕ трогаем reduceOnly-остаток символа свежей
   // LIVE-сделки (freshlyOpenedSymbols) — позиция могла быть открыта в момент снапшота или позже,
   // её защитный TP/SL легитимен, снапшот getPositions(T0) просто ещё не застал позицию (лаг биржи).
+  //
+  // И только НАШИ ордера ('K'-префикс, order-link-id.ts). Раньше фильтра по префиксу не было —
+  // реконсиляция снимала бы reduce-only ордера, выставленные ОПЕРАТОРОМ вручную с биржи (у них
+  // чужой orderLinkId либо пустой, как у trading-stop). Чужие ордера — не наша зона ответственности:
+  // мы не имеем права отменять то, что не ставили.
   const orphans = openOrders.filter(
-    (o) => o.reduceOnly && !positionSymbols.has(o.symbol) && !freshlyOpenedSymbols.has(o.symbol),
+    (o) =>
+      o.reduceOnly &&
+      o.orderLinkId.startsWith(LIVE_ORDER_LINK_PREFIX) &&
+      !positionSymbols.has(o.symbol) &&
+      !freshlyOpenedSymbols.has(o.symbol),
   )
   let orphansCancelled = 0
   for (const order of orphans) {
@@ -232,7 +394,7 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
     }
   }
 
-  return { opened, closed, flagged, orphansCancelled, reattributedExecutions }
+  return { opened, closed, flagged, orphansCancelled, reattributedExecutions, phantomsZeroed }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,23 +407,45 @@ function mapPositionSide(raw: string): Side | null {
   return null // 'None' — плоская позиция-стаб (сюда не попадаем: positions уже отфильтрован size>0)
 }
 
-function positionPredatesLocalOpen(pos: Position, tradeOpenedAt: Date | null): boolean {
-  if (tradeOpenedAt === null) return false // opened_at ещё не проставлен — защита неприменима
-  const posCreatedMs = Number(pos.createdTime)
-  if (!Number.isFinite(posCreatedMs)) return false
-  return posCreatedMs < tradeOpenedAt.getTime() - CREATED_TIME_TOLERANCE_MS
+/**
+ * Bybit отдаёт ПУСТУЮ СТРОКУ вместо числа в необязательных полях position/list — проверено живьём
+ * на demo: `liqPrice=""` у реально открытой позиции (cross-маржа без риска ликвидации), `markPrice=""`
+ * на «холодном» символе (последнее уже задокументировано в rest-client.ts::Ticker). В Postgres
+ * `''::numeric` — ОШИБКА («invalid input syntax for type numeric»), которая рвёт ВСЮ транзакцию
+ * реконсиляции; на старте (main.ts::reconcileOnStart вызывается без catch, в отличие от периодического
+ * прохода) это положило бы движок в boot-loop. Колонки positions.* nullable (миграция 001) — пустое
+ * значение биржи означает «неизвестно», то есть NULL. Тот же приём, что private-ws.ts::asNonEmptyString.
+ */
+function numOrNull(value: string | null | undefined): string | null {
+  return value === undefined || value === null || value === '' ? null : value
 }
 
 /**
- * F2/F8 (адверсариальное ревью): recency-гейт, симметричный createdTime-защите шага А
- * (positionPredatesLocalOpen, ТА ЖЕ CREATED_TIME_TOLERANCE_MS). Сделка, открытая в момент снапшота
- * getPositions (snapshotAtMs) или позже — с допуском на лаг биржи/рассинхрон часов — могла ещё не
- * попасть в снапшот: её НЕЛЬЗЯ закрывать (шаг Б) или снимать её защитный reduceOnly (шаг Г) по
- * устаревшему снапшоту. opened_at=null — гейт неприменим (как и в positionPredatesLocalOpen).
+ * Гейт «чужой» позиции (§14) — ЭВРИСТИЧЕСКИЙ фолбэк к детерминированной проверке по orderLinkId
+ * (шаг А). Позицию не трогали на бирже (updatedTime бампается филлом/добором/частичным закрытием/
+ * правкой TP-SL) ЗАДОЛГО ДО нашего локального opened_at ⇒ наш вход её не создавал: это ручная или
+ * пред-существующая «чужая» позиция — не присваиваем её своей сделке и не перетираем ею журнал.
+ *
+ * Смысл исходной защиты сохранён дословно, изменён только НОСИТЕЛЬ сигнала: createdTime выразить
+ * его не способен (см. POSITION_STALENESS_TOLERANCE_MS).
+ */
+function positionUntouchedBeforeLocalOpen(pos: Position, tradeOpenedAt: Date | null): boolean {
+  if (tradeOpenedAt === null) return false // opened_at ещё не проставлен — гейт неприменим
+  const posUpdatedMs = Number(pos.updatedTime)
+  if (!Number.isFinite(posUpdatedMs) || posUpdatedMs === 0) return false // поле пустое/битое — не бракуем вслепую
+  return posUpdatedMs < tradeOpenedAt.getTime() - POSITION_STALENESS_TOLERANCE_MS
+}
+
+/**
+ * F2/F8 (адверсариальное ревью): recency-гейт, симметричный гейту «чужой позиции» шага А
+ * (positionUntouchedBeforeLocalOpen, ТОТ ЖЕ POSITION_STALENESS_TOLERANCE_MS). Сделка, открытая в
+ * момент снапшота getPositions (snapshotAtMs) или позже — с допуском на лаг биржи/рассинхрон часов —
+ * могла ещё не попасть в снапшот: её НЕЛЬЗЯ закрывать (шаг Б) или снимать её защитный reduceOnly
+ * (шаг Г) по устаревшему снапшоту. opened_at=null — гейт неприменим.
  */
 function tradeOpenedAfterSnapshot(tradeOpenedAt: Date | null, snapshotAtMs: number): boolean {
   if (tradeOpenedAt === null) return false
-  return tradeOpenedAt.getTime() >= snapshotAtMs - CREATED_TIME_TOLERANCE_MS
+  return tradeOpenedAt.getTime() >= snapshotAtMs - POSITION_STALENESS_TOLERANCE_MS
 }
 
 /** Совпадение по символу (единственный открытый LIVE-кандидат, прошедший createdTime-защиту):
@@ -340,23 +524,38 @@ async function upsertPositionFromExchange(trx: Kysely<DB>, channelId: number, tr
   await sql`
     INSERT INTO positions (
       channel_id, symbol, trade_id, side, size, avg_price, mark_price, liq_price,
-      leverage, position_status, bybit_seq, updated_at
+      leverage, unrealised_pnl, take_profit, stop_loss, position_status, bybit_seq, updated_at
     ) VALUES (
-      ${channelId}, ${pos.symbol}, ${tradeId}::uuid, ${side}::side_t, ${pos.size}::numeric,
-      ${pos.avgPrice}::numeric, ${pos.markPrice}::numeric, ${pos.liqPrice}::numeric,
-      ${pos.leverage}::numeric, ${pos.positionStatus}, ${pos.seq}, now()
+      ${channelId}, ${pos.symbol}, ${tradeId}::uuid, ${side}::side_t, ${numOrNull(pos.size) ?? '0'}::numeric,
+      ${numOrNull(pos.avgPrice)}::numeric, ${numOrNull(pos.markPrice)}::numeric, ${numOrNull(pos.liqPrice)}::numeric,
+      ${numOrNull(pos.leverage)}::numeric, ${numOrNull(pos.unrealisedPnl)}::numeric,
+      ${numOrNull(pos.takeProfit)}::numeric, ${numOrNull(pos.stopLoss)}::numeric,
+      ${pos.positionStatus}, ${pos.seq}, now()
     )
     ON CONFLICT (channel_id, symbol) DO UPDATE SET
       trade_id = EXCLUDED.trade_id,
       side = EXCLUDED.side,
       size = EXCLUDED.size,
       avg_price = EXCLUDED.avg_price,
-      mark_price = EXCLUDED.mark_price,
+      -- COALESCE (тот же приём, что private-ws.ts): пустой markPrice на «холодном» символе не должен
+      -- затирать цену, уже известную из тикер-фида.
+      mark_price = COALESCE(EXCLUDED.mark_price, positions.mark_price),
       liq_price = EXCLUDED.liq_price,
       leverage = EXCLUDED.leverage,
+      unrealised_pnl = EXCLUDED.unrealised_pnl,
+      -- SL/TP биржи (protective-стопы позиции): без них карточка показывала бы «—» при реально
+      -- выставленном на бирже стопе — оператор решил бы, что позиция не защищена.
+      take_profit = EXCLUDED.take_profit,
+      stop_loss = EXCLUDED.stop_loss,
       position_status = EXCLUDED.position_status,
       bybit_seq = EXCLUDED.bybit_seq,
       updated_at = now()
+    -- Водяной знак seq: REST-снапшот снимается ДО транзакции, а пока она идёт, живой WS мог прислать
+    -- более СВЕЖЕЕ состояние позиции. Без этого гейта устаревший снапшот откатывал бы позицию назад
+    -- (например, воскрешал уже закрытую). WS-путь такой гейт имеет (private-ws.ts), REST — не имел.
+    -- seq строго возрастает у Bybit в рамках символа; NULL слева — строка от dry-run/старых данных,
+    -- её перезаписываем безусловно.
+    WHERE positions.bybit_seq IS NULL OR EXCLUDED.bybit_seq >= positions.bybit_seq
   `.execute(trx)
 }
 
@@ -386,25 +585,54 @@ async function zeroPositionRow(trx: Kysely<DB>, channelId: number, symbol: strin
  * (order_id заполнен) повторный запуск не трогает.
  */
 async function reattributeOrphanedExecutions(trx: Kysely<DB>): Promise<number> {
-  const rows = await trx
-    .updateTable('executions')
-    .from('orders')
-    .set((eb) => ({
-      order_id: eb.ref('orders.id'),
-      trade_id: eb.ref('orders.trade_id'),
-      leg_id: eb.ref('orders.leg_id'),
-    }))
-    .whereRef('executions.order_link_id', '=', 'orders.order_link_id')
-    .where('executions.order_id', 'is', null)
-    .returning('executions.trade_id as tradeId')
+  // Раньше здесь был голый JOIN по order_link_id — он чинил ТОЛЬКО гонку «execution пришёл раньше
+  // коммита нашей строки orders». Но у РУЧНОГО закрытия оператора orderLinkId чужой, а у филла
+  // сработавшего trading-stop он вовсе пустой — такие исполнения оставались сиротами (trade_id=NULL)
+  // НАВСЕГДА, и PnL сделки не считался. Живой след: TR-1204 с realized_pnl=0 при реальном убытке.
+  // Теперь идём той же атрибуцией, что и весь остальной догон (наш ордер → родитель стопа → ручное).
+  const orphans = await trx
+    .selectFrom('executions')
+    .select(['id', 'order_link_id', 'bybit_order_id', 'symbol', 'exec_ts'])
+    .where('trade_id', 'is', null)
     .execute()
+  if (orphans.length === 0) return 0
 
-  const affectedTradeIds = [...new Set(rows.map((r) => r.tradeId).filter((id): id is string => id !== null))]
-  for (const tradeId of affectedTradeIds) {
-    await recalcTradeRealizedPnl(trx, tradeId)
+  const affectedTradeIds = new Set<string>()
+  let reattributed = 0
+
+  for (const orphan of orphans) {
+    const attribution = await attributeExecution(trx, {
+      orderLinkId: orphan.order_link_id,
+      bybitOrderId: orphan.bybit_order_id,
+      symbol: orphan.symbol,
+      execTs: orphan.exec_ts,
+    })
+    if (!attribution.tradeId) continue
+
+    await trx
+      .updateTable('executions')
+      .set({ order_id: attribution.orderId, trade_id: attribution.tradeId, leg_id: attribution.legId })
+      .where('id', '=', orphan.id)
+      .execute()
+
+    // Исполнение мимо наших ордеров = ручное вмешательство оператора: канал больше не двигает
+    // SL/TP этой сделки (решение заказчика — воля оператора главнее сигнала).
+    if (attribution.kind === 'manual') {
+      await trx
+        .updateTable('trades')
+        .set({ manual_override: true, needs_review: true, updated_at: new Date() })
+        .where('id', '=', attribution.tradeId)
+        .execute()
+    }
+
+    affectedTradeIds.add(attribution.tradeId)
+    reattributed++
   }
 
-  return rows.length
+  // Пересчёт денег, а не инкремент: realized_pnl/fees_paid/is_win выводятся из SUM по executions.
+  await recalcTradesMoney(trx, [...affectedTradeIds])
+
+  return reattributed
 }
 
 /** `audit_log` (миграция 001) существует, но не типизирован в Kysely DB (см. комментарий

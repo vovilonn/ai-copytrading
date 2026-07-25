@@ -78,9 +78,16 @@ export async function applyMarkPriceTick(
       // unrealised_pnl уже закрытой строки устаревшим ненулевым PnL. emitPositionUpsert ниже
       // перечитывает актуальную строку заново, так что на итоговый payload это не влияет —
       // WHERE просто делает сам UPDATE идемпотентным no-op для гонки, вместо порчи данных.
+      // updated_at СОЗНАТЕЛЬНО НЕ трогаем (найдено адверсариальной проверкой фиксов): тик цены —
+      // не изменение состояния позиции, а его переоценка. Бампая его каждую секунду, мы делали
+      // бесполезным гейт реконсиляции «зеркало свежее снапшота биржи» (reconcile.ts, шаг Б2):
+      // фантомная строка сама себя держит в подписке тикера и всегда выглядит только что
+      // обновлённой — то есть шаг Б2 не сработал бы в проде НИКОГДА. Единственный потребитель
+      // positions.updated_at — как раз этот гейт (api сортирует по trades.opened_at, см.
+      // positions.service.ts:20).
       await trx
         .updateTable('positions')
-        .set({ mark_price: markPrice, unrealised_pnl: pnl.toString(), updated_at: new Date() })
+        .set({ mark_price: markPrice, unrealised_pnl: pnl.toString() })
         .where('channel_id', '=', row.channel_id)
         .where('symbol', '=', symbol)
         .where(sql<boolean>`size <> 0`)

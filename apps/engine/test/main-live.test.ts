@@ -141,18 +141,36 @@ async function orderStatus(orderLinkId: string): Promise<string> {
  * тот же приём мока (без сети), что и bybit-adapter.test.ts/reconcile.test.ts, объединённый в один
  * набор ради переиспользования между describe-блоками initLiveRuntime и sweepExpiredLimitOrders.
  */
-function createMockRest(): { rest: BybitAdapterRestClient & ReconcileRestClient; calls: string[] } {
+// initLiveRuntime синхронизирует часы биржи (bybit/server-time.ts) до первой подписи, поэтому в
+// срез мока добавлены syncClock/serverNowMs — тем же приёмом «узкий Pick», что и остальные части.
+type MockRest = BybitAdapterRestClient & ReconcileRestClient & Pick<BybitRestClient, 'syncClock' | 'serverNowMs'>
+
+function createMockRest(): { rest: MockRest; calls: string[] } {
   const calls: string[] = []
   const seenOrderLinkIds = new Set<string>()
   let orderSeq = 0
 
-  const rest: BybitAdapterRestClient & ReconcileRestClient = {
+  const rest: MockRest = {
     getPositions: vi.fn(async (_symbol?: string): Promise<Position[]> => {
       calls.push('getPositions')
       return []
     }),
     getOpenOrders: vi.fn(async (_symbol?: string): Promise<Order[]> => {
       calls.push('getOpenOrders')
+      return []
+    }),
+    // Догон истории (реконсиляция дочитывает исполнения/PnL/статусы ордеров). Пустая история —
+    // поведение стартовой сверки в этом тесте не меняется.
+    getExecutions: vi.fn(async () => {
+      calls.push('getExecutions')
+      return []
+    }),
+    getOrderHistory: vi.fn(async () => {
+      calls.push('getOrderHistory')
+      return []
+    }),
+    getClosedPnl: vi.fn(async () => {
+      calls.push('getClosedPnl')
       return []
     }),
     switchMode: vi.fn(async (symbol: string, mode: 0 | 3) => {
@@ -176,10 +194,21 @@ function createMockRest(): { rest: BybitAdapterRestClient & ReconcileRestClient;
       calls.push('setTradingStop')
       return { ok: true as const }
     }),
+    cancelAll: vi.fn(async (symbol: string) => {
+      calls.push(`cancelAll:${symbol}`)
+      return { ok: true as const }
+    }),
     cancelOrder: vi.fn(async (params: { symbol: string; orderLinkId: string }) => {
       calls.push(`cancelOrder:${params.orderLinkId}`)
       return { ok: true as const }
     }),
+    // Часы биржи (bybit/server-time.ts): initLiveRuntime синхронизирует их ДО первой подписи —
+    // в моке достаточно нулевой поправки, сеть тест не трогает.
+    syncClock: vi.fn(async () => {
+      calls.push('syncClock')
+      return 0
+    }),
+    serverNowMs: vi.fn(() => Date.now()),
   }
 
   return { rest, calls }
@@ -195,7 +224,7 @@ describe('initLiveRuntime — EXECUTION_MODE=live: реконсиляция -> �
     expect(calls).toContain('getPositions')
     expect(calls).toContain('getOpenOrders')
     // Пустой журнал/аккаунт -> всё по нулям (тот же контракт, что и живая проверка на testnet).
-    expect(runtime.reconcileResult).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0 })
+    expect(runtime.reconcileResult).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
     // Фабрика createExecutionPort('live', ...) действительно дала BybitAdapter.
     expect(runtime.executionPort).toBeInstanceOf(BybitAdapter)
     // Приватный WS сконструирован (готов к .start()), но НЕ подключается сам по себе —

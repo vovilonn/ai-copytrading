@@ -320,18 +320,25 @@ describe('replay — реплей CH1 в изолированной схеме',
     expect(report.messages).toBe(6)
     expect(report.executed).toBe(1) // LIT вошёл бы (copy принудительно включён, хотя в public off)
     expect(report.deltasExecuted).toBe(1) // дельта "первая цель есть" по LIT
-    expect(report.skipped['no_SL']).toBe(1)
     expect(report.skipped['symbol_not_listed']).toBe(1)
     expect(report.skipped['price_slippage']).toBe(1)
     expect(report.byGuard['price_slippage']).toBe(1)
     expect(report.entriesGuarded).toBe(1)
-    expect(report.signals).toBe(4) // 1 executed open + 3 skipped opens
-    expect(report.aiRequired).toBe(0) // CH1 детерминирован
+
+    // Сигнал без стопа (1002) БОЛЬШЕ НЕ выбрасывается в skip(no_SL): regex не уверен → отдаём AI.
+    // Смысл: канал может писать стоп в незнакомом виде («стоп за 72.5»), и молча терять такие сделки
+    // нельзя. В бэктесте AI выключен (aiEnabled=false — офлайн, не жжём платные вызовы), поэтому
+    // сообщение честно оседает в needs_review: видно, что оно требует разбора, ордеров при этом ноль.
+    expect(report.skipped['no_SL']).toBeUndefined()
+    expect(report.aiRequired).toBe(1)
+    expect(report.statusBreakdown['needs_review']).toBe(1)
+
+    expect(report.signals).toBe(3) // 1 executed open + 2 skipped opens (третий ушёл в AI-ветку)
     // Статус СООБЩЕНИЯ 'executed' = прошло через executing-ветку пайплайна (даже если intent потом
     // отсеял гвард): 1000 (LIT вход), 1001 (дельта), 1005 (SOL — route execute, но price_slippage).
     // Action-уровневый report.executed=1 (реально открытые сделки) считается отдельно и верно.
     expect(report.statusBreakdown['executed']).toBe(3)
-    expect(report.statusBreakdown['skipped']).toBe(2) // 1002 no_SL, 1003 symbol_not_listed (route=skip)
+    expect(report.statusBreakdown['skipped']).toBe(1) // 1003 symbol_not_listed (AI тут бессилен)
     expect(report.statusBreakdown['noise']).toBe(1)
   })
 

@@ -50,7 +50,7 @@ import type {
 /** Узкий срез BybitRestClient, реально нужный адаптеру — упрощает мок в тестах (без apiKey/apiSecret). */
 export type BybitAdapterRestClient = Pick<
   BybitRestClient,
-  'switchMode' | 'setLeverage' | 'createOrder' | 'setTradingStop' | 'cancelOrder'
+  'switchMode' | 'setLeverage' | 'createOrder' | 'setTradingStop' | 'cancelOrder' | 'cancelAll'
 >
 
 export class BybitAdapter implements ExecutionPort {
@@ -254,7 +254,7 @@ export class BybitAdapter implements ExecutionPort {
     const instrument = await getInstrumentOrThrow(tx, params.symbol, this.network)
     const closeSide = toBybitSide(params.side, false)
     const qty = floorTo(instrument.qtyStep, params.qty).toString()
-    const linkId = buildLinkId(params, 'close', 0)
+    const linkId = buildLinkId(params, 'close', params.seq ?? 0)
 
     const result = await this.rest.createOrder({
       symbol: params.symbol,
@@ -289,6 +289,16 @@ export class BybitAdapter implements ExecutionPort {
 
     if (!inserted) return { orderId: await findOrderId(tx, linkId) }
     return { orderId: inserted.id }
+  }
+
+  /**
+   * Снять ВСЕ висящие ордера символа (R8) после нашего же полного закрытия позиции. Раньше это
+   * делал обработчик flat-пуша приватного WS; теперь пайплайн зовёт явно, сразу после коммита —
+   * пуш мог не дойти, а висящий reduceOnly-остаток на закрытом символе живёт до реконсиляции.
+   * Идемпотентно: повторный cancel-all по символу без ордеров — успех без эффекта.
+   */
+  async cancelAllForSymbol(symbol: string): Promise<void> {
+    await this.rest.cancelAll(symbol)
   }
 
   async cancelOrder(tx: Kysely<DB>, params: CancelOrderParams): Promise<void> {

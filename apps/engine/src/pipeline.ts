@@ -7,6 +7,7 @@ import { getAdapter } from './adapters/registry.js'
 import { normalize } from './normalize.js'
 import { resolveSymbol } from './symbol-resolver.js'
 import { computeLeverage, floorTo, liqPrice } from './risk/leverage.js'
+import { leverageWithoutSl, protectiveSl } from './risk/protective-sl.js'
 import { computeSize } from './risk/sizing.js'
 import { acquireSymbol, addLeg, closeTrade, openTrade } from './state/trades.js'
 import type { ExecutionPort, OrderContext } from './execution/port.js'
@@ -80,6 +81,16 @@ export interface PipelineDeps {
   getMarkPrice?: (symbol: string) => Promise<string | null>
   /** Порог гейта I2, % (design: дефолт '0.5' = MAX_ENTRY_SLIPPAGE_PCT, .env.example). */
   maxEntrySlippagePct?: string
+  /**
+   * Разрешён ли поход в AI (по умолчанию да).
+   *
+   * Нужен для ОФЛАЙН-прогонов — бэктест на исторических сообщениях: с тех пор как CH1 отдаёт
+   * непонятое в AI (смена формата канала не должна терять сигналы), реплей фикстуры начал бы
+   * дёргать ai-proxy по сети — то есть висеть на таймаутах и ЖЕЧЬ ПЛАТНЫЕ вызовы на каждом прогоне
+   * тестов. С `false` route='ai' обрабатывается как «AI недоступен» → needs_review, ноль ордеров:
+   * бэктест честно покажет такие сообщения как требующие разбора, а не притворится, что их нет.
+   */
+  aiEnabled?: boolean
 }
 
 // Important I2 (адверсариальное ревью): вход всегда market по СИГНАЛЬНОЙ цене — если реальный
@@ -87,11 +98,18 @@ export interface PipelineDeps {
 // посчитанные по сигнальной цене, больше не отражают реальность — лучше skip, чем вход вслепую.
 const DEFAULT_MAX_ENTRY_SLIPPAGE_PCT = '0.5'
 
+// «Фиксирую» без явной доли — это половина: самый частый смысл в сигналах («зафиксировал часть»,
+// «скинул половину»). Если автор назвал долю («закрыл 30%»), берётся она, а не этот дефолт.
+const DEFAULT_PARTIAL_CLOSE_FRACTION = '0.5'
+
 type ChannelRow = Selectable<DB['channels']>
 type ChannelSettingsRow = Selectable<DB['channel_settings']>
 
 export async function processMessage(db: Kysely<DB>, message: PipelineMessage, deps: PipelineDeps): Promise<void> {
   let notifyNeeded = false
+  // Уборка за полным закрытием — строго ПОСЛЕ коммита (см. finalizeClosedPositions: внутри
+  // транзакции тот же UPDATE ловил deadlock с приватным WS).
+  const postCommit: IntentBase['postCommit'] = []
 
   await db.transaction().execute(async (trx) => {
     const channel = await trx
@@ -135,7 +153,10 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     // картинка-only сообщение CH2). CH1 и CH2 A/B/C/D никогда не заходят сюда — деградация AI их
     // не касается (см. runAiBranch — при отказе возвращает null, а не бросает наружу).
     // `db` (родительский пул, НЕ trx) передаётся ЕЩЁ и для ai_calls — см. Minor #4 в runAiBranch.
-    const aiBranch = parsed.route === 'ai' ? await runAiBranch(trx, db, message, normalizedText, instruments, channel.adapter_id) : null
+    const aiBranch =
+      parsed.route === 'ai' && deps.aiEnabled !== false
+        ? await runAiBranch(trx, db, message, normalizedText, instruments, channel.adapter_id)
+        : null
     const aiParsed: ParsedResult | null = aiBranch?.parsed ?? null
     // НАХОДКА приёмки задачи 7 (в дополнение к находке задачи 6): extract_signal ВСЕГДА возвращает
     // `summary` (schema.ts: обязательное поле tool-вызова), но до этой правки пайплайн его нигде
@@ -154,6 +175,8 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
         .set({ status: 'noise', normalized_text: normalizedText, method: decision.method, ai_summary: aiSummary, updated_at: now })
         .where('id', '=', message.id)
         .execute()
+      await emitMessageProcessed(trx, message)
+      notifyNeeded = true
       return
     }
 
@@ -182,6 +205,8 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
         })
         .where('id', '=', message.id)
         .execute()
+      await emitMessageProcessed(trx, message)
+      notifyNeeded = true
       return
     }
 
@@ -202,12 +227,14 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
         })
         .where('id', '=', message.id)
         .execute()
+      await emitMessageProcessed(trx, message)
+      notifyNeeded = true
       return
     }
 
     // decision.outcome === 'executing' — decision.method всегда 'auto' либо 'ai' (never null/'review').
     const method: 'auto' | 'ai' = decision.method === 'ai' ? 'ai' : 'auto'
-    const base: IntentBase = { message, channel, settings, instruments, deps }
+    const base: IntentBase = { message, channel, settings, instruments, deps, postCommit }
     // Гейт "Copy trading" (channel_settings.enabled, DEFAULT false — design spec: "off → каждый
     // action Skipped, ордера не отправляются"). Сообщение по-прежнему парсится и actions
     // пишутся (нужны UI/таймлайну), но ни один intent НЕ доходит до handleEntrySignal/handleDelta —
@@ -223,7 +250,14 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
       .set({ status: 'executed', normalized_text: normalizedText, method, ai_summary: aiSummary, updated_at: now })
       .where('id', '=', message.id)
       .execute()
+    await emitMessageProcessed(trx, message)
+    notifyNeeded = true
   })
+
+  if (postCommit.length > 0) {
+    const finalized = await finalizeClosedPositions(db, message.channelId, postCommit, deps)
+    notifyNeeded = notifyNeeded || finalized
+  }
 
   if (notifyNeeded) {
     await sql`SELECT pg_notify('domain_events', '')`.execute(db)
@@ -538,6 +572,19 @@ interface IntentBase {
   settings: ChannelSettingsRow
   instruments: InstrumentMap
   deps: PipelineDeps
+  /**
+   * Что сделать ПОСЛЕ коммита транзакции сообщения. Сюда попадают символы, которые это сообщение
+   * закрыло целиком: обнулить зеркало позиции и снять висящие reduceOnly-остатки (R8).
+   *
+   * Почему не внутри транзакции (найдено живым прогоном): `UPDATE positions` в транзакции
+   * пайплайна, который к тому моменту уже держит блокировки на trades/symbol_ownership, встречно
+   * блокируется с транзакцией приватного WS (та берёт positions ПЕРВОЙ, а trades — следом).
+   * Postgres честно поймал это как `deadlock detected` и откатил сообщение целиком — при том, что
+   * ордер на биржу уже ушёл. Одиночный UPDATE после коммита держит РОВНО ОДНУ блокировку и
+   * взаимно заблокироваться не может; сеть (cancelAll) там же — по общему правилу «сеть не держит
+   * транзакцию БД».
+   */
+  postCommit: Array<{ symbol: string; tradeId: string }>
 }
 
 interface HandlerResult {
@@ -620,19 +667,26 @@ async function processIntent(
   } else {
     switch (intent.kind) {
       case 'entry_signal':
-        result = await handleEntrySignal(trx, base, actionIndex, actionId, intent)
+        result = await handleOpen(trx, base, actionIndex, actionId, specFromEntrySignal(intent))
+        break
+      // «Long BTC, с текущих» — вход по рынку. Цены и стопа в сигнале нет: цену берём с рынка,
+      // стоп синтезируем защитный (см. handleOpen). Самый частый способ дать сигнал в свободном
+      // тексте — до этого он молча уходил в skip и НЕ торговался вовсе.
+      case 'market_entry': {
+        const spec = await specFromMarketEntry(base, intent)
+        result = 'skipReason' in spec ? spec : await handleOpen(trx, base, actionIndex, actionId, spec)
+        break
+      }
+      // «зайду от 76.3» — лимитный вход по названной цене.
+      case 'limit_entry':
+        result = await handleOpen(trx, base, actionIndex, actionId, specFromLimitEntry(intent))
+        break
+      case 'add':
+        result = await handleAdd(trx, base, actionIndex, actionId, intent)
         break
       case 'delta':
         result = await handleDelta(trx, base, actionIndex, actionId, intent)
         break
-      default:
-        // 'add'/'limit_entry'/'market_entry' — CH2/Ф2 типы: и детерминированные правила B/C
-        // ch2.adapter.ts (задача 3), и AI (normalizeAiOutput mapOpenAction/mapAddAction, задача 2)
-        // МОГУТ их производить. Открытие новой позиции/добор через них — отдельный сайзинг-режим
-        // (channel_settings.add_sizing_mode), вне границ ЭТОЙ задачи (reconciler+AI-ветка+
-        // деградация, task-4-brief.md): needs_review-подобный skip, а не молчаливый крэш и не
-        // угадывание риска/размера — "лучше needs_review, чем неверное исполнение" (research §11).
-        result = { skipReason: 'not_implemented_phase1' }
     }
   }
 
@@ -689,6 +743,32 @@ async function processIntent(
   return true
 }
 
+/**
+ * «Разбор сообщения закончен» — сигнал фронту обновить узел таймлайна.
+ *
+ * ЗАЧЕМ. Сообщение прилетает в UI по WS от tg-ingest СРАЗУ (status='received'), а действия и
+ * AI-саммари появляются позже — их дописывает движок. Событий о самих действиях (action.new/
+ * action.skipped) для таймлайна недостаточно: их payload узкий и не содержит собранный узел
+ * (альбом, медиа, текст), а у noise-сообщений действий нет вовсе — и узел так и остался бы «пустым»
+ * до перезагрузки страницы. Поэтому шлём одно событие на сообщение, а api (outbox.publisher.ts)
+ * пересобирает по нему актуальный MessageDto и рассылает 'message.updated' — фронт уже умеет
+ * заменять узел на месте.
+ *
+ * Публикуется В ТОЙ ЖЕ транзакции, что и финальный статус сообщения (outbox-паттерн): иначе крэш
+ * между коммитом статуса и вставкой события оставил бы UI навсегда с крутящимся лоадером.
+ */
+async function emitMessageProcessed(trx: Kysely<DB>, message: PipelineMessage): Promise<void> {
+  await trx
+    .insertInto('domain_events')
+    .values({
+      type: 'message.processed',
+      aggregate: 'message',
+      aggregate_id: message.id,
+      payload: JSON.stringify({ channelId: message.channelId, messageId: message.id }),
+    })
+    .execute()
+}
+
 // Экспортирована для переиспользования в apps/engine/src/market-data/apply-tick.ts (задача 10):
 // живой тик mark price публикует ТОТ ЖЕ формат position.upsert, что и исполнение сделок здесь —
 // один код, читающий актуальную строку positions и пишущий domain_events, вместо двух копий.
@@ -725,6 +805,60 @@ export async function emitPositionUpsert(trx: Kysely<DB>, channelId: number, sym
 // ---------------------------------------------------------------------------
 // entry_signal -> risk -> ExecutionPort.placeEntry/placeTpLadder/setStopLoss
 // ---------------------------------------------------------------------------
+
+/**
+ * Прибирает за НАШИМ ЖЕ полным закрытием — ПОСЛЕ коммита транзакции сообщения:
+ *   1) зануляет зеркало позиции;
+ *   2) снимает висящие reduceOnly-остатки символа (R8).
+ *
+ * Зачем (1), если есть приватный WS: живой e2e показал, что финальный пуш `position size=0`
+ * иногда до зеркала не доходит (3 прогона из 5) — и строка `positions` навсегда остаётся с
+ * размером до закрытия. Оператор видит в UI фантомную открытую позицию, а handleDelta (он ищет
+ * сделку ровно по `positions.size <> 0`) начинает «управлять» несуществующей позицией.
+ *
+ * Зачем (2): раньше cancel-all делал именно обработчик flat-пуша (private-ws.ts, R8). Обнулив
+ * зеркало сами, мы лишаем его последней зацепки для атрибуции символа — и висящие TP снимались бы
+ * только реконсиляцией, то есть до 10 минут. Здесь мы знаем правду детерминированно и снимаем их
+ * сразу; повторный cancel-all со стороны WS безвреден (идемпотентен).
+ *
+ * Ошибки не пробрасываются: сообщение уже закоммичено и переигрывать его нельзя (ордер ушёл).
+ * Любой сбой этой уборки лечится периодической реконсиляцией (шаг Б2 и шаг Г).
+ */
+async function finalizeClosedPositions(
+  db: Kysely<DB>,
+  channelId: number,
+  closed: ReadonlyArray<{ symbol: string; tradeId: string }>,
+  deps: PipelineDeps,
+): Promise<boolean> {
+  let notifyNeeded = false
+  for (const { symbol, tradeId } of closed) {
+    try {
+      await db.transaction().execute(async (trx) => {
+        const updated = await trx
+          .updateTable('positions')
+          .set({ size: '0', updated_at: new Date() })
+          .where('channel_id', '=', channelId)
+          .where('symbol', '=', symbol)
+          .where('trade_id', '=', tradeId)
+          .where(sql<boolean>`size <> 0`)
+          .returning('symbol')
+          .executeTakeFirst()
+        if (!updated) return
+        await emitPositionUpsert(trx, channelId, symbol)
+        notifyNeeded = true
+      })
+    } catch (err) {
+      console.error(`[pipeline] не удалось обнулить зеркало ${symbol} после закрытия:`, err)
+    }
+
+    try {
+      await deps.executionPort.cancelAllForSymbol(symbol)
+    } catch (err) {
+      console.error(`[pipeline] не удалось снять остатки ордеров по ${symbol} после закрытия:`, err)
+    }
+  }
+  return notifyNeeded
+}
 
 /** Общие координаты для orderLinkId (order-link-id.ts) — собираются один раз на intent. */
 function buildOrderContext(
@@ -794,12 +928,98 @@ function buildTpTargets(
   return [{ price: lastPrice.toString(), qty: total.toString(), index: lastIndex }]
 }
 
-async function handleEntrySignal(
+/**
+ * Нормализованное описание ЛЮБОГО открытия позиции — общий вход для трёх типов сигналов:
+ *
+ *   entry_signal  «#SOL/USDT LONG, вход 76.3-76.5, TP 80, SL 72»  → всё есть в сигнале
+ *   market_entry  «Long BTC, с текущих»                            → нет ни цены, ни стопа
+ *   limit_entry   «зайду от 76.3»                                  → есть цена, нет стопа
+ *
+ * Раньше исполнялся только первый: два других уходили в skip('not_implemented_phase1') — свободный
+ * текст («беру с текущих» — самый частый способ сказать «покупаю») не торговался вообще.
+ * Сводим их в одну структуру, чтобы не копировать 150 строк гейтов/сайзинга трижды.
+ */
+interface OpenSpec {
+  symbol: string
+  side: Side
+  orderType: 'market' | 'limit'
+  /** market → живой mark; limit → цена из сигнала; диапазон → его середина. */
+  entryPrice: Decimal
+  /** Стоп ИЗ СИГНАЛА. Нет — синтезируем защитный из плеча (см. protective-sl.ts). */
+  signalSl?: Decimal
+  /**
+   * Цена входа взята ИЗ СИГНАЛА (а не с рынка) — только тогда осмыслен гейт слиппеджа: сигнал мог
+   * протухнуть, пока шёл до нас. У market_entry цена и ЕСТЬ текущий mark (отклонение ≡ 0), у лимитки
+   * цена намеренно стоит вне рынка — там гейт не защищает, а просто зарубил бы вход.
+   */
+  priceFromSignal: boolean
+  tps: number[]
+  /** Риск автора. Учитывается ТОЛЬКО вместе с авторским стопом — см. handleOpen. */
+  riskPct?: number
+}
+
+function specFromEntrySignal(intent: Extract<ParsedIntent, { kind: 'entry_signal' }>): OpenSpec {
+  // Вход диапазоном — берём середину как цену симулированного market-филла (research: «entry для
+  // лимитки — цена лимитки, для market — текущая цена»).
+  const entryPrice = Array.isArray(intent.entry)
+    ? new Decimal(intent.entry[0]).plus(intent.entry[1]).div(2)
+    : new Decimal(intent.entry)
+
+  return {
+    symbol: intent.symbol,
+    side: intent.side,
+    orderType: 'market',
+    entryPrice,
+    priceFromSignal: true,
+    signalSl: new Decimal(intent.sl),
+    tps: intent.tps,
+    ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct } : {}),
+  }
+}
+
+function specFromLimitEntry(intent: Extract<ParsedIntent, { kind: 'limit_entry' }>): OpenSpec {
+  return {
+    symbol: intent.symbol,
+    side: intent.side,
+    orderType: 'limit',
+    entryPrice: new Decimal(intent.price),
+    priceFromSignal: true,
+    ...(intent.sl !== undefined ? { signalSl: new Decimal(intent.sl) } : {}),
+    tps: intent.tps ?? [],
+    ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct } : {}),
+  }
+}
+
+/**
+ * market_entry: цены в сигнале нет вовсе — берём ЖИВОЙ mark. `null` (нет источника цены или сбой
+ * похода за ней) — fail-CLOSED: торговая система не входит вслепую, если не знает текущую цену.
+ */
+async function specFromMarketEntry(
+  base: IntentBase,
+  intent: Extract<ParsedIntent, { kind: 'market_entry' }>,
+): Promise<OpenSpec | { skipReason: string }> {
+  if (!base.deps.getMarkPrice) return { skipReason: 'mark_price_unavailable' }
+  const mark = await base.deps.getMarkPrice(intent.symbol)
+  if (mark === null) return { skipReason: 'mark_price_unavailable' }
+
+  return {
+    symbol: intent.symbol,
+    side: intent.side,
+    orderType: 'market',
+    entryPrice: new Decimal(mark),
+    priceFromSignal: false, // цена = живой mark, отклоняться ей не от чего
+    ...(intent.sl !== undefined ? { signalSl: new Decimal(intent.sl) } : {}),
+    tps: intent.tps ?? [],
+    ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct } : {}),
+  }
+}
+
+async function handleOpen(
   trx: Kysely<DB>,
   base: IntentBase,
   actionIndex: number,
   actionId: string,
-  intent: Extract<ParsedIntent, { kind: 'entry_signal' }>,
+  intent: OpenSpec,
 ): Promise<HandlerResult> {
   const instrument = base.instruments.get(intent.symbol)
   // Защитный повторный гейт: ctx.isListed(symbol) в самом парсере уже опирается на этот же кэш
@@ -826,20 +1046,52 @@ async function handleEntrySignal(
   // лимитки, для market — текущая цена"; тот же 1.5004 для LIT 2796, что и в sizing.test.ts).
   // Decimal, а НЕ JS-float (Minor #3 адверсариального ревью, CLAUDE.md: "деньги — Decimal/строки")
   // — это единственная денежная величина ядра, которая считалась во float, до этого исправления.
-  const entryPrice = Array.isArray(intent.entry)
-    ? new Decimal(intent.entry[0]).plus(intent.entry[1]).div(2)
-    : new Decimal(intent.entry)
-  const sl = new Decimal(intent.sl)
+  const entryPrice = intent.entryPrice
 
-  const leverage = computeLeverage({
-    entry: entryPrice.toString(),
-    sl: sl.toString(),
-    side: intent.side,
-    mmr: instrument.mmr,
-    channelMaxLev: base.settings.max_leverage,
-    instrMaxLev: instrument.maxLeverage,
-    leverageStep: instrument.leverageStep,
-  })
+  // ── Стоп: авторский, либо наш защитный ───────────────────────────────────────────────────────
+  //
+  // Свободный текст сплошь и рядом без стопа («Long BTC, с текущих»). Войти на плече и не поставить
+  // стоп — прямой путь к ликвидации, поэтому политика no_sl_policy='attach_protective_sl' требует
+  // повесить СВОЙ страховочный стоп (design spec §8). Он выводится инверсией той же формулы, что
+  // считает плечо (risk/protective-sl.ts): стоп встаёт ровно там, где выбранное плечо перестаёт быть
+  // безопасным — строго перед ликвидацией. Когда автор позже пришлёт свой стоп (`sl_set`), он его
+  // заменит — это уже работает через handleDelta, отдельного кода не нужно.
+  //
+  // Связка «плечо ← стоп» здесь ИНВЕРТИРОВАНА в «стоп ← плечо»: без стопа вывести плечо из сигнала
+  // нечем, поэтому его задаёт настройка канала (default_leverage), а стоп — следствие плеча.
+  let sl: Decimal
+  let leverage: Decimal
+
+  if (intent.signalSl !== undefined) {
+    sl = intent.signalSl
+    leverage = computeLeverage({
+      entry: entryPrice.toString(),
+      sl: sl.toString(),
+      side: intent.side,
+      mmr: instrument.mmr,
+      channelMaxLev: base.settings.max_leverage,
+      instrMaxLev: instrument.maxLeverage,
+      leverageStep: instrument.leverageStep,
+    })
+  } else {
+    if (base.settings.no_sl_policy !== 'attach_protective_sl') {
+      // Канал настроен «без стопа не входим» — уважаем.
+      return { skipReason: 'no_SL' }
+    }
+    leverage = leverageWithoutSl({
+      defaultLev: base.settings.default_leverage,
+      channelMaxLev: base.settings.max_leverage,
+      instrMaxLev: instrument.maxLeverage,
+      leverageStep: instrument.leverageStep,
+    })
+    const protective = protectiveSl({ entry: entryPrice, side: intent.side, lev: leverage, mmr: instrument.mmr })
+    if (protective === null) {
+      // Плечо так велико, что стоп схлопнулся бы в саму цену ликвидации — «защита» была бы
+      // фиктивной. Лучше не войти, чем войти без реальной защиты.
+      return { skipReason: 'unsafe_leverage' }
+    }
+    sl = protective
+  }
 
   // Важный денежный инвариант (Important #1 адверсариального ревью): SL обязан оставаться
   // ЗА ценой ликвидации на выбранном плече, иначе позицию ликвидирует раньше, чем сработает
@@ -874,7 +1126,12 @@ async function handleEntrySignal(
   // createMarkPriceGetter) — гейт теперь fail-CLOSED (skip mark_price_unavailable), а НЕ
   // fail-open, как было раньше. Раньше null тихо пропускал проверку отклонения — торговая
   // система не должна входить вслепую, если не может достоверно узнать текущую цену.
-  if (base.deps.getMarkPrice) {
+  //
+  // Гейт осмыслен ТОЛЬКО когда цена входа пришла из сигнала И вход рыночный:
+  //  - market_entry («с текущих»): цена = живой mark, отклонение ≡ 0 — проверять нечего;
+  //  - limit_entry («зайду от 76.3»): лимитка ПО ОПРЕДЕЛЕНИЮ стоит вне рынка — гейт зарубил бы
+  //    каждый такой вход, хотя автор осознанно назначил цену.
+  if (base.deps.getMarkPrice && intent.priceFromSignal && intent.orderType === 'market') {
     const currentMark = await base.deps.getMarkPrice(intent.symbol)
     if (currentMark === null) return { skipReason: 'mark_price_unavailable' }
     const maxSlippagePct = new Decimal(base.deps.maxEntrySlippagePct ?? DEFAULT_MAX_ENTRY_SLIPPAGE_PCT)
@@ -883,7 +1140,11 @@ async function handleEntrySignal(
   }
 
   const sizeResult = computeSize({
-    ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct.toString() } : {}),
+    // Риск учитываем ТОЛЬКО вместе с авторским стопом. Без него знаменатель риск-формулы —
+    // дистанция НАШЕГО защитного стопа, то есть артефакт нашего выбора плеча, а не намерение
+    // автора: «риск 2%» превратился бы в размер, зависящий от настройки канала. Тогда сайзим
+    // фиксированным trade_size — предсказуемо и не выдумывает за автора (решение заказчика).
+    ...(intent.riskPct !== undefined && intent.signalSl !== undefined ? { riskPct: intent.riskPct.toString() } : {}),
     equity: base.deps.equity,
     tradeSize: base.settings.trade_size,
     entry: entryPrice.toString(),
@@ -925,7 +1186,7 @@ async function handleEntrySignal(
   await base.deps.executionPort.placeEntry(trx, {
     ...orderCtx,
     purpose: 'entry',
-    orderType: 'market',
+    orderType: intent.orderType,
     qty: sizeResult.qty.toString(),
     price: entryPrice.toString(),
     leverage: leverage.toString(),
@@ -981,6 +1242,112 @@ async function handleEntrySignal(
 // reconciler.ts (classifyIntent) — единственный источник этой классификации (DRY), см. импорт
 // вверху файла.
 
+/**
+ * Доливка к уже открытой позиции («долил соль», «добрал от 74»).
+ *
+ * Размер — channel_settings.add_sizing_mode (сейчас единственный режим 'trade_size': доливаем на
+ * фиксированный размер канала). Плечо НЕ меняем — оно уже выбрано при открытии сделки, менять его
+ * на живой позиции значит менять её риск задним числом.
+ *
+ * Стоп доливкой НЕ трогаем: он уже стоит на позиции (trading-stop охватывает весь объём), а средняя
+ * цена входа после долива уедет — её пересчитает биржа, и реконсиляция/WS-пуш подтянут avg_entry.
+ */
+async function handleAdd(
+  trx: Kysely<DB>,
+  base: IntentBase,
+  actionIndex: number,
+  actionId: string,
+  intent: Extract<ParsedIntent, { kind: 'add' }>,
+): Promise<HandlerResult> {
+  const instrument = base.instruments.get(intent.symbol)
+  if (!instrument || instrument.status !== 'Trading') return { skipReason: 'symbol_not_listed' }
+  if (instrument.mmr === null) return { skipReason: 'mmr_unavailable' }
+
+  // Доливать можно только В СУЩЕСТВУЮЩУЮ позицию этого канала. Нет позиции — это не доливка, а
+  // новый вход, и угадывать за автора мы не будем.
+  const position = await trx
+    .selectFrom('positions')
+    .selectAll()
+    .where('channel_id', '=', base.message.channelId)
+    .where('symbol', '=', intent.symbol)
+    .where(sql<boolean>`size <> 0`)
+    .executeTakeFirst()
+  if (!position || position.trade_id === null || position.side === null) {
+    return { skipReason: 'no_open_position' }
+  }
+
+  const trade = await trx
+    .selectFrom('trades')
+    .select(['id', 'leverage', 'manual_override'])
+    .where('id', '=', position.trade_id)
+    .executeTakeFirst()
+  if (!trade) return { skipReason: 'no_open_position' }
+
+  // Оператор взял сделку в свои руки — доливка увеличила бы риск на позиции, которой он управляет
+  // сам. Симметрично правилу для SL/TP (см. handleDelta). Выход из позиции при этом всегда разрешён.
+  if (trade.manual_override) return { skipReason: 'manual_override' }
+
+  // Цена: названа автором («добрал от 74») → лимитка; не названа → по рынку.
+  const orderType: 'market' | 'limit' = intent.price !== undefined ? 'limit' : 'market'
+  let entryPrice: Decimal
+  if (intent.price !== undefined) {
+    entryPrice = new Decimal(intent.price)
+  } else {
+    if (!base.deps.getMarkPrice) return { skipReason: 'mark_price_unavailable' }
+    const mark = await base.deps.getMarkPrice(intent.symbol)
+    if (mark === null) return { skipReason: 'mark_price_unavailable' } // fail-closed, как и market_entry
+    entryPrice = new Decimal(mark)
+  }
+
+  const leverage = new Decimal(trade.leverage ?? base.settings.max_leverage)
+
+  const sizeResult = computeSize({
+    equity: base.deps.equity,
+    tradeSize: base.settings.trade_size, // add_sizing_mode='trade_size'
+    entry: entryPrice.toString(),
+    sl: position.avg_price ?? entryPrice.toString(), // sl не участвует в фолбэк-ветке (нет riskPct)
+    lev: leverage,
+    minNotional: instrument.minNotional,
+    ...(base.settings.max_symbol_notional !== null ? { maxSymbolNotional: base.settings.max_symbol_notional } : {}),
+    qtyStep: instrument.qtyStep,
+  })
+  if ('skip' in sizeResult) return { skipReason: sizeResult.skip }
+
+  // Следующая по счёту «нога» сделки: entry был 0, доливки идут дальше.
+  const legs = await trx
+    .selectFrom('trade_legs')
+    .select(({ fn }) => [fn.max('leg_index').as('max_index')])
+    .where('trade_id', '=', trade.id)
+    .executeTakeFirst()
+  const nextLegIndex = (legs?.max_index ?? 0) + 1
+
+  const leg = await addLeg(trx, {
+    tradeId: trade.id,
+    legIndex: nextLegIndex,
+    kind: 'add',
+    sourceMessageId: base.message.id,
+    sourceActionId: actionId,
+    requestedQty: sizeResult.qty.toString(),
+  })
+
+  const orderCtx = buildOrderContext(base, actionIndex, actionId, trade.id, intent.symbol, position.side)
+  const projectedLiq = liqPrice({ entry: entryPrice, side: position.side, lev: leverage, mmr: instrument.mmr })
+
+  await base.deps.executionPort.placeEntry(trx, {
+    ...orderCtx,
+    purpose: 'add',
+    orderType,
+    qty: sizeResult.qty.toString(),
+    price: entryPrice.toString(),
+    leverage: leverage.toString(),
+    legId: leg.legId,
+    liqPrice: projectedLiq.toString(),
+    // stopLoss НЕ передаём: он уже стоит на позиции и охватывает весь объём, включая долитый.
+  })
+
+  return {}
+}
+
 async function handleDelta(
   trx: Kysely<DB>,
   base: IntentBase,
@@ -1008,22 +1375,107 @@ async function handleDelta(
 
   const orderCtx = buildOrderContext(base, actionIndex, actionId, position.trade_id, intent.symbol, position.side)
 
+  // Ручное вмешательство оператора на бирже (закрытие/фиксация/сдвиг стопа руками) ставит
+  // trades.manual_override — и с этого момента ВОЛЯ ОПЕРАТОРА ГЛАВНЕЕ сигнала канала: канал больше
+  // не двигает защиту этой сделки. Иначе следующий tp_set «воскресил» бы лесенку, которую оператор
+  // осознанно снял, а sl_set откатил бы стоп, который он подвинул руками.
+  //
+  // ИСКЛЮЧЕНИЕ: команды на ВЫХОД (close_remainder) исполняются ВСЕГДА. Блокировать закрытие позиции
+  // опасно — это единственный способ канала вывести оператора из убытка.
+  const trade = await trx
+    .selectFrom('trades')
+    .select(['manual_override', 'initial_size'])
+    .where('id', '=', position.trade_id)
+    .executeTakeFirst()
+  const manualOverride = trade?.manual_override === true
+
+  const isProtectionOp = (op: string): boolean =>
+    op === 'sl_set' || op === 'sl_breakeven' || op === 'sl_cancel' || op === 'tp_set'
+
+  if (manualOverride && intent.ops.length > 0 && intent.ops.every((op) => isProtectionOp(op.op))) {
+    return { skipReason: 'manual_override' }
+  }
+
+  // Причина, по которой рыночный гейт не дал переставить стоп. Копим, а не выходим сразу: в одном
+  // сообщении может быть и «зафиксировал половину», и «стоп в безубыток» — первое должно исполниться,
+  // даже если второе пока невозможно.
+  let gateSkip: string | null = null
+  let executedOps = 0
+
+  // ОСТАТОК ПОЗИЦИИ ВНУТРИ ОДНОГО СООБЩЕНИЯ. positions.size — это зеркало биржи, и после нашего
+  // closePosition оно обновится только пришедшим ПОЗЖЕ WS-пушем. Поэтому все следующие операции
+  // ЭТОГО ЖЕ сообщения обязаны считать от `remaining`, а не от position.size — иначе «фиксирую
+  // половину, стоп на твх» выставит trading-stop (он идёт с tpslMode='Full' и slSize=qty) на ВДВОЕ
+  // больший объём, чем реально остался.
+  let remaining = new Decimal(position.size)
+  // Порядковый номер закрывающего ордера: два closePosition в одном сообщении иначе получат
+  // ОДИН orderLinkId, Bybit отвергнет дубликат и сообщение зациклится (см. ClosePositionParams.seq).
+  let closeSeq = 0
+
+  // ДВОЙНОЕ ЗАКРЫТИЕ. «Первая цель взята» означает, что НАШ reduce-only TP-ордер исполнится САМ.
+  // Если в том же сообщении автор добавляет «зафиксировал 50%» — это ОПИСАНИЕ того же самого
+  // закрытия, а не вторая команда: закрыть ещё 50% рынком значит закрыть вдвое больше.
+  // Подавляем фиксацию ТОЛЬКО когда лесенка реально стоит на бирже. Если живых TP-ордеров нет
+  // (лесенку не ставили — например вход «с текущих» без целей), фиксацию исполняем.
+  const tpHitInMessage = intent.ops.some((o) => o.op === 'tp_hit')
+  const liveTpOrder = tpHitInMessage
+    ? await trx
+        .selectFrom('orders')
+        .select('id')
+        .where('trade_id', '=', position.trade_id)
+        .where('purpose', '=', 'tp')
+        .where('status', 'in', ['created', 'pending_submit', 'submitted'])
+        .executeTakeFirst()
+    : undefined
+  const suppressPartialClose = liveTpOrder !== undefined
+
   for (const op of intent.ops) {
+    if (manualOverride && isProtectionOp(op.op)) {
+      console.warn(
+        `[pipeline] ${intent.symbol}: '${op.op}' от канала пропущен — сделка под ручным управлением оператора (manual_override)`,
+      )
+      continue
+    }
     switch (op.op) {
       case 'close_remainder':
-        await base.deps.executionPort.closePosition(trx, { ...orderCtx, qty: position.size })
+        // Именно remaining, а не position.size: если выше в этом же сообщении уже зафиксировали
+        // половину, зеркало биржи ещё не обновилось — закрывать надо то, что реально осталось.
+        if (remaining.lte(0)) break
+        await base.deps.executionPort.closePosition(trx, { ...orderCtx, qty: remaining.toString(), seq: closeSeq++ })
         await closeTrade(trx, { tradeId: position.trade_id })
+        base.postCommit.push({ symbol: intent.symbol, tradeId: position.trade_id })
+        remaining = new Decimal(0)
+        executedOps++
         break
-      case 'sl_breakeven':
+      case 'sl_breakeven': {
         // Безубыток = средняя цена входа (design spec §6: "LLM не считает арифметику... число
         // подставляет код из состояния позиции").
-        if (position.avg_price !== null) {
-          await base.deps.executionPort.setStopLoss(trx, { ...orderCtx, price: position.avg_price, qty: position.size })
+        if (position.avg_price === null) break
+        // Позиция ушла в минус — стоп в безубыток оказался бы ПО ТУ СТОРОНУ рынка (для лонга выше
+        // текущей цены). Биржа такой стоп отвергает (retCode 10001), и раньше это роняло всю
+        // транзакцию: сообщение навсегда оставалось 'received' и переигрывалось каждые 5 секунд
+        // (в живом инциденте — 108 раз, лоадер в UI висел вечно). Это не ошибка, а нормальная
+        // рыночная ситуация: безубыток пока недостижим.
+        const beGate = await stopLossReachable(base, intent.symbol, position.side, position.avg_price)
+        if (beGate !== null) {
+          gateSkip = beGate
+          break
         }
+        await base.deps.executionPort.setStopLoss(trx, { ...orderCtx, price: position.avg_price, qty: remaining.toString() })
+        executedOps++
         break
-      case 'sl_set':
-        await base.deps.executionPort.setStopLoss(trx, { ...orderCtx, price: op.price.toString(), qty: position.size })
+      }
+      case 'sl_set': {
+        // Тот же гейт: автор может прислать стоп, который рынок уже прошёл.
+        const slGate = await stopLossReachable(base, intent.symbol, position.side, op.price.toString())
+        if (slGate !== null) {
+          gateSkip = slGate
+          break
+        }
+        await base.deps.executionPort.setStopLoss(trx, { ...orderCtx, price: op.price.toString(), qty: remaining.toString() })
+        executedOps++
         break
+      }
       case 'sl_cancel': {
         const activeSl = await trx
           .selectFrom('orders')
@@ -1038,13 +1490,72 @@ async function handleDelta(
       }
       case 'tp_hit':
       case 'sl_hit':
-      case 'partial_close':
-        // СОБЫТИЯ (design spec §9: "«зафиксировал 50%» трактуется как событие... а не как
-        // команда"), не команды: в Ф1 нет ни живого тикер-фида, ни реконсиляции исполнений с
-        // биржи (это driver реальных tp/sl-филлов, задача 10/Ф3) — наши TP/SL-ордера остаются
-        // "submitted" до явной команды (close_remainder/sl_breakeven/...). Событие уже зафиксировано
-        // самой actions-строкой (params.ops), доп. действий не требует.
+        // ЭТО СОБЫТИЯ, А НЕ КОМАНДЫ — и разница здесь денежная.
+        //
+        // «Первая цель взята» означает, что у АВТОРА сработал take-profit. У нас на бирже на этот
+        // случай стоит СВОЙ reduce-only TP-ордер — он исполнится САМ, по той же цене. Если вдобавок
+        // закрыть часть позиции вручную, мы закроем ВДВОЕ больше, чем следует.
+        //
+        // Именно поэтому tp_hit/sl_hit (события: «сработало») и partial_close (команда: «фиксирую
+        // руками») — РАЗНЫЕ операции лексикона, и обрабатываются они по-разному. Событие уже
+        // зафиксировано самой строкой actions, ордеров не требует.
         break
+
+      case 'partial_close': {
+        // КОМАНДА: автор закрывает часть позиции руками («фиксирую половину», «закрыл 50%»).
+        // Раньше лежало в одной ветке с событиями выше и было no-op — бот игнорировал прямое
+        // указание автора и держал полный объём, пока тот уже сократил риск.
+        if (suppressPartialClose) {
+          // В сообщении есть и «цель взята», и «зафиксировал» — это одно и то же закрытие,
+          // и наш TP-ордер отработает его сам.
+          console.warn(
+            `[pipeline] ${intent.symbol}: 'partial_close' подавлен — в сообщении есть tp_hit, а на бирже стоит наш TP-ордер (он закроет объём сам)`,
+          )
+          break
+        }
+
+        const instrument = base.instruments.get(intent.symbol)
+        if (!instrument) {
+          gateSkip = 'symbol_not_listed'
+          break
+        }
+
+        // Доля: «половину» → 0.5. Базис — остаток (автор говорит про то, что видит СЕЙЧАС), либо
+        // исходный объём, если модель явно указала basis='original'.
+        const fraction = new Decimal(op.fraction ?? DEFAULT_PARTIAL_CLOSE_FRACTION)
+        const basisSize =
+          op.basis === 'original' && trade?.initial_size != null ? new Decimal(trade.initial_size) : remaining
+
+        // Округляем ВНИЗ к шагу объёма — иначе биржа отвергнет ордер. И не закрываем больше остатка.
+        const closeQty = Decimal.min(floorTo(instrument.qtyStep, basisSize.mul(fraction)), remaining)
+
+        if (closeQty.lte(0)) {
+          gateSkip = 'zero_qty' // остаток меньше шага объёма — «половину» физически нечем закрыть
+          break
+        }
+
+        if (closeQty.gte(remaining)) {
+          // Доля покрыла весь остаток — это уже полный выход, а не фиксация части.
+          await base.deps.executionPort.closePosition(trx, { ...orderCtx, qty: remaining.toString(), seq: closeSeq++ })
+          await closeTrade(trx, { tradeId: position.trade_id })
+          base.postCommit.push({ symbol: intent.symbol, tradeId: position.trade_id })
+          remaining = new Decimal(0)
+          executedOps++
+          break
+        }
+
+        await base.deps.executionPort.closePosition(trx, { ...orderCtx, qty: closeQty.toString(), seq: closeSeq++ })
+        remaining = remaining.minus(closeQty)
+        // Статус «частично закрыта» до этого не писал НИКТО — колонка была мертва, и в UI сделка
+        // после фиксации половины выглядела как обычная открытая.
+        await trx
+          .updateTable('trades')
+          .set({ status: 'partially_closed', updated_at: new Date() })
+          .where('id', '=', position.trade_id)
+          .execute()
+        executedOps++
+        break
+      }
       case 'tp_set':
         // modify_tp (Ф2, AI-канал: "Следующие цели 72.7, 74") — полная замена TP-лесенки.
         // Примитивы по отдельности (не весь `position`) — trade_id уже сужен до string выше
@@ -1071,7 +1582,51 @@ async function handleDelta(
     }
   }
 
+  // Ни одно действие не исполнилось, и причина — рыночный гейт: показываем оператору ПОЧЕМУ
+  // («безубыток пока недостижим»), вместо того чтобы уронить транзакцию об отказ биржи.
+  if (gateSkip !== null && executedOps === 0) return { skipReason: gateSkip }
+
   return { tradeId: position.trade_id, side: position.side, symbol: intent.symbol }
+}
+
+/**
+ * Можно ли вообще поставить такой стоп прямо сейчас.
+ *
+ * Стоп обязан стоять ПО ТУ СТОРОНУ рынка, куда идёт убыток: для лонга — НИЖЕ текущей цены, для шорта
+ * — ВЫШЕ. Иначе он сработал бы мгновенно, и биржа его просто отвергает (retCode 10001
+ * «StopLoss ... should lower than base_price»).
+ *
+ * Самый частый случай — «стоп в безубыток», когда позиция ушла в минус: безубыток оказывается выше
+ * рынка для лонга. Это НЕ ошибка, а нормальная рыночная ситуация. Раньше отказ биржи ронял всю
+ * транзакцию сообщения: оно навсегда оставалось в статусе 'received' и переигрывалось каждые 5 секунд
+ * (живой инцидент: 108 повторов, в UI вечно крутился лоадер «Разбираем сообщение…»).
+ *
+ * `null` — стоп поставить можно. Строка — причина пропуска.
+ *
+ * Без источника цены (dry_run) гейт не применяется: сети там нет, а симулированный стоп никого не
+ * ликвидирует.
+ */
+async function stopLossReachable(
+  base: IntentBase,
+  symbol: string,
+  side: Side,
+  slPrice: string,
+): Promise<string | null> {
+  if (!base.deps.getMarkPrice) return null
+
+  const mark = await base.deps.getMarkPrice(symbol)
+  if (mark === null) return 'mark_price_unavailable' // fail-closed: вслепую стоп не двигаем
+
+  const sl = new Decimal(slPrice)
+  const current = new Decimal(mark)
+  const unreachable = side === 'long' ? sl.gte(current) : sl.lte(current)
+  if (!unreachable) return null
+
+  console.warn(
+    `[pipeline] ${symbol}: стоп ${sl.toString()} по ту сторону рынка (${current.toString()}, ${side}) — ` +
+      `биржа отвергнет такой стоп, пропускаю`,
+  )
+  return 'sl_beyond_market'
 }
 
 /**

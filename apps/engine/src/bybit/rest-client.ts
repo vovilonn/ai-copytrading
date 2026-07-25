@@ -10,6 +10,7 @@
 // вызывающий метод, не общий транспортный слой.
 
 import { createHmac } from 'node:crypto'
+import { createBybitServerClock, type ServerClock } from './server-time.js'
 import type { Network } from 'shared/domain.js'
 
 // 'demo' — Bybit DEMO TRADING (p3-task6-demo): отдельный хост, НЕ testnet и НЕ mainnet.
@@ -52,10 +53,17 @@ const MUTATE_BUCKET_REFILL_PER_SEC = 5
 // position/list поддерживает limit до 200, order/realtime — до 50 (меньше запросов на полный список).
 const POSITIONS_PAGE_LIMIT = 200
 const OPEN_ORDERS_PAGE_LIMIT = 50
+// История (execution/list, order/history, position/closed-pnl) — максимум страницы Bybit V5 = 100.
+// Используется полной реконсиляцией (догон истории после даунтайма): за сутки простоя исполнений
+// заведомо больше одной страницы, поэтому все три эндпоинта ходят через signedGetAllPages.
+const HISTORY_PAGE_LIMIT = 100
 // Жёсткий потолок числа страниц за один вызов — предохранитель от бесконечного цикла, если биржа
 // отдаёт бесконечно меняющийся (баг/аномальный ответ) nextPageCursor. 200×50=10000 позиций /
 // 50×50=2500 ордеров — заведомо выше любого реалистичного объёма demo-аккаунта.
 export const MAX_PAGINATION_PAGES = 50
+
+/** «Invalid request, please check your server timestamp or recv_window param» — рассинхрон часов. */
+const TIMESTAMP_RETCODE = 10002
 
 const RATE_LIMIT_RETCODES = new Set([10006, 10018])
 // "Set leverage has not been modified" (research §2) — идемпотентный успех setLeverage.
@@ -199,6 +207,8 @@ export interface BybitRestClientOptions {
   timeoutMs?: number
   /** Переопределение хоста — только для тестов (мок-сервер), в продакшене не передаётся. */
   baseUrl?: string
+  /** Часы биржи. Инжектируются в тестах; в проде создаются автоматически по host. */
+  clock?: ServerClock
 }
 
 type HttpMethod = 'GET' | 'POST'
@@ -250,17 +260,37 @@ export interface Ticker {
   markPrice: string
 }
 
-/** `GET /v5/order/realtime` (research §9/§14). */
+/**
+ * `GET /v5/order/realtime` (research §9/§14) и `GET /v5/order/history` (терминальные статусы) —
+ * один и тот же shape ордера.
+ *
+ * `parentOrderLinkId` — мост для атрибуции сработавшего trading-stop SL: у филла/ордера,
+ * порождённого биржевым SL позиции, СОБСТВЕННЫЙ `orderLinkId` ПУСТОЙ (мы его не задавали —
+ * ордер создала биржа), а `parentOrderLinkId` указывает на наш ВХОДНОЙ ордер. Это единственное
+ * поле, по которому филл стопа привязывается к сделке; без него закрытие по SL выглядит
+ * «ничьим» исполнением.
+ */
 export interface Order {
   orderId: string
   orderLinkId: string
+  /** Пусто у обычных ордеров; у ордера от сработавшего trading-stop — orderLinkId нашего входа. */
+  parentOrderLinkId?: string
   symbol: string
   side: string
   orderType: string
+  /** 'CreateByUser' | 'CreateByStopLoss' | 'CreateByTakeProfit' | 'CreateByClosing' | ... */
+  createType?: string
   price: string
   qty: string
+  avgPrice?: string
   cumExecQty: string
+  cumExecFee?: string
+  triggerPrice?: string
+  /** 'New' | 'PartiallyFilled' | 'Filled' | 'Cancelled' | 'Rejected' | 'Triggered' | ... */
   orderStatus: string
+  cancelType?: string
+  stopLoss?: string
+  takeProfit?: string
   timeInForce: string
   reduceOnly: boolean
   stopOrderType?: string
@@ -268,7 +298,13 @@ export interface Order {
   updatedTime: string
 }
 
-/** `GET /v5/execution/list` (research §11: атрибуция филлов по orderLinkId/closedSize). */
+/**
+ * `GET /v5/execution/list` (research §11: атрибуция филлов по orderLinkId/closedSize).
+ * Набор полей снят живьём с demo — ровно то, что отдаёт эндпоинт.
+ *
+ * ⚠️ Поля `execPnl` в ответе `/v5/execution/list` НЕТ (проверено живьём): реализованный PnL берётся
+ * из `/v5/position/closed-pnl` (см. ClosedPnl), а не из исполнений. Комиссия филла — `execFee`.
+ */
 export interface Execution {
   symbol: string
   orderId: string
@@ -277,19 +313,105 @@ export interface Execution {
   execId: string
   execPrice: string
   execQty: string
+  execValue: string
+  execFee: string
+  execFeeV2?: string
+  feeCurrency?: string
+  feeRate?: string
+  /** 'Trade' | 'Funding' | 'AdlTrade' | 'BustTrade' | 'Settle' — фильтровать нужно 'Trade'. */
   execType: string
+  /** 'CreateByUser' | 'CreateByStopLoss' | 'CreateByClosing' | ... — источник ордера, породившего филл. */
+  createType?: string
   closedSize: string
   leavesQty: string
   execTime: string
+  /** Монотонная последовательность внутри символа — детерминированная сортировка филлов. */
+  seq: number
+  orderPrice: string
+  orderQty?: string
+  orderType?: string
+  stopOrderType?: string
+  blockTradeId?: string
+  indexPrice?: string
+  markPrice?: string
   isMaker: boolean
 }
 
+/**
+ * `GET /v5/position/closed-pnl` — реализованный PnL закрытых кусков позиции. Поля сняты живьём с demo.
+ *
+ * ⚠️ КЛЮЧЕВАЯ СЕМАНТИКА: `closedPnl` — НЕТТО, комиссии УЖЕ вычтены (открытие + закрытие).
+ * Проверено арифметически на живом ответе:
+ *   closedPnl(-0.03360805) = gross(-0.025) - openFee(0.0043109) - closeFee(0.00429715).
+ * То есть НЕ нужно повторно вычитать openFee/closeFee из closedPnl — это была бы двойная
+ * комиссия. Gross-PnL, если нужен отдельно, восстанавливается как closedPnl + openFee + closeFee.
+ */
+export interface ClosedPnl {
+  symbol: string
+  orderId: string
+  side: string
+  qty: string
+  orderPrice: string
+  orderType: string
+  execType: string
+  closedSize: string
+  cumEntryValue: string
+  avgEntryPrice: string
+  cumExitValue: string
+  avgExitPrice: string
+  /** НЕТТО-PnL: gross - openFee - closeFee (см. комментарий к интерфейсу). */
+  closedPnl: string
+  fillCount: string
+  leverage: string
+  openFee: string
+  closeFee: string
+  createdTime: string
+  updatedTime: string
+}
+
+/**
+ * Общие ограничения ИСТОРИЧЕСКИХ эндпоинтов Bybit V5 (execution/list, order/history,
+ * position/closed-pnl) — проверено живьём:
+ *  - окно ОДНОГО запроса `startTime..endTime` ≤ 7 ДНЕЙ, иначе retCode 10001
+ *    "The time range between startTime and endTime cannot exceed 7 days" → длинный догон
+ *    вызывающая сторона обязана нарезать на окна ≤7д и звать метод по окну;
+ *  - глубина хранения — 2 ГОДА: запрос старше отвечает retCode 10001
+ *    "Can't query order earlier than 2 years";
+ *  - `startTime` ИНКЛЮЗИВНЫЙ (запись ровно с `execTime === startTime` попадёт в выдачу) —
+ *    догон «с последнего обработанного времени» вернёт уже виденную запись, дедуп обязателен
+ *    (execId / orderId — естественные ключи).
+ */
 export interface GetExecutionsParams {
   symbol?: string
   orderId?: string
   orderLinkId?: string
+  /** 'Trade' | 'Funding' | 'AdlTrade' | 'BustTrade' | 'Settle' (без фильтра — все типы). */
+  execType?: string
+  /** Инклюзивный. Окно startTime..endTime ≤ 7 дней (см. комментарий выше). */
   startTime?: number
   endTime?: number
+  /** Размер СТРАНИЦЫ (не общий лимит: пагинация прокручивается полностью). Дефолт/максимум 100. */
+  limit?: number
+}
+
+/** `GET /v5/order/history` — те же временные ограничения, что у GetExecutionsParams. */
+export interface GetOrderHistoryParams {
+  symbol?: string
+  orderLinkId?: string
+  /** Инклюзивный. Окно startTime..endTime ≤ 7 дней. */
+  startTime?: number
+  endTime?: number
+  /** Размер СТРАНИЦЫ (пагинация прокручивается полностью). Дефолт/максимум 100. */
+  limit?: number
+}
+
+/** `GET /v5/position/closed-pnl` — те же временные ограничения, что у GetExecutionsParams. */
+export interface GetClosedPnlParams {
+  symbol?: string
+  /** Инклюзивный. Окно startTime..endTime ≤ 7 дней. */
+  startTime?: number
+  endTime?: number
+  /** Размер СТРАНИЦЫ (пагинация прокручивается полностью). Дефолт/максимум 100. */
   limit?: number
 }
 
@@ -344,12 +466,33 @@ export class BybitRestClient {
   private readonly timeoutMs: number
   private readonly getBucket = new TokenBucket(GET_BUCKET_CAPACITY, GET_BUCKET_REFILL_PER_SEC)
   private readonly mutateBucket = new TokenBucket(MUTATE_BUCKET_CAPACITY, MUTATE_BUCKET_REFILL_PER_SEC)
+  /** Часы БИРЖИ: подпись считается по ним, а не по локальным (см. server-time.ts — дрейф VM
+   *  на 5 секунд молча ломал каждый приватный запрос кодом 10002). */
+  private readonly clock: ServerClock
 
   constructor(opts: BybitRestClientOptions) {
     this.apiKey = opts.apiKey
     this.apiSecret = opts.apiSecret
     this.host = opts.baseUrl ?? HOSTS[opts.network]
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    this.clock = opts.clock ?? createBybitServerClock(this.host)
+  }
+
+  /** Время биржи (локальное + поправка) — им же подписывается auth приватного WS. */
+  serverNowMs(): number {
+    return this.clock.nowMs()
+  }
+
+  /** Явная синхронизация часов с биржей. Зовётся один раз на старте live-рантайма (main.ts):
+   *  после неё поправка сама освежается по TTL перед подписью, а 10002 форсирует внеплановую. */
+  async syncClock(): Promise<number> {
+    await this.clock.sync()
+    return this.clock.offset
+  }
+
+  /** Текущая поправка часов, мс. Для диагностики. */
+  get clockOffsetMs(): number {
+    return this.clock.offset
   }
 
   private async signedGet<T>(path: string, params: Record<string, string | number | boolean | undefined> = {}): Promise<T> {
@@ -429,7 +572,9 @@ export class BybitRestClient {
 
       const headers: Record<string, string> = {}
       if (opts.signed) {
-        const timestamp = String(Date.now())
+        // Поправка часов освежается по TTL — в норме это НОЛЬ сетевых запросов на подпись.
+        await this.clock.ensureFresh()
+        const timestamp = String(this.clock.nowMs())
         const signature = signPayload(this.apiSecret, timestamp, this.apiKey, RECV_WINDOW, isGet ? queryString : jsonBody)
         headers['X-BAPI-API-KEY'] = this.apiKey
         headers['X-BAPI-TIMESTAMP'] = timestamp
@@ -480,6 +625,15 @@ export class BybitRestClient {
               ? Math.min(Math.max(rateLimitInfo.resetTimestamp - Date.now(), 0), MAX_RATE_LIMIT_WAIT_MS)
               : 0
           await sleep(waitForReset + backoffMs(attempt))
+          continue
+        }
+
+        if (body.retCode === TIMESTAMP_RETCODE && attempt < MAX_ATTEMPTS) {
+          // 10002 — «метка времени вне recv_window». Значит наша поправка часов протухла (сон
+          // VM/хоста, скачок NTP). Пересинхронизируемся ПРИНУДИТЕЛЬНО и повторяем: раньше такой
+          // ответ просто бросался наружу, и торговля молча деградировала до перезапуска.
+          lastError = new BybitApiError(`Bybit retCode=${body.retCode} (${body.retMsg}) на ${path}`, body.retCode, body.retMsg)
+          await this.clock.sync()
           continue
         }
 
@@ -538,17 +692,63 @@ export class BybitRestClient {
     return ticker
   }
 
-  /** `GET /v5/execution/list category=linear` (research §11/§14: атрибуция филлов по orderLinkId). */
+  /**
+   * `GET /v5/execution/list category=linear` (research §11/§14: атрибуция филлов по orderLinkId).
+   *
+   * ФИКС (полная реконсиляция): раньше метод читал ТОЛЬКО ПЕРВУЮ страницу (`signedGet` →
+   * `result.list`) и молча выбрасывал `nextPageCursor`. При догоне истории после даунтайма
+   * (сутки простоя) исполнений заведомо больше страницы — часть филлов ТЕРЯЛАСЬ БЕЗ ОШИБКИ, и
+   * реконсиляция считала PnL/позиции по неполному набору. Теперь — signedGetAllPages: курсор
+   * прокручивается до конца (limit=100 — максимум страницы эндпоинта).
+   *
+   * Ограничения окна/глубины (≤7д на запрос, 2 года хранения, инклюзивный startTime) — см.
+   * комментарий к GetExecutionsParams.
+   */
   async getExecutions(params: GetExecutionsParams = {}): Promise<Execution[]> {
     const query: Record<string, string | number> = { category: 'linear' }
     if (params.symbol) query.symbol = params.symbol
     if (params.orderId) query.orderId = params.orderId
     if (params.orderLinkId) query.orderLinkId = params.orderLinkId
+    if (params.execType) query.execType = params.execType
     if (params.startTime !== undefined) query.startTime = params.startTime
     if (params.endTime !== undefined) query.endTime = params.endTime
-    if (params.limit !== undefined) query.limit = params.limit
-    const result = await this.signedGet<{ list: Execution[] }>('/v5/execution/list', query)
-    return result.list
+    return this.signedGetAllPages<Execution>('/v5/execution/list', query, params.limit ?? HISTORY_PAGE_LIMIT)
+  }
+
+  /**
+   * `GET /v5/order/history category=linear` — ТЕРМИНАЛЬНЫЕ статусы ордеров (Filled/Cancelled/
+   * Rejected), которых уже НЕТ в `order/realtime` (тот отдаёт только живые). Нужен полной
+   * реконсиляции: после даунтайма статус ордера, закрывшегося пока движок лежал, восстановим
+   * только отсюда. Пагинация прокручивается полностью (limit=100).
+   *
+   * Ограничения окна/глубины (≤7д на запрос, 2 года хранения, инклюзивный startTime) — см.
+   * комментарий к GetExecutionsParams.
+   */
+  async getOrderHistory(params: GetOrderHistoryParams = {}): Promise<Order[]> {
+    const query: Record<string, string | number> = { category: 'linear' }
+    if (params.symbol) query.symbol = params.symbol
+    if (params.orderLinkId) query.orderLinkId = params.orderLinkId
+    if (params.startTime !== undefined) query.startTime = params.startTime
+    if (params.endTime !== undefined) query.endTime = params.endTime
+    return this.signedGetAllPages<Order>('/v5/order/history', query, params.limit ?? HISTORY_PAGE_LIMIT)
+  }
+
+  /**
+   * `GET /v5/position/closed-pnl category=linear` — реализованный PnL закрытых кусков позиции.
+   * Источник правды по PnL при догоне истории: `execution/list` поля `execPnl` НЕ отдаёт (см.
+   * Execution). Пагинация прокручивается полностью (limit=100).
+   *
+   * ⚠️ `ClosedPnl.closedPnl` — НЕТТО (комиссии уже вычтены), не вычитать openFee/closeFee повторно.
+   *
+   * Ограничения окна/глубины (≤7д на запрос, 2 года хранения, инклюзивный startTime) — см.
+   * комментарий к GetExecutionsParams.
+   */
+  async getClosedPnl(params: GetClosedPnlParams = {}): Promise<ClosedPnl[]> {
+    const query: Record<string, string | number> = { category: 'linear' }
+    if (params.symbol) query.symbol = params.symbol
+    if (params.startTime !== undefined) query.startTime = params.startTime
+    if (params.endTime !== undefined) query.endTime = params.endTime
+    return this.signedGetAllPages<ClosedPnl>('/v5/position/closed-pnl', query, params.limit ?? HISTORY_PAGE_LIMIT)
   }
 
   /**

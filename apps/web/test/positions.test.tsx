@@ -70,6 +70,7 @@ function positionFixture(overrides: Partial<PositionDto> = {}): PositionDto {
     unrealisedPnl: '+$327.60',
     roi: '+6.2%',
     tp: '65500',
+    tps: ['65500'],
     sl: '61500',
     leverage: '5x',
     marginMode: 'Cross',
@@ -262,13 +263,15 @@ describe('PositionsPage', () => {
     }
   })
 
-  it('?tr=#TR-1042 предзаполняет поиск', async () => {
+  it('?tr=#TR-1042 предзаполняет поиск БЕЗ решётки — иначе по нему ничего не находится', async () => {
+    // В UI сделка показана как «#TR-1042» (решётку добавляет бэкенд), но в БД human_ref хранится
+    // без неё и поиск матчит `human_ref ILIKE` — с решёткой переход в позицию открывал пустой список.
     renderPositions([positionFixture()], statsFixture(), '/positions?tr=%23TR-1042')
     await screen.findByText('BTCUSDT')
 
     const input = await screen.findByPlaceholderText('Symbol, channel or #TR-ID…')
     await waitFor(() => {
-      expect(input).toHaveValue('#TR-1042')
+      expect(input).toHaveValue('TR-1042')
     })
   })
 
@@ -311,6 +314,24 @@ describe('PositionsPage', () => {
     expect(screen.getByText('TP')).toBeInTheDocument()
     expect(screen.getByText('Win')).toBeInTheDocument()
     expect(screen.getByText('2h 14m')).toBeInTheDocument()
+  })
+
+  // Регрессия: TP выставляется лесенкой reduce-only лимиток, а не trading-stop'ом позиции, поэтому
+  // positions.take_profit пуст — раньше карточка показывала «TP —» при реально висящих на бирже целях
+  // (в список отложенных reduce-only ордера тоже не попадают by design → TP не было видно НИГДЕ).
+  it('карточка позиции показывает всю активную TP-лесенку, а не одну цель', async () => {
+    renderPositions([positionFixture({ tp: '79.47', tps: ['79.47', '82.52'], sl: '72.59' })])
+    await screen.findByText('BTCUSDT')
+
+    expect(screen.getByText('TP 79.47 / 82.52')).toBeInTheDocument()
+    expect(screen.getByText('SL 72.59')).toBeInTheDocument()
+  })
+
+  it('TP-лесенки нет (TP выставлен на самой позиции) -> показывается TP позиции', async () => {
+    renderPositions([positionFixture({ tp: '65500', tps: [], sl: '61500' })])
+    await screen.findByText('BTCUSDT')
+
+    expect(screen.getByText('TP 65500')).toBeInTheDocument()
   })
 
   it('position.upsert точечно обновляет mark/PnL строки без нового GET /api/positions', async () => {

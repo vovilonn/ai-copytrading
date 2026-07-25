@@ -1,9 +1,10 @@
 import { type QueryKey } from '@tanstack/react-query'
-import { ArrowUpRight, Image as ImageIcon, Sparkles } from 'lucide-react'
+import { ArrowUpRight, Image as ImageIcon, Loader2, Sparkles } from 'lucide-react'
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { actionIconColor, actionSummary } from 'shared/action-meta.js'
-import type { MessageActionDto, MessageDto } from 'shared/dto.js'
+import { isMessagePending, type MessageActionDto, type MessageDto } from 'shared/dto.js'
+import { skipReasonLabel } from 'shared/skip-reason.js'
 import { getActionIcon, isNeedsReviewReason, normalizeTradeRef } from '../lib/action-display.js'
 import { apiFetch } from '../lib/api.js'
 import { useCursorList } from '../lib/use-cursor-list.js'
@@ -83,6 +84,12 @@ function MessageRow({ message }: { message: MessageDto }) {
   const showResultSummary = hasActions && message.method === 'ai' && Boolean(message.aiSummary)
   const showNoteSummary = !hasActions && Boolean(message.aiSummary)
 
+  // Сообщение прилетает в таймлайн СРАЗУ (tg-ingest, status='received'), а действия и AI-саммари
+  // дописывает движок секундами позже — и до этого узел выглядел точно как «шум»: пусто, без следа
+  // разбора. Оператор думал, что бот проигнорировал сигнал, и обновлял страницу. Теперь на их месте
+  // крутится лоадер, а по 'message.updated' (outbox пересобирает узел) он сменяется результатом.
+  const pending = isMessagePending(message.status)
+
   return (
     <div className="relative flex gap-[18px] pb-[26px]" data-testid="message-row">
       <NodeTile actions={message.actions} />
@@ -100,7 +107,9 @@ function MessageRow({ message }: { message: MessageDto }) {
         {/* Блок actions (1..N строк, task-11-brief.md — приёмка Ф1): под сигналом видны все
             распознанные действия сообщения (иконка+тип+пара+ссылка на сделку или Skipped/Needs
             review), design/project/Admin.dc.html:214-226. */}
-        {hasActions ? (
+        {pending ? (
+          <PendingAnalysis />
+        ) : hasActions ? (
           <div className="mt-[11px] flex flex-col gap-2">
             {message.actions.map((action, i) => (
               <ActionRow key={i} action={action} onTradeClick={(ref) => navigate(`/positions?tr=${encodeURIComponent(ref)}`)} />
@@ -127,11 +136,16 @@ function ActionRow({ action, onTradeClick }: { action: MessageActionDto; onTrade
       </span>
       {action.pair ? <span className="font-mono text-[12.5px] leading-none text-muted-2">{action.pair}</span> : null}
       {action.skipReason ? (
-        <span
-          title={action.skipReason}
-          className="inline-flex items-center rounded-[5px] bg-skipped-bg px-2 py-[3px] text-[10.5px] font-bold uppercase tracking-[.04em] text-skipped"
-        >
-          {isNeedsReviewReason(action.skipReason) ? 'Needs review' : 'Skipped'}
+        <span className="inline-flex flex-wrap items-center gap-[6px]">
+          <span
+            title={action.skipReason}
+            className="inline-flex items-center rounded-[5px] bg-skipped-bg px-2 py-[3px] text-[10.5px] font-bold uppercase tracking-[.04em] text-skipped"
+          >
+            {isNeedsReviewReason(action.skipReason) ? 'Needs review' : 'Skipped'}
+          </span>
+          {/* Причина текстом, а не только в подсказке: раньше оператор видел безликое «Skipped» и не
+              понимал, почему сделки нет — «нет стопа» и «символа нет на бирже» выглядели одинаково. */}
+          <span className="text-[11.5px] leading-none text-muted-2">{skipReasonLabel(action.skipReason)}</span>
         </span>
       ) : action.tradeRef ? (
         <button
@@ -242,6 +256,21 @@ function AiSummary({ text, variant }: { text: string; variant: 'result' | 'note'
       >
         {text}
       </span>
+    </div>
+  )
+}
+
+/**
+ * Заглушка на месте действий/саммари, пока движок разбирает сообщение.
+ *
+ * Без неё узел свежего сообщения был неотличим от «шума» (пустой), и оператор не понимал, дошёл ли
+ * сигнал до бота: результат появлялся только после перезагрузки страницы.
+ */
+function PendingAnalysis() {
+  return (
+    <div className="mt-[11px] flex items-center gap-[9px]" data-testid="message-pending">
+      <Loader2 size={14} className="flex-none animate-spin text-muted-2" />
+      <span className="text-[12px] leading-none text-muted-2">Parsing message…</span>
     </div>
   )
 }

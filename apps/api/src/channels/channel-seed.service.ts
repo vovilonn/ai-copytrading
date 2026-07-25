@@ -1,22 +1,26 @@
 import { Inject, Injectable, type OnModuleInit } from '@nestjs/common'
-import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
-import { DEFAULT_CHANNEL_SETTINGS } from 'shared/channel-settings.js'
+import { resolveChannelSources, type ChannelSource } from 'shared/sources.js'
+import { DEFAULT_CHANNEL_SETTINGS, TEST_CHANNEL_SETTINGS } from 'shared/channel-settings.js'
 import { DatabaseService } from '../db/database.service.js'
 
 /**
- * Список каналов — единый источник CHANNEL_SOURCES (packages/shared/src/sources.ts), общий с
+ * Список каналов — единый источник (packages/shared/src/sources.ts), общий с
  * apps/tg-ingest/src/ingest.service.ts. Оба сервиса сидируют одни и те же каналы независимо
  * друг от друга: api не имеет доступа к Telegram, чтобы динамически резолвить title/handle,
  * поэтому свой сид оставляет их null. ON CONFLICT(id) DO NOTHING никогда не перезаписывает
  * title/handle/ord, выставленные при первом реальном коннекте tg-ingest, — порядок запуска
  * сервисов не важен.
+ *
+ * resolveChannelSources учитывает TG_CHANNEL_OVERRIDES: в тестовом режиме сидируются ВАШИ каналы
+ * (боевые остаются в БД со своей историей, но новых сообщений в них не приходит — tg-ingest их
+ * не слушает).
  */
 @Injectable()
 export class ChannelSeedService implements OnModuleInit {
   constructor(@Inject(DatabaseService) private readonly database: DatabaseService) {}
 
   async onModuleInit(): Promise<void> {
-    for (const source of CHANNEL_SOURCES) {
+    for (const source of resolveChannelSources(process.env)) {
       await this.seedOne(source)
     }
   }
@@ -52,7 +56,7 @@ export class ChannelSeedService implements OnModuleInit {
       .insertInto('channel_settings')
       .values({
         channel_id: channelId,
-        ...DEFAULT_CHANNEL_SETTINGS,
+        ...(source.isTest ? TEST_CHANNEL_SETTINGS : DEFAULT_CHANNEL_SETTINGS),
         updated_at: now,
       })
       // Не затираем настройки, выставленные оператором из админки после старта.

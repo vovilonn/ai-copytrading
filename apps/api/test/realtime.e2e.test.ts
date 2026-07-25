@@ -6,7 +6,7 @@ import { sql, type Kysely } from 'kysely'
 import type { INestApplication } from '@nestjs/common'
 import { resetTestSchema } from 'test-db'
 import { CHANNEL_SOURCES } from 'shared/sources.js'
-import type { MessageNewPayload } from 'shared/ws-events.js'
+import type { MessageNewPayload, MessageUpdatedPayload } from 'shared/ws-events.js'
 import { createDb, type DB } from '../src/db/database.js'
 import { migrateToLatest } from '../src/db/migrate.js'
 import { createApp } from '../src/app.js'
@@ -120,6 +120,7 @@ describe('realtime gateway', () => {
           aiSummary: null,
           actions: [],
           method: null,
+          status: 'received',
         },
       }
 
@@ -161,6 +162,80 @@ describe('realtime gateway', () => {
           { timeout: 5000, interval: 50 },
         )
         .not.toBeNull()
+    } finally {
+      socket.close()
+    }
+  }, 15_000)
+
+  // Реалтайм разбора: сообщение прилетает в UI сразу (message.new от tg-ingest), а действия и
+  // AI-саммари дописывает движок ПОЗЖЕ. Раньше про это никто фронту не сообщал — узел таймлайна
+  // так и оставался пустым до перезагрузки страницы. Теперь движок шлёт 'message.processed'
+  // (он знает только id), а outbox ПЕРЕСОБИРАЕТ узел и рассылает готовый 'message.updated'.
+  it('message.processed от движка -> клиент получает message.updated с собранными действиями', async () => {
+    const socket = io(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      forceNew: true,
+      extraHeaders: { cookie: sessionCookie },
+    })
+
+    try {
+      await waitForEvent(socket, 'connect', 10_000)
+      socket.emit('channel.subscribe', CHANNEL_ID)
+
+      const msgTs = new Date()
+      const messageRow = await db
+        .insertInto('messages')
+        .values({
+          channel_id: CHANNEL_ID,
+          tg_message_id: 424243,
+          is_topic_message: false,
+          text: '#SOL/USDT LONG',
+          has_media: false,
+          msg_ts: msgTs,
+          raw: JSON.stringify({}),
+          status: 'skipped',
+          status_reason: 'no_SL',
+          method: 'auto',
+        })
+        .returning('id')
+        .executeTakeFirstOrThrow()
+
+      await db
+        .insertInto('actions')
+        .values({
+          message_id: messageRow.id,
+          channel_id: CHANNEL_ID,
+          action_index: 0,
+          type: 'open',
+          side: 'long',
+          symbol: 'SOLUSDT',
+          pair: 'SOLUSDT',
+          method: 'auto',
+          status: 'skipped',
+          skip_reason: 'no_SL',
+        })
+        .execute()
+
+      const eventPromise = waitForEvent<MessageUpdatedPayload>(socket, 'message.updated', 10_000)
+
+      await db
+        .insertInto('domain_events')
+        .values({
+          type: 'message.processed',
+          aggregate: 'message',
+          aggregate_id: messageRow.id,
+          payload: JSON.stringify({ channelId: CHANNEL_ID, messageId: messageRow.id }),
+        })
+        .execute()
+      await sql`SELECT pg_notify('domain_events', '')`.execute(db)
+
+      const received = await eventPromise
+      expect(received.message.id).toBe(messageRow.id)
+      // Узел собран целиком: статус (фронт снимет лоадер) и действие с причиной пропуска.
+      expect(received.message.status).toBe('skipped')
+      expect(received.message.actions).toHaveLength(1)
+      expect(received.message.actions[0]!.skipReason).toBe('no_SL')
     } finally {
       socket.close()
     }

@@ -71,9 +71,13 @@ export type ParsedIntent =
       sl: number
       riskPct?: number
     } // R1 / A
-  | { kind: 'limit_entry'; symbol: string; side: Side; price: number } // B
-  | { kind: 'market_entry'; symbol: string; side: Side } // C
-  | { kind: 'add'; symbol: string; price?: number } // доливка (реш. #6)
+  // B / C. sl/tps/riskPct ОПЦИОНАЛЬНЫ и появились не «на всякий случай»: автор свободного текста
+  // вполне может дать стоп или цели, не давая диапазон входа («беру соль с текущих, стоп 72»).
+  // Раньше эти поля выбрасывались на этапе маппинга AI-выхода, и бот терял авторский стоп, подставляя
+  // вместо него свой синтетический. Теперь: стоп автора — приоритетнее нашего защитного (risk/protective-sl.ts).
+  | { kind: 'limit_entry'; symbol: string; side: Side; price: number; sl?: number; tps?: number[]; riskPct?: number } // B
+  | { kind: 'market_entry'; symbol: string; side: Side; sl?: number; tps?: number[]; riskPct?: number } // C
+  | { kind: 'add'; symbol: string; price?: number; side?: Side } // доливка (реш. #6)
   | { kind: 'delta'; symbol: string | null; ops: DeltaOp[]; targetTradeId?: string } // R3/R4/D/E
 
 // Ф2 (задача 2, normalize-output.ts) добавила 3 варианта поверх Ф1-набора — AI-канал (CH2)

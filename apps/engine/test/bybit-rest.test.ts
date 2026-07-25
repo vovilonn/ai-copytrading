@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, vi } from 'vitest'
 import { createHmac } from 'node:crypto'
 import { BybitApiError, BybitRestClient, MAX_PAGINATION_PAGES, TokenBucket, signPayload } from '../src/bybit/rest-client.js'
+import { ServerClock } from '../src/bybit/server-time.js'
 
 // Тесты Bybit REST-клиента (Ф3, задача 1). Группы:
 //  1) ЖИВЫЕ (READ-only + идемпотентный setLeverage) против testnet — гейт BYBIT_LIVE_TESTS=1
@@ -413,6 +414,215 @@ describe('BybitRestClient — идемпотентные/ошибочные retC
     expect(call).toBe(2)
     expect(urls[0]).toContain('limit=50')
     expect(urls[1]).toContain('cursor=PAGE2')
+  })
+
+  // РЕГРЕССИЯ (полная реконсиляция): getExecutions читал только ПЕРВУЮ страницу и молча ронял
+  // остальные филлы (nextPageCursor игнорировался). При догоне за сутки простоя это тихая потеря
+  // части истории → неверный PnL/позиции. Мок отдаёт курсор на 1-й странице — обязаны прийти ОБА филла.
+  it('getExecutions: прокручивает nextPageCursor и собирает ОБЕ страницы (limit=100, category=linear)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    const urls: string[] = []
+    let call = 0
+    const executions = await withMockFetch(
+      (async (url: unknown) => {
+        urls.push(String(url))
+        call++
+        if (call === 1) {
+          return mockResponse({
+            retCode: 0,
+            retMsg: 'OK',
+            result: {
+              list: [
+                { execId: 'E-1', symbol: 'BTCUSDT', execFee: '0.0043109', execValue: '10', execType: 'Trade', seq: 1 },
+              ],
+              nextPageCursor: 'EXEC_PAGE2',
+            },
+          })
+        }
+        return mockResponse({
+          retCode: 0,
+          retMsg: 'OK',
+          result: {
+            list: [{ execId: 'E-2', symbol: 'BTCUSDT', execFee: '0.00429715', execValue: '10', execType: 'Trade', seq: 2 }],
+            nextPageCursor: '',
+          },
+        })
+      }) as typeof fetch,
+      () => client.getExecutions({ symbol: 'BTCUSDT', startTime: 1_700_000_000_000, endTime: 1_700_086_400_000 }),
+    )
+
+    expect(executions.map((e) => e.execId)).toEqual(['E-1', 'E-2'])
+    expect(call).toBe(2)
+    expect(urls[0]).toContain('/v5/execution/list?')
+    expect(urls[0]).toContain('category=linear')
+    expect(urls[0]).toContain('symbol=BTCUSDT')
+    expect(urls[0]).toContain('startTime=1700000000000')
+    expect(urls[0]).toContain('endTime=1700086400000')
+    expect(urls[0]).toContain('limit=100')
+    expect(urls[0]).not.toContain('cursor=') // первая страница — без курсора
+    expect(urls[1]).toContain('cursor=EXEC_PAGE2') // вторая — прокручен nextPageCursor
+    // Поля из живого ответа не теряются при парсинге (execFee/execValue/seq — нужны реконсиляции).
+    expect(executions[0]).toMatchObject({ execFee: '0.0043109', execValue: '10', execType: 'Trade', seq: 1 })
+  })
+
+  it('getExecutions: execType пробрасывается в query (фильтр Trade против Funding/Settle)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    let capturedUrl: string | undefined
+    await withMockFetch(
+      (async (url: unknown) => {
+        capturedUrl = String(url)
+        return mockResponse({ retCode: 0, retMsg: 'OK', result: { list: [], nextPageCursor: '' } })
+      }) as typeof fetch,
+      () => client.getExecutions({ execType: 'Trade' }),
+    )
+    expect(capturedUrl).toContain('execType=Trade')
+  })
+
+  it('getOrderHistory: путь /v5/order/history, category=linear, пагинация и парсинг терминальных статусов', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    const urls: string[] = []
+    let call = 0
+    const orders = await withMockFetch(
+      (async (url: unknown) => {
+        urls.push(String(url))
+        call++
+        if (call === 1) {
+          return mockResponse({
+            retCode: 0,
+            retMsg: 'OK',
+            result: {
+              list: [{ orderId: 'O-1', orderLinkId: 'K01-1-00-E0', orderStatus: 'Filled', symbol: 'BTCUSDT' }],
+              nextPageCursor: 'HIST_PAGE2',
+            },
+          })
+        }
+        return mockResponse({
+          retCode: 0,
+          retMsg: 'OK',
+          result: {
+            list: [
+              {
+                orderId: 'O-2',
+                orderLinkId: '', // сработавший trading-stop SL: свой orderLinkId ПУСТ...
+                parentOrderLinkId: 'K01-1-00-E0', // ...а мост к нашей сделке — parentOrderLinkId
+                createType: 'CreateByStopLoss',
+                orderStatus: 'Filled',
+                symbol: 'BTCUSDT',
+              },
+            ],
+            nextPageCursor: '',
+          },
+        })
+      }) as typeof fetch,
+      () => client.getOrderHistory({ symbol: 'BTCUSDT', startTime: 1_700_000_000_000 }),
+    )
+
+    expect(orders.map((o) => o.orderId)).toEqual(['O-1', 'O-2'])
+    expect(orders.map((o) => o.orderStatus)).toEqual(['Filled', 'Filled'])
+    expect(call).toBe(2)
+    expect(urls[0]).toContain('/v5/order/history?')
+    expect(urls[0]).toContain('category=linear')
+    expect(urls[0]).toContain('symbol=BTCUSDT')
+    expect(urls[0]).toContain('startTime=1700000000000')
+    expect(urls[0]).toContain('limit=100')
+    expect(urls[1]).toContain('cursor=HIST_PAGE2')
+    expect(orders[1]).toMatchObject({ orderLinkId: '', parentOrderLinkId: 'K01-1-00-E0', createType: 'CreateByStopLoss' })
+  })
+
+  it('getClosedPnl: путь /v5/position/closed-pnl, category=linear, пагинация и парсинг closedPnl (НЕТТО)', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    const urls: string[] = []
+    let call = 0
+    const rows = await withMockFetch(
+      (async (url: unknown) => {
+        urls.push(String(url))
+        call++
+        if (call === 1) {
+          return mockResponse({
+            retCode: 0,
+            retMsg: 'OK',
+            result: {
+              // Живой ответ demo: closedPnl уже НЕТТО — gross(-0.025) - openFee - closeFee.
+              list: [
+                {
+                  symbol: 'BTCUSDT',
+                  orderId: 'O-1',
+                  closedPnl: '-0.03360805',
+                  openFee: '0.0043109',
+                  closeFee: '0.00429715',
+                  closedSize: '0.001',
+                  avgEntryPrice: '100000',
+                  avgExitPrice: '99975',
+                },
+              ],
+              nextPageCursor: 'PNL_PAGE2',
+            },
+          })
+        }
+        return mockResponse({
+          retCode: 0,
+          retMsg: 'OK',
+          result: {
+            list: [{ symbol: 'SOLUSDT', orderId: 'O-2', closedPnl: '1.5', openFee: '0.01', closeFee: '0.01' }],
+            nextPageCursor: '',
+          },
+        })
+      }) as typeof fetch,
+      () => client.getClosedPnl({ startTime: 1_700_000_000_000, endTime: 1_700_086_400_000 }),
+    )
+
+    expect(rows.map((r) => r.orderId)).toEqual(['O-1', 'O-2'])
+    expect(call).toBe(2)
+    expect(urls[0]).toContain('/v5/position/closed-pnl?')
+    expect(urls[0]).toContain('category=linear')
+    expect(urls[0]).toContain('startTime=1700000000000')
+    expect(urls[0]).toContain('endTime=1700086400000')
+    expect(urls[0]).toContain('limit=100')
+    expect(urls[1]).toContain('cursor=PNL_PAGE2')
+
+    // Фиксируем НЕТТО-семантику фактом: closedPnl == gross - openFee - closeFee (живая арифметика demo).
+    const row = rows[0]!
+    const gross = -0.025
+    expect(Number(row.closedPnl)).toBeCloseTo(gross - Number(row.openFee) - Number(row.closeFee), 8)
+  })
+
+  it('retCode 10002 (часы разошлись) → пересинхронизирует часы биржи и повторяет запрос', async () => {
+    // Живой инцидент e2e: после сна ноутбука VM Docker ушла на ~5 секунд, и Bybit начал отвергать
+    // КАЖДЫЙ подписанный запрос — движок молча перестал писать снапшоты баланса. Теперь такой
+    // ответ форсирует синхронизацию часов (bybit/server-time.ts) и повтор, а не пробрасывается наружу.
+    let syncs = 0
+    const clock = new ServerClock(async () => {
+      syncs += 1
+      return Date.now() + 5_000 // сервер на 5 секунд впереди наших часов
+    })
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet', clock })
+
+    const timestamps: string[] = []
+    let call = 0
+    global.fetch = (async (_url: string, init?: RequestInit) => {
+      call++
+      timestamps.push(String((init?.headers as Record<string, string>)['X-BAPI-TIMESTAMP']))
+      if (call === 1) {
+        return mockResponse({
+          retCode: 10002,
+          retMsg: 'invalid request, please check your server timestamp or recv_window param',
+          result: {},
+        })
+      }
+      return mockResponse({
+        retCode: 0,
+        retMsg: 'OK',
+        result: { list: [{ totalEquity: '42', totalAvailableBalance: '42', coin: [] }] },
+      })
+    }) as typeof fetch
+
+    const result = await client.getWalletBalance()
+
+    expect(result.totalEquity).toBe('42')
+    expect(call).toBe(2)
+    expect(syncs).toBe(1) // синхронизация случилась именно из-за 10002
+    // Вторая подпись ушла уже по часам БИРЖИ — метка сдвинулась примерно на поправку.
+    expect(Number(timestamps[1]) - Number(timestamps[0])).toBeGreaterThan(4_000)
   })
 
   it('retCode 10006 (rate limit UID) → ждёт до X-Bapi-Limit-Reset-Timestamp и повторяет успешно', async () => {

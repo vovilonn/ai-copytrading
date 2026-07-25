@@ -215,7 +215,7 @@ export class DryRunAdapter implements ExecutionPort {
   }
 
   async closePosition(tx: Kysely<DB>, params: ClosePositionParams): Promise<{ orderId: string }> {
-    const linkId = buildLinkId(params, 'close', 0)
+    const linkId = buildLinkId(params, 'close', params.seq ?? 0)
 
     const inserted = await tx
       .insertInto('orders')
@@ -285,6 +285,12 @@ export class DryRunAdapter implements ExecutionPort {
     }
 
     return { orderId: inserted.id }
+  }
+
+  /** В dry_run биржи нет — снимать нечего (ордера живут только в нашей таблице, их закрывает
+   *  сам DryRunAdapter). Метод существует ради единого контракта ExecutionPort. */
+  async cancelAllForSymbol(_symbol: string): Promise<void> {
+    // no-op
   }
 
   async cancelOrder(tx: Kysely<DB>, params: CancelOrderParams): Promise<void> {

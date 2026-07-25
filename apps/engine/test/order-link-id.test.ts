@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { orderLinkId } from '../src/execution/order-link-id.js'
+import { isEngineOrderLinkId, orderLinkId } from '../src/execution/order-link-id.js'
 
 // research bybit-execution.md §8 (идемпотентность): orderLinkId ≤36 символов, [A-Za-z0-9_-],
 // детерминирован из координат СООБЩЕНИЯ (не tradeId/orderId — LOOP_STATE.md, ключевая находка).
@@ -169,5 +169,25 @@ describe('orderLinkId', () => {
       legIndex: 0,
     })
     expect(a).not.toBe(b)
+  })
+})
+
+describe('isEngineOrderLinkId — «наш ли это ключ»', () => {
+  it('распознаёт ключи обоих режимов и всех назначений', () => {
+    expect(isEngineOrderLinkId(orderLinkId({ mode: 'live', channelOrd: 1, tgMessageId: 2796, actionIndex: 0, purpose: 'entry', legIndex: 0 }))).toBe(true)
+    expect(isEngineOrderLinkId(orderLinkId({ mode: 'dry_run', channelOrd: 2, tgMessageId: 1, actionIndex: 3, purpose: 'tp', legIndex: 2 }))).toBe(true)
+    expect(isEngineOrderLinkId('K101-45-00-C0')).toBe(true)
+  })
+
+  it('НЕ принимает чужие ключи — от них зависит решение «ручное действие оператора»', () => {
+    // Пустой orderLinkId — сработавший trading-stop; чужой формат — ручной ордер с биржи;
+    // наш уборочный префикс e2e — тоже не ордер движка.
+    expect(isEngineOrderLinkId('')).toBe(false)
+    expect(isEngineOrderLinkId(null)).toBe(false)
+    expect(isEngineOrderLinkId(undefined)).toBe(false)
+    expect(isEngineOrderLinkId('E2ECLEAN-1784993424638-SOLUSDT')).toBe(false)
+    expect(isEngineOrderLinkId('1784993424638')).toBe(false)
+    expect(isEngineOrderLinkId('K101-45-00')).toBe(false) // без кода назначения
+    expect(isEngineOrderLinkId('X101-45-00-C0')).toBe(false) // чужой префикс режима
   })
 })

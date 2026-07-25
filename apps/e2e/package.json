@@ -1,0 +1,23 @@
+{
+  "name": "e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "api": "workspace:*",
+    "decimal.js": "^10.6.0",
+    "dotenv": "^16.4.0",
+    "engine": "workspace:*",
+    "kysely": "^0.28.0",
+    "pg": "^8.13.0",
+    "shared": "workspace:*",
+    "telegram": "^2.26.22",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.7.0"
+  }
+}

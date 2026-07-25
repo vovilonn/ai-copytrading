@@ -9,6 +9,7 @@ import { TableStateRow } from '../components/TableStateRow.js'
 import { Card } from '../components/ui/card.js'
 import { Input } from '../components/ui/input.js'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table.js'
+import { skipReasonLabel } from 'shared/skip-reason.js'
 import { getActionIcon, isNeedsReviewReason, normalizeTradeRef } from '../lib/action-display.js'
 import { apiFetch } from '../lib/api.js'
 import { type Cursor, useCursorList } from '../lib/use-cursor-list.js'
@@ -252,11 +253,15 @@ function ActionTableRow({ action, onChannelClick, onTradeClick }: ActionTableRow
       <TableCell className="max-w-[300px] text-[12.5px] text-secondary-2">{action.summary}</TableCell>
       <TableCell>
         {action.skipReason ? (
-          <span
-            title={action.skipReason}
-            className="inline-flex items-center rounded-[5px] bg-skipped-bg px-2 py-[3px] text-[10.5px] font-bold uppercase tracking-[.04em] text-skipped"
-          >
-            {isNeedsReviewReason(action.skipReason) ? 'Needs review' : 'Skipped'}
+          <span className="inline-flex flex-wrap items-center gap-[6px]">
+            <span
+              title={action.skipReason}
+              className="inline-flex items-center rounded-[5px] bg-skipped-bg px-2 py-[3px] text-[10.5px] font-bold uppercase tracking-[.04em] text-skipped"
+            >
+              {isNeedsReviewReason(action.skipReason) ? 'Needs review' : 'Skipped'}
+            </span>
+            {/* Причина видна сразу, а не только в подсказке при наведении. */}
+            <span className="text-[11.5px] leading-none text-muted-2">{skipReasonLabel(action.skipReason)}</span>
           </span>
         ) : action.tradeRef ? (
           <button

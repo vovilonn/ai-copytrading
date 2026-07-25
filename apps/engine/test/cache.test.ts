@@ -125,3 +125,4 @@ describe('getCached / putCached (round-trip, copytrade_test)', () => {
     expect(rows).toHaveLength(1)
   })
 })
+

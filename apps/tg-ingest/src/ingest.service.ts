@@ -1,7 +1,6 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { fileURLToPath } from 'node:url'
 import { TelegramClient, Api } from 'telegram'
 import { StringSession } from 'telegram/sessions/index.js'
 import { NewMessage, type NewMessageEvent, Raw } from 'telegram/events/index.js'
@@ -25,14 +24,16 @@ import {
 } from './repository.js'
 import { withDownloadRetry } from './retry.js'
 import { MediaRepairService, type MediaFetcher, type DownloadedMediaResult } from './media-repair.js'
-import { CHANNEL_SOURCES, type ChannelSource } from 'shared/sources.js'
+import { resolveChannelSources, type ChannelSource } from 'shared/sources.js'
 import type { MessageNewPayload, MessageUpdatedPayload } from 'shared/ws-events.js'
 import { mediaUrl } from 'shared/media.js'
-import { DEFAULT_CHANNEL_SETTINGS } from 'shared/channel-settings.js'
+import { DEFAULT_CHANNEL_SETTINGS, TEST_CHANNEL_SETTINGS } from 'shared/channel-settings.js'
 
-// var/media лежит в корне репозитория, а не в apps/tg-ingest — путь считаем от расположения
-// этого модуля (устойчиво к тому, из какого cwd запущен процесс), как и scripts/tg-dump.mjs.
-const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url))
+// Префикс, под которым путь к файлу хранится в БД (message_media.storage_path) — ОТНОСИТЕЛЬНЫЙ,
+// его же снимают api (media.controller.ts) и engine (ai/context.ts) перед резолвом от своего корня.
+// Сам корень на диске — config.mediaRoot (MEDIA_ROOT), а НЕ «N уровней вверх от import.meta.url»:
+// в прод-образе `pnpm deploy --prod` сплющивает apps/tg-ingest/src → src, и вычисляемый корень
+// уезжал за пределы /app (медиа молча писалось в несуществующий /var/media). См. config.schema.ts.
 const MEDIA_ROOT_REL = 'var/media'
 
 // Окно склейки альбома — см. docs/superpowers/research/telegram-ingestion.md §2.
@@ -82,6 +83,25 @@ interface PreparedMember {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
+/**
+ * Потолок на один проход бэкфилла. Полный догон истории двух каналов с нуля укладывается в
+ * единицы минут; всё, что дольше, — это уже не «медленно», а «висит».
+ */
+const BACKFILL_PASS_TIMEOUT_MS = 5 * 60_000
+
+/**
+ * Отпускает ожидание по дедлайну. Сам зависший промис не отменяется (GramJS не принимает
+ * AbortSignal) — но перестаёт держать single-flight-слот: следующий проход стартует заново.
+ * Отклонение промиса-победителя ловят вызывающие (все зовут backfillAll с .catch(logError)).
+ */
+export function withDeadline<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}: превышен потолок ${timeoutMs} мс — проход отпущен`)), timeoutMs)
+  })
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer)) as Promise<T>
+}
+
 /** Снимок сообщения для колонки messages.raw — только скалярные поля, без циклических ссылок
  *  на client/entities, которые GramJS развешивает на объекте после _finishInit. */
 function snapshotMessage(msg: Api.Message): Record<string, unknown> {
@@ -112,16 +132,55 @@ function entityHandle(entity: ResolvedEntity): string | null {
   return 'username' in entity && typeof entity.username === 'string' ? entity.username : null
 }
 
+/**
+ * Фронт-детектор реконнекта поверх UpdateConnectionState.
+ *
+ * `connected` — это УРОВЕНЬ («связь есть»), а НЕ ФРОНТ («только что переподключились»), и GramJS
+ * 2.26.x переподтверждает уровень КАЖДЫЕ 9 секунд на полностью здоровом соединении: в
+ * telegram/client/updates.js пинг-луп спит PING_INTERVAL=9000, но порог «вернулись из фонового
+ * режима» PING_INTERVAL_TO_WAKE_UP=5000 МЕНЬШЕ периода цикла — поэтому проверка
+ * `lastInterval < PING_INTERVAL_TO_WAKE_UP` ложна на каждой итерации после первой, управление
+ * всегда уходит в ветку «проснулись», и та безусловно шлёт connected после каждого успешного
+ * пинга (баг апстрима, не наш).
+ *
+ * Пока мы реагировали на уровень, каждый такой фантом запускал полный backfillAll: ~19 000
+ * getHistory в сутки вместо 288 (66×) — прямой путь к FloodWait и бану юзербота.
+ *
+ * Реальный реконнект фронт даёт всегда: MTProtoSender._reconnect() первым делом зовёт
+ * _disconnect(), а тот шлёт disconnected до любого await. Фантомный keepalive шлёт connected
+ * без предшествующего разрыва — его и отсекаем.
+ */
+export function createReconnectDetector(onReconnected: () => void): (state: number) => void {
+  let dropped = false
+  return (state: number): void => {
+    if (state !== UpdateConnectionState.connected) {
+      dropped = true // disconnected | broken
+      return
+    }
+    if (!dropped) return // keepalive на живой связи — догонять нечего
+    dropped = false
+    onReconnected()
+  }
+}
+
 export class IngestService {
   private readonly client: TelegramClient
   private readonly albumBuffer: AlbumBuffer<BufferedMessage>
   private readonly resolved = new Map<string, ResolvedSource>() // key: channelId.toString()
   private readonly inFlight = new Set<Promise<void>>()
   private readonly mediaRepair: MediaRepairService
+  /**
+   * Кого реально слушаем. Обычно — боевые CHANNEL_SOURCES; если задан TG_CHANNEL_OVERRIDES, то
+   * ВМЕСТО них ваши тестовые каналы (боевые при этом не слушаются вовсе — иначе живой сигнал
+   * открыл бы реальную сделку посреди теста). См. shared/sources.ts.
+   */
+  private readonly sources: readonly ChannelSource[] = resolveChannelSources(process.env)
   private backfillTimer: NodeJS.Timeout | null = null
+  /** Идущий проход backfillAll (single-flight), либо null. */
+  private backfillInFlight: Promise<void> | null = null
 
   constructor(
-    config: AppConfig,
+    private readonly config: AppConfig,
     private readonly db: Kysely<DB>,
   ) {
     this.client = new TelegramClient(new StringSession(config.tgSession), config.tgApiId, config.tgApiHash, {
@@ -136,7 +195,7 @@ export class IngestService {
     this.albumBuffer = new AlbumBuffer<BufferedMessage>(ALBUM_WINDOW_MS, (batch) => this.trackAlbum(batch))
     // Ремонтный проход (задача 12b) — MediaFetcher реализован ниже (mediaFetcher()) поверх
     // this.client, но MediaRepairService о GramJS ничего не знает (тестируется фейком).
-    this.mediaRepair = new MediaRepairService(this.db, this.mediaFetcher(), CHANNEL_SOURCES)
+    this.mediaRepair = new MediaRepairService(this.db, this.mediaFetcher(), this.sources)
   }
 
   /** Подключение, авторизация, прогрев access_hash, резолв источников и сид channels/channel_settings. */
@@ -153,10 +212,26 @@ export class IngestService {
     // §10 / определение: перед getEntity(id) обязателен разовый getDialogs — иначе нет access_hash.
     await this.withFloodRetry('getDialogs', () => this.client.getDialogs({ limit: 500 }))
 
-    for (const source of CHANNEL_SOURCES) {
-      const entity = await this.resolveEntity(source.channelId)
+    const overridden = process.env.TG_CHANNEL_OVERRIDES?.trim()
+    if (overridden) {
+      console.warn(
+        `[tg-ingest] ⚠️  ТЕСТОВЫЙ РЕЖИМ (TG_CHANNEL_OVERRIDES): боевые каналы НЕ слушаются. Источники: ` +
+          this.sources.map((s) => `${s.channelId}${s.topicId != null ? `/topic ${s.topicId}` : ''} → ${s.adapterId}`).join(', '),
+      )
+    }
+
+    for (const source of this.sources) {
+      const entity = await this.resolveEntity(source.channelId).catch((err: unknown) => {
+        // Самая частая ошибка теста: юзербот не состоит в канале, либо указан id с префиксом -100.
+        throw new Error(
+          `не удалось открыть канал ${source.channelId}: ${(err as Error).message}. ` +
+            `Проверьте, что аккаунт юзербота ДОБАВЛЕН в этот канал/группу, и что id указан «сырым» ` +
+            `(без префикса -100). Список доступных каналов и их id: pnpm tg:chats`,
+        )
+      })
       this.resolved.set(source.channelId.toString(), { source, entity })
       await this.seedChannel(source, entity)
+      console.log(`[tg-ingest] источник: ${entityTitle(entity) ?? source.key} (${source.channelId}) → ${source.adapterId}`)
     }
   }
 
@@ -175,9 +250,28 @@ export class IngestService {
   }
 
   /** Бэкфилл на старте, после реконнекта и периодически — catchUp() в GramJS не восстанавливает
-   *  пропущенные апдейты (§5), поэтому это единственный механизм догнать пропуски. */
+   *  пропущенные апдейты (§5), поэтому это единственный механизм догнать пропуски.
+   *
+   *  Single-flight: зовут три источника (start, реконнект, таймер) — проходы не должны
+   *  накладываться, иначе два getHistory idут по одному курсору одновременно. Пока проход идёт,
+   *  все желающие ждут тот же промис. */
   async backfillAll(): Promise<void> {
-    for (const source of CHANNEL_SOURCES) {
+    // ⚠️ ПОТОЛОК НА ПРОХОД (найдено живым e2e). Single-flight сам по себе — ловушка: если вызов
+    // GramJS внутри прохода зависнет (сокет умер молча, сервер не ответил, а таймаута у invoke
+    // нет), `backfillInFlight` НИКОГДА не обнулится, и ВСЕ последующие попытки — реконнект,
+    // периодический таймер, старт — будут возвращать тот же вечно-pending промис. Воркер тихо
+    // перестаёт догонять историю до перезапуска контейнера; в логе при этом ни одной ошибки.
+    // Наблюдалось живьём: сообщение лежит в Telegram, курсор позади него, в БД его нет.
+    // Ограничение по времени возвращает систему к рабочему состоянию: зависший проход
+    // отпускает слот, следующий стартует с того же курсора (бэкфилл идемпотентен по minId).
+    this.backfillInFlight ??= withDeadline(this.runBackfillAll(), BACKFILL_PASS_TIMEOUT_MS, 'backfillAll').finally(() => {
+      this.backfillInFlight = null
+    })
+    return this.backfillInFlight
+  }
+
+  private async runBackfillAll(): Promise<void> {
+    for (const source of this.sources) {
       try {
         await this.backfillSource(source)
       } catch (err) {
@@ -201,9 +295,14 @@ export class IngestService {
 
   async start(): Promise<void> {
     await this.backfillAll()
-    await this.repairMissingMedia().catch((err) => this.logError('repairMissingMedia (старт)', err))
+    // Под тем же потолком, что и бэкфилл: ремонт медиа ходит в сеть без своего таймаута, а стоит
+    // ДО регистрации realtime-хендлеров — зависнув здесь, воркер не начал бы принимать сообщения
+    // вовсе (найдено адверсариальной проверкой фиксов).
+    await withDeadline(this.repairMissingMedia(), BACKFILL_PASS_TIMEOUT_MS, 'repairMissingMedia').catch((err) =>
+      this.logError('repairMissingMedia (старт)', err),
+    )
 
-    const chats = CHANNEL_SOURCES.map((s) => Number(s.channelId))
+    const chats = this.sources.map((s) => Number(s.channelId))
 
     const onIncoming = (event: NewMessageEvent | EditedMessageEvent): void => this.enqueue(event.message)
     this.client.addEventHandler(onIncoming, new NewMessage({ chats }))
@@ -217,12 +316,13 @@ export class IngestService {
     )
 
     // UpdateConnectionState не имеет chatId, поэтому фильтруется по типу, а не по chats (§5, §8).
+    // Догоняем строго по ФРОНТУ разрыва — почему не по уровню, см. createReconnectDetector.
+    const onConnectionState = createReconnectDetector(() => {
+      console.warn('[tg-ingest] реконнект: соединение восстановлено, догоняем бэкфиллом')
+      this.backfillAll().catch((err) => this.logError('backfillAll (reconnect)', err))
+    })
     this.client.addEventHandler(
-      (update: UpdateConnectionState) => {
-        if (update.state !== UpdateConnectionState.connected) return
-        console.warn('[tg-ingest] реконнект: соединение восстановлено, догоняем бэкфиллом')
-        this.backfillAll().catch((err) => this.logError('backfillAll (reconnect)', err))
-      },
+      (update: UpdateConnectionState) => onConnectionState(update.state),
       new Raw({ types: [UpdateConnectionState] }),
     )
 
@@ -290,7 +390,7 @@ export class IngestService {
       .insertInto('channel_settings')
       .values({
         channel_id: channelId,
-        ...DEFAULT_CHANNEL_SETTINGS,
+        ...(source.isTest ? TEST_CHANNEL_SETTINGS : DEFAULT_CHANNEL_SETTINGS),
         updated_at: new Date(),
       })
       // Сид не должен затирать настройки, выставленные оператором из админки после старта.
@@ -405,6 +505,10 @@ export class IngestService {
             aiSummary: null,
             actions: [],
             method: null,
+            // Сообщение только что записано — движок его ещё не разбирал. Таймлайн по этому статусу
+            // покажет лоадер на месте действий/саммари, вместо пустоты, неотличимой от «шума»;
+            // финальный статус приедет отдельным 'message.updated' (outbox, после разбора).
+            status: 'received',
           },
         }
         return { type: kind === 'new' ? 'message.new' : 'message.updated', aggregate: 'message', payload }
@@ -518,7 +622,7 @@ export class IngestService {
     if (!buffer || typeof buffer === 'string' || buffer.length === 0) return null
 
     const relPath = path.posix.join(MEDIA_ROOT_REL, source.key, `${msg.id}_${orderIndex}.jpg`)
-    const absPath = path.join(REPO_ROOT, relPath)
+    const absPath = path.join(this.config.mediaRoot, source.key, `${msg.id}_${orderIndex}.jpg`)
     await fs.mkdir(path.dirname(absPath), { recursive: true })
     await fs.writeFile(absPath, buffer)
 

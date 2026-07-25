@@ -7,7 +7,7 @@ import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
 import type { Network } from 'shared/domain.js'
 import { createExecutionPort, type ExecutionPort } from './execution/port.js'
-import { BybitRestClient } from './bybit/rest-client.js'
+import { BybitApiError, BybitRestClient } from './bybit/rest-client.js'
 import { BybitPrivateWs } from './bybit/private-ws.js'
 import { reconcileOnStart, type ReconcileResult } from './bybit/reconcile.js'
 import { getEquity } from './state/equity.js'
@@ -117,7 +117,50 @@ async function processChannel(db: Kysely<DB>, channelId: number, deps: PipelineD
       mediaKind: row.media_kind,
       msgTs: row.msg_ts,
     }
-    await processMessage(db, message, deps)
+    try {
+      await processMessage(db, message, deps)
+    } catch (err) {
+      // ЯДОВИТОЕ СООБЩЕНИЕ. Транзакция processMessage откатилась целиком — статус сообщения остался
+      // 'received', и следующий тик (каждые 5 секунд) возьмёт его снова. Если отказ ПОСТОЯННЫЙ, это
+      // вечный цикл: живой инцидент — «стоп в безубыток» на убыточной позиции, Bybit отвергал стоп
+      // (retCode 10001), сообщение переигрывалось 108 раз, а в UI вечно крутился лоадер.
+      //
+      // Отличаем отказ БИРЖИ ПО СУЩЕСТВУ (retCode: цена стопа невалидна, ордер не существует, …) от
+      // транзиентного сбоя (сеть/БД). Первый ретраить бессмысленно — сообщение уходит в needs_review
+      // с причиной, оператор видит его в UI. Второй оставляем в 'received': следующий тик повторит.
+      if (err instanceof BybitApiError) {
+        console.error(
+          `[engine] биржа отвергла исполнение сообщения ${message.tgMessageId} (retCode=${err.retCode}) — needs_review:`,
+          err.retMsg,
+        )
+        await db.transaction().execute(async (trx) => {
+          await trx
+            .updateTable('messages')
+            .set({
+              status: 'needs_review',
+              status_reason: `exchange_rejected_${err.retCode}`,
+              updated_at: new Date(),
+            })
+            .where('id', '=', message.id)
+            .execute()
+
+          // Иначе в UI навсегда останется лоадер «Разбираем сообщение…»: фронт снимает его по
+          // 'message.updated', который api собирает как раз по этому событию.
+          await trx
+            .insertInto('domain_events')
+            .values({
+              type: 'message.processed',
+              aggregate: 'message',
+              aggregate_id: message.id,
+              payload: JSON.stringify({ channelId: message.channelId, messageId: message.id }),
+            })
+            .execute()
+        })
+        await sql`SELECT pg_notify('domain_events', '')`.execute(db)
+        continue
+      }
+      throw err // сеть/БД — пусть тик упадёт и повторит на следующей итерации
+    }
   }
 }
 
@@ -183,13 +226,38 @@ export async function initLiveRuntime(
   network: Network,
   keys: { apiKey: string; apiSecret: string },
 ): Promise<LiveRuntime> {
-  const reconcileResult = await reconcileOnStart(db, rest)
+  // Сбой реконсиляции на старте НЕ должен ронять движок: раньше исключение отсюда (5xx/таймаут
+  // Bybit, битое поле в ответе) уходило в main().catch → process.exitCode=1 → рестарт → снова
+  // тот же вызов = crash-loop, при котором пайплайн не обрабатывает сообщения вообще. Живём
+  // дальше с неполной сверкой — периодический проход (RECONCILE_INTERVAL_MS) повторит попытку.
+  // Часы биржи — ДО первой подписи: локальные часы контейнера могут уехать (сон хоста/VM), и
+  // тогда КАЖДЫЙ приватный запрос отвергается кодом 10002, а приватный WS не проходит auth —
+  // движок молча слепнет (см. bybit/server-time.ts). Сбой самой синхронизации не критичен:
+  // поправка останется нулевой, а 10002 форсирует повтор.
+  const clockOffsetMs = await rest.syncClock()
+  console.log(`[engine] часы биржи: поправка ${clockOffsetMs} мс`)
+
+  const reconcileResult = await reconcileOnStart(db, rest).catch((err): ReconcileResult => {
+    console.error('[engine] reconcileOnStart не удалась — стартуем без стартовой сверки:', err)
+    return { opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0, phantomsZeroed: 0, degraded: true }
+  })
   console.log(
     `[engine] reconcileOnStart: opened=${reconcileResult.opened} closed=${reconcileResult.closed} ` +
       `flagged=${reconcileResult.flagged} orphansCancelled=${reconcileResult.orphansCancelled} ` +
-      `reattributedExecutions=${reconcileResult.reattributedExecutions}`,
+      `reattributedExecutions=${reconcileResult.reattributedExecutions} ` +
+      `phantomsZeroed=${reconcileResult.phantomsZeroed}` +
+      (reconcileResult.degraded ? ' (DEGRADED: сверка не выполнена)' : ''),
   )
-  const privateWs = new BybitPrivateWs({ apiKey: keys.apiKey, apiSecret: keys.apiSecret, network, db, rest })
+  // nowMs — часы БИРЖИ того же rest-клиента: auth приватного WS подписывается временем, и на
+  // уехавших локальных часах поток молча не поднимается (см. bybit/server-time.ts).
+  const privateWs = new BybitPrivateWs({
+    apiKey: keys.apiKey,
+    apiSecret: keys.apiSecret,
+    network,
+    db,
+    rest,
+    nowMs: () => rest.serverNowMs(),
+  })
   const executionPort = createExecutionPort('live', { rest, network })
   return { executionPort, privateWs, reconcileResult }
 }
@@ -388,16 +456,27 @@ async function main(): Promise<void> {
     // замыканий setInterval (могла бы быть переприсвоена между определением и вызовом) — локальная
     // const убирает необходимость в `!`-assertion и гарантированно не null внутри таймеров.
     const rest = liveRest
+    // Проходы не должны накладываться: сверка ходит в сеть и с догоном истории (окна execution/
+    // order-history/closed-pnl) легко переживёт свой интервал. Тот же приём, что `draining` у tick().
+    let reconciling = false
     reconcileTimer = setInterval(() => {
+      if (reconciling) {
+        console.warn('[engine] реконсиляция ещё идёт — пропускаю тик')
+        return
+      }
+      reconciling = true
       reconcileOnStart(db, rest)
         .then((result) =>
           console.log(
             `[engine] периодическая реконсиляция: opened=${result.opened} closed=${result.closed} ` +
               `flagged=${result.flagged} orphansCancelled=${result.orphansCancelled} ` +
-              `reattributedExecutions=${result.reattributedExecutions}`,
+              `reattributedExecutions=${result.reattributedExecutions} phantomsZeroed=${result.phantomsZeroed}`,
           ),
         )
         .catch((err) => console.error('[engine] периодическая реконсиляция:', err))
+        .finally(() => {
+          reconciling = false
+        })
     }, RECONCILE_INTERVAL_MS)
 
     equityTimer = setInterval(() => {

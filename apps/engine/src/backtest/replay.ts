@@ -300,6 +300,10 @@ export async function replay(options: ReplayOptions): Promise<BacktestReport> {
         equity,
         getMarkPrice: (symbol: string) => kline.klineAt(symbol, tMs),
         maxEntrySlippagePct,
+        // Бэктест — офлайн-инструмент: он гоняет СОТНИ исторических сообщений, и поход в AI на
+        // каждое непонятое означал бы платные вызовы и сетевые таймауты на каждом прогоне.
+        // Такие сообщения попадут в needs_review — видно, что regex их не взял, но денег не стоит.
+        aiEnabled: false,
       }
       try {
         await processMessage(schemaDb, message, deps)

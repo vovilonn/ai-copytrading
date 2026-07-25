@@ -54,6 +54,41 @@ export interface MessageActionDto {
   icon: string // lucide-имя (спека §12, packages/shared/src/action-meta.ts)
 }
 
+/**
+ * Статус обработки сообщения (messages.status). Нужен фронту, чтобы отличить «движок ещё думает»
+ * от «движок решил, что действий нет».
+ *
+ * Без него таймлайн не мог показать загрузку: сообщение прилетает по WS от tg-ingest СРАЗУ
+ * (status='received'), а действия и AI-саммари появляются позже — после разбора движком. Пока их
+ * нет, узел выглядел так же, как обычный «шум», и оператору казалось, что бот проигнорировал сигнал.
+ */
+export type MessageStatus =
+  | 'received'
+  | 'normalized'
+  | 'parsed'
+  | 'decided'
+  | 'executing'
+  | 'executed'
+  | 'skipped'
+  | 'needs_review'
+  | 'noise'
+  | 'failed'
+  | 'archived'
+
+/** Промежуточные статусы: движок ещё разбирает сообщение — действия/саммари только будут. */
+const PENDING_STATUSES: ReadonlySet<MessageStatus> = new Set<MessageStatus>([
+  'received',
+  'normalized',
+  'parsed',
+  'decided',
+  'executing',
+])
+
+/** true, пока сообщение в обработке — таймлайн показывает лоадер на месте действий/саммари. */
+export function isMessagePending(status: MessageStatus): boolean {
+  return PENDING_STATUSES.has(status)
+}
+
 export interface MessageDto {
   id: string
   tgMessageId: number
@@ -63,6 +98,8 @@ export interface MessageDto {
   aiSummary: string | null
   actions: MessageActionDto[] // Ф1: заполняется из actions пайплайна (задача 7), [] — нет сигнала
   method: 'auto' | 'ai' | 'review' | null
+  /** Статус разбора: пока он «в процессе» (isMessagePending), фронт крутит лоадер вместо действий. */
+  status: MessageStatus
 }
 
 // Задача 8: строка таблицы Actions (design/project/Admin.dc.html:306-392) — один action = одна
@@ -105,7 +142,17 @@ export interface PositionDto {
   liq: string | null // не всегда рассчитана биржей (nullable в БД)
   unrealisedPnl: string // '+$327.60' — 0, пока не подключён живой тикер-фид (задача 10)
   roi: string // '+6.2%'
-  tp: string | null // TP-лесенка сворачивается в ближайшую/последнюю цель — здесь не хранится
+  /**
+   * Ближайшая ещё не исполненная цель TP-лесенки (первая из `tps`), либо TP самой позиции
+   * (trading-stop биржи), если лесенки нет. Раньше бралась ТОЛЬКО из positions.take_profit и почти
+   * всегда была null: engine выставляет TP отдельными reduce-only ЛИМИТ-ордерами, а не trading-stop'ом
+   * позиции, поэтому поле биржи пустое — TP не показывался нигде (в список отложенных reduce-only
+   * ордера тоже не попадают by design, см. orders/pending.service.ts).
+   */
+  tp: string | null
+  /** Вся активная TP-лесенка: цены неисполненных reduce-only TP-ордеров, по ходу движения цены
+   *  (long — по возрастанию, short — по убыванию). Пусто, если TP выставлен не ордерами. */
+  tps: string[]
   sl: string | null
   leverage: string // '5x'
   marginMode: 'Cross' | 'Isolated'

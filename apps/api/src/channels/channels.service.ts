@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common'
 import { sql } from 'kysely'
 import { actionIcon } from 'shared/action-meta.js'
-import type { ChannelDto, MessageActionDto, MessageDto } from 'shared/dto.js'
+import type { ChannelDto, MessageActionDto, MessageDto, MessageStatus } from 'shared/dto.js'
 import { mediaUrl } from 'shared/media.js'
 import { formatWinRate } from 'shared/numbers.js'
 import { DatabaseService } from '../db/database.service.js'
@@ -150,6 +150,38 @@ export class ChannelsService {
 
     // Строки messages, входящие в отобранные узлы (для альбома — несколько строк с одним
     // grouped_id: нужны все подписи группы, для одиночного — ровно одна строка).
+    return this.buildMessageNodes(channelId, nodes)
+  }
+
+  /**
+   * Один узел таймлайна по id сообщения. Нужен реалтайму: движок дописывает действия и AI-саммари
+   * УЖЕ ПОСЛЕ того, как сообщение прилетело по WS от tg-ingest, — outbox (realtime/outbox.publisher.ts)
+   * пересобирает узел этим методом и рассылает 'message.updated', чтобы таймлайн обновился на месте,
+   * а не только после перезагрузки страницы.
+   */
+  async getMessageNode(channelId: number, messageId: string): Promise<MessageDto | null> {
+    if (!UUID_RE.test(messageId)) return null // messages.id — UUID; мусор не роняем в 22P02
+
+    const { rows: nodes } = await sql<{ node_key: string; anchor_tg_message_id: number }>`
+      SELECT coalesce(grouped_id, id::text) AS node_key, min(tg_message_id) AS anchor_tg_message_id
+      FROM messages
+      WHERE channel_id = ${channelId}
+        AND coalesce(grouped_id, id::text) = (
+          SELECT coalesce(grouped_id, id::text) FROM messages WHERE id = ${messageId}::uuid
+        )
+      GROUP BY coalesce(grouped_id, id::text)
+    `.execute(this.database.db)
+    if (nodes.length === 0) return null
+
+    const built = await this.buildMessageNodes(channelId, nodes)
+    return built[0] ?? null
+  }
+
+  /** Общая сборка узлов таймлайна (альбом = один узел) — из listMessages и getMessageNode. */
+  private async buildMessageNodes(
+    channelId: number,
+    nodes: readonly { node_key: string; anchor_tg_message_id: number }[],
+  ): Promise<MessageDto[]> {
     const nodeKeys = nodes.map((n) => n.node_key)
     const { rows: messageRows } = await sql<{
       id: string
@@ -160,13 +192,15 @@ export class ChannelsService {
       method: string | null
       media_kind: string | null
       grouped_id: string | null
+      status: MessageStatus
     }>`
-      SELECT id, tg_message_id, msg_ts, text, ai_summary, method, media_kind, grouped_id
+      SELECT id, tg_message_id, msg_ts, text, ai_summary, method, media_kind, grouped_id, status
       FROM messages
       WHERE channel_id = ${channelId}
         AND coalesce(grouped_id, id::text) = ANY(${nodeKeys})
       ORDER BY tg_message_id ASC
     `.execute(this.database.db)
+    if (messageRows.length === 0) return []
 
     const mediaKindByMessageId = new Map(messageRows.map((m) => [m.id, m.media_kind]))
     const media = await this.database.db
@@ -246,6 +280,7 @@ export class ChannelsService {
         aiSummary: anchor.ai_summary,
         actions: groupRows.flatMap((r) => actionsByMessage.get(r.id) ?? []),
         method: anchor.method as MessageDto['method'],
+        status: anchor.status,
       })
     }
     return result

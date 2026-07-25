@@ -106,7 +106,8 @@ beforeAll(async () => {
     })
     .execute()
 
-  // XRP (channel B, long, cross по умолчанию).
+  // XRP (channel B, long, cross по умолчанию). TP выставлен ЛЕСЕНКОЙ reduce-only лимиток — так это
+  // и делает engine (positions.take_profit при этом пуст, см. тест про TP-лесенку ниже).
   await db
     .insertInto('positions')
     .values({
@@ -119,6 +120,98 @@ beforeAll(async () => {
       mark_price: '2',
       leverage: '1',
     })
+    .execute()
+
+  const xrpMsg = await db
+    .insertInto('messages')
+    .values({
+      channel_id: CHANNEL_B_ID,
+      tg_message_id: 9104,
+      is_topic_message: false,
+      text: 'xrp tp ladder seed',
+      has_media: false,
+      msg_ts: new Date(Date.UTC(2026, 6, 10, 8, 0, 0)),
+      raw: JSON.stringify({}),
+    })
+    .returning('id')
+    .executeTakeFirstOrThrow()
+
+  const xrpAction = await db
+    .insertInto('actions')
+    .values({
+      message_id: xrpMsg.id,
+      channel_id: CHANNEL_B_ID,
+      action_index: 0,
+      type: 'open',
+      side: 'long',
+      symbol: 'XRPUSDT',
+      pair: 'XRPUSDT',
+      method: 'auto',
+      status: 'executed',
+      trade_id: tradeXrp.id,
+    })
+    .returning('id')
+    .executeTakeFirstOrThrow()
+
+  await db
+    .insertInto('orders')
+    .values([
+      // Две активные цели — попадают в лесенку (ближайшая для long = меньшая цена).
+      {
+        action_id: xrpAction.id,
+        trade_id: tradeXrp.id,
+        channel_id: CHANNEL_B_ID,
+        symbol: 'XRPUSDT',
+        order_link_id: 'CT-9104-tp2',
+        purpose: 'tp',
+        side: 'long',
+        order_type: 'limit',
+        reduce_only: true,
+        price: '0.68',
+        status: 'submitted',
+      },
+      {
+        action_id: xrpAction.id,
+        trade_id: tradeXrp.id,
+        channel_id: CHANNEL_B_ID,
+        symbol: 'XRPUSDT',
+        order_link_id: 'CT-9104-tp1',
+        purpose: 'tp',
+        side: 'long',
+        order_type: 'limit',
+        reduce_only: true,
+        price: '0.62',
+        status: 'submitted',
+      },
+      // Уже сработавшая цель — в лесенке её быть не должно (она больше не защищает позицию).
+      {
+        action_id: xrpAction.id,
+        trade_id: tradeXrp.id,
+        channel_id: CHANNEL_B_ID,
+        symbol: 'XRPUSDT',
+        order_link_id: 'CT-9104-tp0',
+        purpose: 'tp',
+        side: 'long',
+        order_type: 'limit',
+        reduce_only: true,
+        price: '0.55',
+        status: 'filled',
+      },
+      // Ордер на ВХОД той же сделки — не TP, в лесенку не попадает.
+      {
+        action_id: xrpAction.id,
+        trade_id: tradeXrp.id,
+        channel_id: CHANNEL_B_ID,
+        symbol: 'XRPUSDT',
+        order_link_id: 'CT-9104-entry',
+        purpose: 'entry',
+        side: 'long',
+        order_type: 'limit',
+        reduce_only: false,
+        price: '0.50',
+        status: 'submitted',
+      },
+    ])
     .execute()
 
   // --- Task 2: закрытые/отменённые сделки для /history, расширенной stats и by-channel ---
@@ -307,6 +400,19 @@ describe('GET /api/positions', () => {
     expect(btc.channelId).toBe(CHANNEL_A_ID)
     expect(btc.unrealisedPnl).toBe('+$500.00')
     expect(btc.roi).toBe('+16.7%')
+  })
+
+  // Регрессия: engine выставляет TP отдельными reduce-only ЛИМИТ-ордерами, а не trading-stop'ом
+  // позиции, поэтому positions.take_profit почти всегда пуст. Раньше карточка показывала «TP —» при
+  // реально висящих на бирже целях, а в /api/orders/pending reduce-only ордера не попадают by design
+  // (они «протекторы позиции») — TP не было видно НИГДЕ. Теперь лесенка собирается из orders.
+  it('TP-лесенка позиции собирается из активных reduce-only TP-ордеров (ближайшая цель — в tp)', async () => {
+    const res = await agent.get('/api/positions').expect(200)
+    const rows = res.body as PositionDto[]
+    const xrp = rows.find((p) => p.symbol === 'XRPUSDT')!
+    // long: ближайшая цель — меньшая цена; исполненный TP в лесенку не попадает.
+    expect(xrp.tps).toEqual(['0.62', '0.68'])
+    expect(xrp.tp).toBe('0.62')
   })
 
   it('позиция без unrealised_pnl/position_im (Ф1, нет тикер-фида) — pnl 0, roi 0%, а не NaN/null', async () => {

@@ -67,12 +67,17 @@ services:
       # (127.0.0.1:5173, без TLS). Secure-кука над http браузер тихо не сохранит, и вход
       # сломается без единой видимой ошибки.
       NODE_ENV: development
+      # Корень медиа-хранилища. В prod-образе код лежит в /app/src (pnpm deploy --prod сплющивает
+      # apps/<name>/src → src), поэтому вычислять корень «на N уровней вверх от import.meta.url»
+      # нельзя — глубина вложенности разная в dev и в образе. Задаём явным путём (тот же том, что
+      # у tg-ingest/engine); в dev, где переменной нет, config.schema.ts ищет корень воркспейса.
+      MEDIA_ROOT: /app/var/media
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       # Раздача медиа: GET /api/media/:id (apps/api/src/channels/media.controller.ts) читает
-      # var/media/<key>/... относительно корня репозитория — тот же том, что пишет tg-ingest.
+      # var/media/<key>/... относительно MEDIA_ROOT — тот же том, что пишет tg-ingest.
       - ./var:/app/var
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
@@ -92,14 +97,18 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-copytrade}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-copytrade}
+      # См. комментарий у api: в prod-образе глубина вложенности кода другая, поэтому корень медиа
+      # задаётся явно, а не считается от import.meta.url.
+      MEDIA_ROOT: /app/var/media
     depends_on:
       postgres:
         condition: service_healthy
       api:
         condition: service_started
     volumes:
-      # Медиа (фото/превью видео) пишется сюда воркером — apps/tg-ingest/src/ingest.service.ts,
-      # MEDIA_ROOT_REL = 'var/media', резолвится относительно корня репозитория внутри контейнера.
+      # Медиа (фото/превью видео) пишется сюда воркером — apps/tg-ingest/src/ingest.service.ts:
+      # файл кладётся в MEDIA_ROOT/<key>/..., а в БД (message_media.storage_path) остаётся
+      # относительный путь 'var/media/<key>/...' — его же читают api и engine.
       - ./var:/app/var
     deploy:
       # Ровно одна реплика: воркер MTProto держит единственную сессию Telegram (TG_SESSION) —
@@ -126,9 +135,23 @@ services:
       # там её нет — берёт из служебного .env рядом с этим файлом (тот же .env, что и env_file
       # выше) — поэтому `${EXECUTION_MODE:-dry_run}` безопасен и НЕ меняет поведение по умолчанию.
       EXECUTION_MODE: ${EXECUTION_MODE:-dry_run}
+      # Внутри контейнера 127.0.0.1 (значение из .env) — это САМ engine, а не прокси: все AI-вызовы
+      # падали с ECONNREFUSED (ai_calls.http_status=0), и сообщения ch2 уходили в
+      # needs_review/ai_unavailable вместо исполнения. В сети compose прокси доступен по имени
+      # сервиса. Тот же приём, что и с DATABASE_URL выше: .env не трогаем, переопределяем здесь.
+      AI_PROXY_URL: http://ai-proxy:8317
+      # engine читает картинки сообщения и кладёт их в AI-промпт (apps/engine/src/ai/context.ts) —
+      # тот же корень и тот же том, что у tg-ingest (который их пишет).
+      MEDIA_ROOT: /app/var/media
     depends_on:
       postgres:
         condition: service_healthy
+      ai-proxy:
+        condition: service_healthy
+    volumes:
+      # Картинки для AI-промпта (ai/context.ts:204 читает файл по message_media.storage_path).
+      # Без этого тома engine физически не видел медиа и разбирал сигналы ch2 «вслепую», без графиков.
+      - ./var:/app/var
     deploy:
       # Ровно одна реплика: engine — единственный писатель в trades/orders/positions
       # (ExecutionPort, design spec §14) — вторая реплика продублировала бы обработку сообщений

@@ -31,6 +31,7 @@ function messageFixture(overrides: Partial<MessageDto> = {}): MessageDto {
     aiSummary: null,
     actions: [],
     method: 'auto',
+    status: 'executed',
     ...overrides,
   }
 }
@@ -162,6 +163,7 @@ describe('MessageTimeline', () => {
     renderTimeline([
       messageFixture({
         method: 'auto',
+        status: 'executed',
         aiSummary: 'Текст, который design не должен показывать для auto.',
         actions: [
           { type: 'open', side: 'long', pair: 'BTCUSDT', tradeRef: '#TR-3001', skipReason: null, icon: 'trending-up' },
@@ -282,5 +284,53 @@ describe('MessageTimeline', () => {
     })
     expect(screen.getByText('старое сообщение')).toBeInTheDocument()
     expect(screen.queryByText('узел, которого нет в таймлайне')).toBeNull()
+  })
+})
+
+// Правки по итогам живой эксплуатации: (1) сообщение прилетает по WS сразу, а действия и AI-саммари
+// движок дописывает секундами позже — до этого узел был неотличим от «шума», и оператор перезагружал
+// страницу; (2) у пропущенных действий на экране был безликий бейдж «Skipped» без причины.
+describe('MessageTimeline — разбор в процессе и причины пропуска', () => {
+  it('сообщение ещё разбирается -> лоадер вместо действий/саммари', async () => {
+    renderTimeline([messageFixture({ status: 'received', actions: [], aiSummary: null })])
+
+    expect(await screen.findByTestId('message-pending')).toBeInTheDocument()
+    expect(screen.getByText(/Parsing message/)).toBeInTheDocument()
+  })
+
+  it('разбор закончен -> лоадера нет, видны действия', async () => {
+    renderTimeline([
+      messageFixture({
+        status: 'executed',
+        actions: [{ type: 'open', side: 'long', pair: 'BTCUSDT', tradeRef: '#TR-1', skipReason: null, icon: 'trending-up' }],
+      }),
+    ])
+
+    await screen.findByTestId('timeline-action-row')
+    expect(screen.queryByTestId('message-pending')).not.toBeInTheDocument()
+  })
+
+  it('пропущенное действие показывает ПРИЧИНУ текстом, а не только бейдж Skipped', async () => {
+    renderTimeline([
+      messageFixture({
+        status: 'skipped',
+        actions: [{ type: 'open', side: 'long', pair: 'SOLUSDT', tradeRef: null, skipReason: 'no_SL', icon: 'trending-up' }],
+      }),
+    ])
+
+    await screen.findByText('Skipped')
+    expect(screen.getByText('no stop-loss')).toBeInTheDocument()
+  })
+
+  it('needs_review-причина: бейдж Needs review + расшифровка', async () => {
+    renderTimeline([
+      messageFixture({
+        status: 'needs_review',
+        actions: [{ type: 'open', side: null, pair: null, tradeRef: null, skipReason: 'ai_unavailable', icon: 'trending-up' }],
+      }),
+    ])
+
+    await screen.findByText('Needs review')
+    expect(screen.getByText('AI unavailable')).toBeInTheDocument()
   })
 })

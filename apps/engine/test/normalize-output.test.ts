@@ -388,3 +388,65 @@ describe('normalizeAiOutput', () => {
     expect(result.needsVision).toBe(true)
   })
 })
+
+// Раньше маппинг AI-выхода БЕЗУСЛОВНО выбрасывал stop_loss / take_profits / risk_pct во всех ветках
+// кроме диапазонной: у типов market_entry/limit_entry этих полей просто не было. Из-за этого бот
+// терял АВТОРСКИЙ стоп («беру соль с текущих, стоп 72») и вешал вместо него свой синтетический
+// защитный — то есть менял замысел автора на свой.
+describe('normalize-output — стоп/цели/риск автора не теряются на market/limit входах', () => {
+  it('market_entry со стопом автора -> sl доезжает до intent', () => {
+    const result = normalizeAiOutput(
+      output({
+        message_type: 'entry',
+        actions: [
+          action({
+            type: 'open',
+            symbol: 'SOLUSDT',
+            side: 'long',
+            order_type: 'market',
+            stop_loss: { mode: 'price', value: 72 },
+            take_profits: [{ value: 80 }, { value: 83 }],
+          }),
+        ],
+      }),
+    )
+
+    expect(result.intents).toEqual([
+      { kind: 'market_entry', symbol: 'SOLUSDT', side: 'long', sl: 72, tps: [80, 83] },
+    ])
+  })
+
+  it('limit_entry со стопом и риском автора -> поля доезжают', () => {
+    const result = normalizeAiOutput(
+      output({
+        message_type: 'entry',
+        actions: [
+          action({
+            type: 'open',
+            symbol: 'XRPUSDT',
+            side: 'long',
+            order_type: 'limit',
+            entry: { mode: 'price', price: 1.1 },
+            stop_loss: { mode: 'price', value: 1.0 },
+            risk_pct: 2,
+          }),
+        ],
+      }),
+    )
+
+    expect(result.intents).toEqual([
+      { kind: 'limit_entry', symbol: 'XRPUSDT', side: 'long', price: 1.1, sl: 1.0, riskPct: 2 },
+    ])
+  })
+
+  it('market_entry без стопа -> sl отсутствует (движок повесит свой защитный)', () => {
+    const result = normalizeAiOutput(
+      output({
+        message_type: 'entry',
+        actions: [action({ type: 'open', symbol: 'BTCUSDT', side: 'long', order_type: 'market' })],
+      }),
+    )
+
+    expect(result.intents).toEqual([{ kind: 'market_entry', symbol: 'BTCUSDT', side: 'long' }])
+  })
+})

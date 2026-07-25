@@ -128,6 +128,18 @@ function buildStats(stats: PositionStatsDto): StatDef[] {
   ]
 }
 
+/**
+ * Номер сделки для СТРОКИ ПОИСКА: без ведущей решётки.
+ *
+ * В интерфейсе сделка показывается как «#TR-1273» — решётку добавляет бэкенд (positions.service.ts:
+ * `#${row.human_ref}`), и переход «Trade #TR-1273» с Actions/таймлайна приносил её прямо в поиск.
+ * Но в БД `trades.human_ref` хранится БЕЗ решётки ('TR-1273'), а поиск матчит `human_ref ILIKE`, —
+ * так что запрос «#TR-1273» не находил ничего, и переход в позицию открывал пустой список.
+ */
+function searchQueryFromTradeRef(ref: string): string {
+  return ref.replace(/^#/, '')
+}
+
 // Страница Positions (design/project/Admin.dc.html:394-475) — зеркало Bybit /v5/position/list с
 // живым mark price (engine/src/market-data). Task 4: + вкладки Open/Closed, keyset-пагинация,
 // панели PnL/баланса.
@@ -145,7 +157,7 @@ export default function PositionsPage() {
       (prev) => {
         const next = new URLSearchParams(prev)
         next.delete('tr')
-        next.set('q', tr)
+        next.set('q', searchQueryFromTradeRef(tr))
         return next
       },
       { replace: true },
@@ -157,7 +169,8 @@ export default function PositionsPage() {
   const channel = searchParams.get('channel') ?? 'all'
   const side = searchParams.get('side') ?? 'all'
   const margin = searchParams.get('margin') ?? 'all'
-  const q = searchParams.get('q') ?? searchParams.get('tr') ?? ''
+  const rawTr = searchParams.get('tr')
+  const q = searchParams.get('q') ?? (rawTr !== null ? searchQueryFromTradeRef(rawTr) : '')
 
   function setFilter(key: string, value: string): void {
     setSearchParams(
@@ -392,7 +405,11 @@ function PositionTableRow({ position: p, onSourceClick }: PositionTableRowProps)
       </TableCell>
       <TableCell>
         <span className="flex flex-col gap-[1px] font-mono text-[11px]">
-          <span className="text-long">TP {p.tp ?? '—'}</span>
+          {/* TP выставляется лесенкой reduce-only лимиток — показываем все неисполненные цели
+              (ближайшая первая), а не одну. p.tp — фолбэк на TP самой позиции (trading-stop). */}
+          <span className="text-long" title={p.tps.length > 1 ? `TP targets: ${p.tps.join(', ')}` : undefined}>
+            TP {p.tps.length > 0 ? p.tps.join(' / ') : (p.tp ?? '—')}
+          </span>
           <span className="text-short">SL {p.sl ?? '—'}</span>
         </span>
       </TableCell>

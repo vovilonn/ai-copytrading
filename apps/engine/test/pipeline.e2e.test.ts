@@ -77,7 +77,16 @@ function discoverSymbols(messages: FixtureMessage[]): Set<string> {
 
 let db: Kysely<DB>
 const fixture = loadFixture()
-const deps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '1000' }
+// aiEnabled: false — офлайн-прогон. С тех пор как CH1 отдаёт непонятое в AI (смена формата канала
+// не должна молча терять сигналы), этот тест на 100 реальных сообщениях дёргал бы ai-proxy по сети:
+// платные вызовы и таймауты на каждом запуске CI. Такое сообщение осядет в needs_review — ровно то
+// поведение, которое мы и хотим видеть без доступного AI (ноль ордеров, сигнал не потерян).
+const deps: PipelineDeps = {
+  executionPort: createExecutionPort('dry_run'),
+  network: 'testnet',
+  equity: '1000',
+  aiEnabled: false,
+}
 
 beforeAll(async () => {
   db = createDb(process.env.DATABASE_URL!)

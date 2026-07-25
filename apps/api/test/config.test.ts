@@ -1,3 +1,4 @@
+import path from 'node:path'
 import { describe, it, expect } from 'vitest'
 import { loadConfig } from '../src/config/config.schema.js'
 
@@ -30,4 +31,25 @@ it('BYBIT_NETWORK не задан -> дефолт testnet', () => {
 
 it('падает на невалидном BYBIT_NETWORK', () => {
   expect(() => loadConfig({ ...valid, BYBIT_NETWORK: 'mars' })).toThrow(/BYBIT_NETWORK/)
+})
+
+// Регрессия: раньше каждый потребитель считал корень медиа как «N уровней вверх от import.meta.url»
+// (tg-ingest — 3, api/engine — 4). В прод-образе `pnpm deploy --prod` сплющивает apps/<name>/src → src,
+// корень уезжал за пределы /app в корень ФС — медиа молча писалось в /var/media и терялось.
+describe('mediaRoot', () => {
+  it('MEDIA_ROOT задан -> берётся как есть (абсолютным)', () => {
+    expect(loadConfig({ ...valid, MEDIA_ROOT: '/app/var/media' }).mediaRoot).toBe('/app/var/media')
+  })
+
+  it('MEDIA_ROOT пустой (так лежит в .env.example) -> дефолт от корня воркспейса, не падение', () => {
+    const root = loadConfig({ ...valid, MEDIA_ROOT: '' }).mediaRoot
+    expect(root).toMatch(/var[/\\]media$/)
+    expect(path.isAbsolute(root)).toBe(true)
+  })
+
+  it('MEDIA_ROOT не задан -> дефолт от корня воркспейса', () => {
+    const root = loadConfig(valid).mediaRoot
+    expect(root).toMatch(/var[/\\]media$/)
+    expect(path.isAbsolute(root)).toBe(true)
+  })
 })

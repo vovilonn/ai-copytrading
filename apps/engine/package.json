@@ -2,6 +2,9 @@
   "name": "engine",
   "private": true,
   "type": "module",
+  "exports": {
+    "./*": "./src/*"
+  },
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "test": "vitest run",

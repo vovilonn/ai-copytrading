@@ -114,6 +114,9 @@ function computeRoi(pnl: number, margin: number): string {
   return signedPct((pnl / margin) * 100)
 }
 
+/** Статусы ордера, при которых он ещё «живой» на бирже (не терминальный). */
+const ACTIVE_ORDER_STATUSES = ['created', 'pending_submit', 'submitted', 'partially_filled'] as const
+
 interface PositionQueryRow {
   symbol: string
   side: Side | null
@@ -131,6 +134,8 @@ interface PositionQueryRow {
   channel_key: string
   human_ref: string | null
   margin_mode: string | null
+  /** Цены активных reduce-only TP-ордеров сделки, по возрастанию (NULL, если лесенки нет). */
+  tp_prices: string[] | null
 }
 
 function toPositionDto(row: PositionQueryRow): PositionDto {
@@ -138,19 +143,28 @@ function toPositionDto(row: PositionQueryRow): PositionDto {
   const margin = marginOf(row.size, row.mark_price, row.avg_price, row.position_im, row.leverage)
   const channelName = row.channel_title ?? row.channel_key
 
+  // TP-лесенка идёт по ходу движения цены: у long ближайшая цель — минимальная, у short — максимальная.
+  const side = row.side ?? 'long'
+  const ladder = (row.tp_prices ?? []).map((p) => formatDecimal(p))
+  const tps = side === 'short' ? [...ladder].reverse() : ladder
+  // Позиционный TP (trading-stop) — фолбэк: engine выставляет цели ордерами, но SL/TP, поставленный
+  // на саму позицию (напр. вручную с биржи), тоже должен быть виден.
+  const positionTp = row.take_profit !== null ? formatDecimal(row.take_profit) : null
+
   return {
     id: `${row.channel_id}:${row.symbol}`,
     symbol: row.symbol,
     // side_t nullable в схеме, но при size<>0 её всегда выставляет handleEntrySignal
     // (apps/engine/src/pipeline.ts) вместе с size — 'long' здесь чисто защитный дефолт.
-    side: row.side ?? 'long',
+    side,
     size: formatDecimal(row.size),
     entry: row.avg_price !== null ? formatDecimal(row.avg_price) : '0',
     mark: row.mark_price !== null ? formatDecimal(row.mark_price) : row.avg_price !== null ? formatDecimal(row.avg_price) : '0',
     liq: row.liq_price !== null ? formatDecimal(row.liq_price) : null,
     unrealisedPnl: signedMoney(pnl),
     roi: computeRoi(pnl, margin),
-    tp: row.take_profit !== null ? formatDecimal(row.take_profit) : null,
+    tp: tps[0] ?? positionTp,
+    tps,
     sl: row.stop_loss !== null ? formatDecimal(row.stop_loss) : null,
     leverage: `${row.leverage !== null ? formatDecimal(row.leverage) : '0'}x`,
     marginMode: (row.margin_mode ?? 'cross').toLowerCase() === 'isolated' ? 'Isolated' : 'Cross',
@@ -255,6 +269,19 @@ export class PositionsService {
         'c.key as channel_key',
         't.human_ref as human_ref',
         't.margin_mode as margin_mode',
+        // TP-лесенка позиции. Хранить её в positions нечего: engine выставляет цели отдельными
+        // reduce-only ЛИМИТ-ордерами, а не trading-stop'ом позиции — поэтому positions.take_profit
+        // почти всегда пуст, и TP не показывался НИГДЕ (в /api/orders/pending reduce-only ордера не
+        // попадают by design — они «протекторы позиции», их место как раз здесь).
+        sql<string[] | null>`(
+          SELECT array_agg(o.price::text ORDER BY o.price ASC)
+          FROM orders o
+          WHERE o.trade_id = p.trade_id
+            AND o.purpose = 'tp'
+            AND o.reduce_only = true
+            AND o.price IS NOT NULL
+            AND o.status IN (${sql.join(ACTIVE_ORDER_STATUSES.map((s) => sql.lit(s)))})
+        )`.as('tp_prices'),
       ])
       .where(sql<boolean>`p.size <> 0`)
 

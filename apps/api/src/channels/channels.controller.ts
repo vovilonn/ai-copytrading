@@ -22,7 +22,7 @@ export class ChannelsController {
   @Get(':id')
   async get(@Param('id', ParseIntPipe) id: number): Promise<ChannelDto> {
     const channel = await this.channels.getChannel(id)
-    if (!channel) throw new NotFoundException(`Канал ${id} не найден`)
+    if (!channel) throw new NotFoundException(`Channel ${id} not found`)
     return channel
   }
 

@@ -91,6 +91,14 @@ export interface SetStopLossParams extends OrderContext {
 
 export interface ClosePositionParams extends OrderContext {
   qty: string
+  /**
+   * Порядковый номер ЗАКРЫВАЮЩЕГО ордера внутри одного action (идёт в orderLinkId: ...-C<seq>).
+   *
+   * Без него два closePosition в одном сообщении («фиксирую половину… закрываю остаток») получают
+   * ОДИН orderLinkId — Bybit отвергает дубликат, транзакция сообщения откатывается, и сообщение
+   * переигрывается каждые 5 секунд вечно (ровно тот паттерн, что дал инцидент со 108 повторами).
+   */
+  seq?: number
 }
 
 export interface CancelOrderParams {
@@ -103,6 +111,13 @@ export interface ExecutionPort {
   setStopLoss(tx: Kysely<DB>, params: SetStopLossParams): Promise<{ orderId: string }>
   closePosition(tx: Kysely<DB>, params: ClosePositionParams): Promise<{ orderId: string }>
   cancelOrder(tx: Kysely<DB>, params: CancelOrderParams): Promise<void>
+  /**
+   * Снять ВСЕ висящие ордера символа — reduceOnly-остатки TP/SL после полного закрытия позиции
+   * (research §5: биржа не снимает их сама). Вызывается ПОСЛЕ коммита транзакции сообщения
+   * (pipeline.ts::finalizeClosedPositions), поэтому `tx` не принимает вовсе: это чистый поход в
+   * сеть, ничего в БД не пишет. В dry_run — no-op (биржи нет).
+   */
+  cancelAllForSymbol(symbol: string): Promise<void>
 }
 
 /**

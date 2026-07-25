@@ -56,6 +56,31 @@ const MODE_PREFIX: Readonly<Record<ExecutionMode, string>> = {
 const VALID_CHARS_RE = /^[A-Za-z0-9_-]+$/
 const MAX_LEN = 36
 
+/**
+ * Форма ключа, порождённого ЭТИМ движком: `<K|D><ord2>-<tgMessageId>-<idx2>-<purpose><leg>`
+ * (см. orderLinkId ниже). Держится рядом с генератором намеренно: любой правкой формата ключа
+ * ломается и распознавание — пусть ломается в одном файле.
+ */
+// `\d{2,}` — не ровно две цифры: pad2 добивает НУЛЯМИ ДО двух, но не режет длиннее (ord
+// тестовых каналов = 101, см. shared/sources.ts::OVERRIDE_ORD_OFFSET).
+const ENGINE_LINK_ID_RE = new RegExp(
+  `^[${Object.values(MODE_PREFIX).join('')}]\\d{2,}-\\d+-\\d{2,}-[${Object.values(PURPOSE_CODE).join('')}]\\d+$`,
+)
+
+/**
+ * Наш ли это ключ идемпотентности.
+ *
+ * Нужен атрибуции исполнений (bybit/sync/attribute.ts): пуш филла прилетает по WS за миллисекунды,
+ * а строка `orders` коммитится транзакцией пайплайна чуть позже — лукап по order_link_id в этот
+ * момент промахивается. Без признака «ключ всё-таки НАШ» такой промах уводил исполнение в ветку
+ * «ручное действие оператора», и живой сделке проставлялся manual_override, после чего канал
+ * переставал двигать её стоп. Форма ключа детерминирована и чужими ордерами не воспроизводится.
+ */
+export function isEngineOrderLinkId(orderLinkId: string | null | undefined): boolean {
+  if (!orderLinkId) return false
+  return ENGINE_LINK_ID_RE.test(orderLinkId)
+}
+
 function nonNegativeInt(value: number, label: string): number {
   if (!Number.isInteger(value) || value < 0) {
     throw new Error(`orderLinkId: ${label} должен быть неотрицательным целым, получено ${String(value)}`)

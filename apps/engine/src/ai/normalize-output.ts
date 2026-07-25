@@ -181,15 +181,27 @@ function mapOpenAction(action: ExtractSignalAction): ParsedIntent | null {
     }
   }
 
+  // Стоп/цели/риск, если автор их дал. Раньше эти поля тут ВЫБРАСЫВАЛИСЬ: у типов limit_entry/
+  // market_entry их просто не было, и авторский стоп («беру соль с текущих, стоп 72») терялся —
+  // бот подставлял вместо него свой синтетический защитный. Теперь автор всегда приоритетнее.
+  const authorSl = action.stop_loss !== undefined && action.stop_loss.mode === 'price' ? (action.stop_loss.value ?? null) : null
+  const authorTps = (action.take_profits ?? []).map((tp) => tp.value).filter((v): v is number => v !== undefined && v !== null)
+  const authorRisk = action.risk_pct
+  const optional = {
+    ...(authorSl !== null ? { sl: authorSl } : {}),
+    ...(authorTps.length > 0 ? { tps: authorTps } : {}),
+    ...(authorRisk !== undefined && authorRisk !== null ? { riskPct: authorRisk } : {}),
+  }
+
   if (orderType === 'limit') {
     const price = action.entry?.mode === 'price' ? (action.entry.price ?? null) : null
     if (price === null) return null
-    return { kind: 'limit_entry', symbol: action.symbol, side, price }
+    return { kind: 'limit_entry', symbol: action.symbol, side, price, ...optional }
   }
 
   // 'market' или 'na' (в т.ч. entry.mode='marker'/current_price, "с текущих") — безопасный
   // дефолт: market_entry не требует ни одного числа (research §2 C: "Sol long с текущих").
-  return { kind: 'market_entry', symbol: action.symbol, side }
+  return { kind: 'market_entry', symbol: action.symbol, side, ...optional }
 }
 
 // ---------------------------------------------------------------------------

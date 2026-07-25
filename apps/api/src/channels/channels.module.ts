@@ -12,5 +12,8 @@ import { ChannelStatsService } from './stats.service.js'
   imports: [DbModule],
   controllers: [ChannelsController, ChannelSettingsController, MediaController],
   providers: [ChannelsService, ChannelSettingsService, ChannelSeedService, ChannelStatsService],
+  // RealtimeModule (outbox.publisher.ts) пересобирает узел таймлайна по событию 'message.processed'
+  // от движка — сборка MessageDto живёт здесь, дублировать её в realtime нельзя.
+  exports: [ChannelsService],
 })
 export class ChannelsModule {}

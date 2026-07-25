@@ -305,9 +305,15 @@ describe('applyPositionPush', () => {
     const { tradeId } = await setupTrade(symbol, 'long')
     const { rest, calls } = mockCancelAllRest()
 
+    // Позиция сперва РЕАЛЬНО открывается. Без этого шага flat-пуш больше не считается закрытием:
+    // Bybit шлёт size=0 и в момент открытия (слот заведён, филла ещё нет), и раньше такой пуш
+    // закрывал только что открытую сделку, снимая с неё защитный стоп (см. регрессию ниже).
+    await applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '0.5', seq: 1 }), rest)
+    calls.length = 0
+
     const notified = await applyPositionPush(
       db,
-      buildPositionPush({ symbol, side: 'Sell', size: '0', curRealisedPnl: '12.5', seq: 1 }),
+      buildPositionPush({ symbol, side: 'Sell', size: '0', curRealisedPnl: '12.5', seq: 2 }),
       rest,
     )
 
@@ -408,6 +414,62 @@ describe('applyPositionPush', () => {
     expect(row.size).toBe('10.0000000000')
   })
 
+  it('хвостовой flat-пуш после НАШЕГО закрытия атрибутируется по недавно закрытой сделке (без warn)', async () => {
+    // Пайплайн зануляет зеркало сам, сразу после своего полного закрытия — значит фолбэк
+    // «последняя строка positions с size<>0» до финального пуша не доживает. Без отдельного
+    // фолбэка на недавно закрытую сделку КАЖДОЕ штатное закрытие писало бы в лог предупреждение
+    // «владение символом не найдено», и оно перестало бы что-либо значить.
+    const symbol = 'NEARUSDT'
+    const { tradeId } = await setupTrade(symbol, 'long')
+    const { rest } = mockCancelAllRest()
+
+    await applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '5', seq: 20 }), rest)
+    // Имитируем работу пайплайна: сделка закрыта, владение снято, зеркало обнулено.
+    await db.updateTable('trades').set({ status: 'closed', closed_at: new Date() }).where('id', '=', tradeId).execute()
+    await db.updateTable('symbol_ownership').set({ released_at: new Date() }).where('trade_id', '=', tradeId).execute()
+    await db.updateTable('positions').set({ size: '0' }).where('channel_id', '=', CHANNEL_ID).where('symbol', '=', symbol).execute()
+
+    const applied = await applyPositionPush(db, buildPositionPush({ symbol, side: '', size: '0', seq: 21 }), rest)
+
+    expect(applied).toBe(true) // пуш атрибутирован и применён, а не выброшен с предупреждением
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(row.size).toBe('0.0000000000')
+    expect(Number(row.bybit_seq)).toBe(21)
+  })
+
+  it('КОНКУРЕНТНЫЕ фреймы: устаревший пуш не воскрешает закрытую позицию (водяной знак в самом UPDATE)', async () => {
+    // Живой e2e (3 прогона из 5): позиция закрыта, на бирже пусто — а строка positions осталась с
+    // размером ДО закрытия. Фреймы WS обрабатываются КОНКУРЕНТНО (handleMessage вызывается без
+    // await), и проверка seq отдельным SELECT'ом их не спасает: обе транзакции успевают прочитать
+    // один и тот же старый seq, и та, что коммитится второй, затирает более свежее состояние.
+    // Теперь условие стоит в самом UPDATE — исход детерминирован независимо от порядка коммитов.
+    const symbol = 'AVAXUSDT'
+    await setupTrade(symbol, 'long')
+    const { rest } = mockCancelAllRest()
+
+    await applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '7', markPrice: '30', seq: 10 }), rest)
+
+    // Закрытие (seq=12) и переупорядоченный «живой» пуш (seq=11) — одновременно, в обоих порядках.
+    await Promise.all([
+      applyPositionPush(db, buildPositionPush({ symbol, side: '', size: '0', seq: 12 }), rest),
+      applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '7', markPrice: '30', seq: 11 }), rest),
+    ])
+
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(row.size).toBe('0.0000000000')
+    expect(Number(row.bybit_seq)).toBe(12)
+  })
+
   it('пуш с ТЕМ ЖЕ seq, что уже сохранён (перенос SL/TP не бампает seq биржи) -> всё равно применяется', async () => {
     // Фикс p3-task6-demo (найдено живьём на demo, приёмка UI задачи 6): Bybit не увеличивает
     // seq позиции на переносе SL/TP (`position/trading-stop`) — только на реальных исполнениях.
@@ -432,14 +494,39 @@ describe('applyPositionPush', () => {
     expect(row.stop_loss).toBe('145.0000000000')
   })
 
-  it('символ без владения в БД -> предупреждение, без записи в positions, cancelAll не вызван', async () => {
+  // Регрессия «позиция не видна в UI» (13.07.2026): market-ордер уходит на биржу ИЗНУТРИ ещё не
+  // закоммиченной транзакции pipeline, биржа исполняет его за миллисекунды и шлёт пуш — а этот
+  // обработчик читает БД на другом соединении и незакоммиченного symbol_ownership не видит. Раньше
+  // такой пуш дропался НАВСЕГДА: позиция не попадала в `positions` и становилась не только невидимой
+  // в админке, но и НЕУПРАВЛЯЕМОЙ (pipeline резолвит сделку для дельт через positions.size <> 0).
+  it('пуш пришёл ДО коммита владения символом -> ретрай дожидается и применяет пуш', async () => {
+    const symbol = 'RACEUSDT'
+    const { rest } = mockCancelAllRest()
+
+    // Пуш стартует, когда владения ещё нет — как при живой гонке.
+    const pushPromise = applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '0.1' }), rest)
+
+    // ...а «транзакция pipeline» коммитит владение спустя полсекунды.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    await setupTrade(symbol, 'long')
+
+    expect(await pushPromise).toBe(true)
+
+    const row = await db.selectFrom('positions').selectAll().where('symbol', '=', symbol).executeTakeFirstOrThrow()
+    expect(Number(row.size)).toBe(0.1)
+  }, 20_000)
+
+  // Пуш РЕАЛЬНО чужого символа (ручная торговля с того же аккаунта) обязан быть отброшен, а не
+  // создать фантомную строку в positions. Ретрай атрибуции (гонка «пуш раньше коммита») этот
+  // инвариант не отменяет — лишь откладывает дроп до исчерпания попыток (~6.2с), отсюда timeout.
+  it('символ без владения в БД -> после исчерпания ретраев атрибуции предупреждение, без записи в positions, cancelAll не вызван', async () => {
     const { rest, calls } = mockCancelAllRest()
     const notified = await applyPositionPush(db, buildPositionPush({ symbol: 'UNKNOWNUSDT', side: 'Buy', size: '1' }), rest)
     expect(notified).toBe(false)
     expect(calls).toEqual([])
     const row = await db.selectFrom('positions').selectAll().where('symbol', '=', 'UNKNOWNUSDT').executeTakeFirst()
     expect(row).toBeUndefined()
-  })
+  }, 20_000)
 })
 
 describe('applyExecutionPush', () => {
@@ -538,11 +625,28 @@ describe('applyOrderPush', () => {
     })
   })
 
-  it('неизвестный orderLinkId -> no-op, не бросает, событие не публикуется', async () => {
+  // Как и в applyPositionPush: ордер действительно чужой -> дроп, но уже после ретраев (~6.2с).
+  it('неизвестный orderLinkId -> после исчерпания ретраев no-op, не бросает, событие не публикуется', async () => {
     const notified = await applyOrderPush(db, { symbol: 'BTCUSDT', orderId: 'x', orderLinkId: 'NOSUCH-E0', orderStatus: 'Filled' })
     expect(notified).toBe(false)
     const event = await db.selectFrom('domain_events').selectAll().where('aggregate_id', '=', 'NOSUCH-E0').executeTakeFirst()
     expect(event).toBeUndefined()
+  }, 20_000)
+
+  // Ретрай выше означает, что пуши по одному ордеру могут примениться не в порядке прихода (у
+  // order.linear нет seq-водяного знака, в отличие от position). Задержавшийся 'New' не должен
+  // откатывать уже записанный 'Filled' — иначе cancel_pending попытается отменить исполненный ордер.
+  it('терминальный статус не понижается: задержавшийся New после Filled не откатывает orders.status', async () => {
+    const symbol = 'TERMUSDT'
+    const { tradeId, actionId } = await setupTrade(symbol, 'long')
+    const orderLinkId = 'TR-TERM-E0'
+    await seedOrder({ tradeId, actionId, symbol, side: 'long', orderLinkId })
+
+    await applyOrderPush(db, { symbol, orderId: 'oid-1', orderLinkId, orderStatus: 'Filled' })
+    await applyOrderPush(db, { symbol, orderId: 'oid-1', orderLinkId, orderStatus: 'New' })
+
+    const order = await db.selectFrom('orders').selectAll().where('order_link_id', '=', orderLinkId).executeTakeFirstOrThrow()
+    expect(order.status).toBe('filled')
   })
 })
 
@@ -622,6 +726,11 @@ describe('BybitPrivateWs — диспетчеризация сырых фрей�
     const ws = new BybitPrivateWs({ apiKey: 'k', apiSecret: 's', network: 'testnet', db, rest })
     const dispatch = ws as unknown as { handleMessage(raw: string): Promise<void> }
 
+    // Позиция сперва реально открылась (иначе size=0 — это пуш-стаб момента открытия, а не закрытие).
+    await dispatch.handleMessage(
+      JSON.stringify({ topic: 'position.linear', data: [{ symbol, side: 'Buy', size: '1', seq: 98 }] }),
+    )
+
     await dispatch.handleMessage(
       JSON.stringify({ topic: 'position.linear', data: [{ symbol, side: '', size: '0', seq: 99 }] }),
     )
@@ -645,5 +754,47 @@ describe('BybitPrivateWs — диспетчеризация сырых фрей�
     await dispatch.handleMessage(JSON.stringify({ topic: 'liquidation.linear', data: [{ symbol: 'BTCUSDT' }] }))
 
     expect(logs.some((l) => l.includes('liquidation.linear'))).toBe(true)
+  })
+})
+
+// Регрессия (живой инцидент): Bybit при открытии присылает промежуточный пуш позиции с size=0
+// (слот заведён, филла ещё нет). Раньше он безвредно отбрасывался — владения символом ещё не было.
+// Но с ретраем атрибуции такой пуш ДОЖИДАЕТСЯ коммита и применяется — и код трактовал его как
+// «позиция закрылась»: закрывал сделку, снимал владение и делал cancelAll, СНИМАЯ ЗАЩИТНЫЙ СТОП
+// с только что открытой позиции. BTC остался висеть на плече 20x без стопа.
+describe('applyPositionPush — плоский пуш не закрывает только что открытую сделку', () => {
+  it('пуш size=0, когда открытой позиции в зеркале ещё НЕ БЫЛО -> сделка НЕ закрыта, cancelAll не вызван', async () => {
+    const symbol = 'FLATUSDT'
+    const { tradeId } = await setupTrade(symbol, 'long')
+    const { rest, calls } = mockCancelAllRest()
+
+    // Позиции в зеркале ещё нет (строка positions не создана) — как в момент открытия.
+    await applyPositionPush(db, buildPositionPush({ symbol, side: '', size: '0' }), rest)
+
+    const trade = await db.selectFrom('trades').selectAll().where('id', '=', tradeId).executeTakeFirstOrThrow()
+    expect(trade.status).not.toBe('closed') // сделка жива (после openTrade она 'pending')
+    expect(trade.closed_at).toBeNull()
+    expect(calls).toEqual([]) // защитные ордера НЕ сняты — стоп остался на бирже
+
+    const ownership = await db
+      .selectFrom('symbol_ownership')
+      .selectAll()
+      .where('trade_id', '=', tradeId)
+      .executeTakeFirstOrThrow()
+    expect(ownership.released_at).toBeNull() // символ не освобождён
+  })
+
+  it('пуш size=0 ПОСЛЕ реально открытой позиции -> сделка закрывается (обычное закрытие работает)', async () => {
+    const symbol = 'CLOSEUSDT'
+    const { tradeId } = await setupTrade(symbol, 'long')
+    const { rest } = mockCancelAllRest()
+
+    // Сначала позиция реально открылась...
+    await applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '1', seq: 1 }), rest)
+    // ...а потом закрылась.
+    await applyPositionPush(db, buildPositionPush({ symbol, side: '', size: '0', seq: 2 }), rest)
+
+    const trade = await db.selectFrom('trades').selectAll().where('id', '=', tradeId).executeTakeFirstOrThrow()
+    expect(trade.status).toBe('closed')
   })
 })

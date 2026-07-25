@@ -4,6 +4,7 @@ import { APP_CONFIG } from '../config/config.module.js'
 import type { AppConfig } from '../config/config.schema.js'
 import { DatabaseService } from '../db/database.service.js'
 import type { ServerToClientEvents } from 'shared/ws-events.js'
+import { ChannelsService } from '../channels/channels.service.js'
 import { RealtimeGateway } from './realtime.gateway.js'
 
 const BATCH_SIZE = 100
@@ -34,6 +35,7 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
     @Inject(APP_CONFIG) private readonly config: AppConfig,
     @Inject(DatabaseService) private readonly database: DatabaseService,
     @Inject(RealtimeGateway) private readonly gateway: RealtimeGateway,
+    @Inject(ChannelsService) private readonly channels: ChannelsService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -130,7 +132,7 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
           // комментарий про outbox-инвариант в realtime.e2e.test.ts, task-9-brief §3): при крэше
           // между emit и коммитом клиент в худшем случае получит дубль на следующем тике опроса,
           // а не потеряет событие навсегда, если бы published_at успел закоммититься раньше рассылки.
-          for (const row of rows) this.publishRow(row)
+          for (const row of rows) await this.publishRow(row)
 
           await trx
             .updateTable('domain_events')
@@ -150,15 +152,31 @@ export class OutboxPublisher implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private publishRow(row: { type: string; payload: unknown }): void {
+  private async publishRow(row: { type: string; payload: unknown }): Promise<void> {
     // payload всегда объект с channelId — контракт задачи 9 (MessageNewPayload/ChannelStatsPayload,
     // см. packages/shared/src/ws-events.ts). Строка без channelId — испорченные данные продюсера,
     // а не повод остановить рассылку остального батча.
-    const payload = row.payload as { channelId?: unknown } | null
+    const payload = row.payload as { channelId?: unknown; messageId?: unknown } | null
     if (!payload || typeof payload.channelId !== 'number') {
       this.logger.warn(`событие "${row.type}" без числового channelId в payload — пропускаю рассылку`)
       return
     }
+
+    // 'message.processed' — единственное событие, которое outbox ОБОГАЩАЕТ, а не рассылает как есть.
+    // Движок знает только id сообщения; собрать узел таймлайна (альбом, медиа, действия, саммари)
+    // умеет api. Пересобираем и шлём фронту готовый 'message.updated' — он уже умеет заменять узел
+    // на месте, поэтому действия и AI-саммари появляются без перезагрузки страницы.
+    if (row.type === 'message.processed') {
+      if (typeof payload.messageId !== 'string') {
+        this.logger.warn('событие "message.processed" без messageId — пропускаю рассылку')
+        return
+      }
+      const message = await this.channels.getMessageNode(payload.channelId, payload.messageId)
+      if (!message) return // сообщение удалено между обработкой и рассылкой — терять нечего
+      this.gateway.emitToChannel(payload.channelId, 'message.updated', { channelId: payload.channelId, message })
+      return
+    }
+
     this.gateway.emitToChannel(payload.channelId, row.type as keyof ServerToClientEvents, payload)
   }
 }

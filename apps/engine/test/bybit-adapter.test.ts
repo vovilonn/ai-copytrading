@@ -144,6 +144,7 @@ function createMockRest(): { rest: BybitAdapterRestClient; calls: string[] } {
       calls.push('setTradingStop')
       return { ok: true as const }
     }),
+    cancelAll: vi.fn(async () => ({ ok: true as const })),
     cancelOrder: vi.fn(async (params: { symbol: string; orderLinkId: string }) => {
       calls.push(`cancelOrder:${params.orderLinkId}`)
       return { ok: true as const }
@@ -376,7 +377,8 @@ describe('BybitAdapter.placeEntry — Critical C1: SL атомарно со вх
         throw new Error('Bybit retCode=110017 (qty invalid) на /v5/order/create')
       }),
       setTradingStop: vi.fn(async () => ({ ok: true as const })),
-      cancelOrder: vi.fn(async () => ({ ok: true as const })),
+      cancelAll: vi.fn(async () => ({ ok: true as const })),
+    cancelOrder: vi.fn(async () => ({ ok: true as const })),
     }
     const adapter = new BybitAdapter(rest, 'testnet')
     const ctx = await setupTradeContext('FTMUSDT', 'long')

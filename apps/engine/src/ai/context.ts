@@ -6,22 +6,22 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { fileURLToPath } from 'node:url'
 import { Decimal } from 'decimal.js'
 import { sql, type Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
+import { resolveMediaRoot } from 'api/config/config.schema.js'
 import { serializeOpenPosition, type OpenPositionSummary, type PromptImage } from './prompt.js'
 
-// var/media лежит в корне репозитория (тот же приём, что apps/tg-ingest/src/ingest.service.ts:
-// REPO_ROOT), а не в apps/engine — message_media.storage_path хранится ОТНОСИТЕЛЬНО корня
-// (напр. 'var/media/ch-1962583820-t173666/221437_0.jpg'), путь считаем от расположения ЭТОГО
-// модуля, устойчиво к тому, из какого cwd запущен процесс.
-const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url))
+// message_media.storage_path хранится ОТНОСИТЕЛЬНЫМ ('var/media/<key>/<file>'), а корень на диске
+// берём из MEDIA_ROOT — тот же источник правды, что у tg-ingest (который эти файлы пишет) и api
+// (который их раздаёт). Считать корень «на N уровней вверх от import.meta.url» нельзя: в прод-образе
+// `pnpm deploy --prod` сплющивает apps/engine/src → src, и корень уезжал за пределы /app —
+// картинки не читались, AI разбирал сигналы без графиков. См. config.schema.ts::resolveMediaRoot.
+//
 // Minor #3 адверсариального ревью (p2-final-fix-report.md): контейнмент того же поля
-// message_media.storage_path, что и apps/api/src/channels/media.controller.ts:12-13/28-29 —
-// зеркально тому же приёму (тот же REPO_ROOT-relative формат пути), чтобы кривой/злонамеренный
-// storage_path не читал произвольный файл с диска и не сливал его в тело запроса к ai-proxy.
-const MEDIA_ROOT = path.join(REPO_ROOT, 'var', 'media')
+// message_media.storage_path, что и apps/api/src/channels/media.controller.ts — чтобы кривой/
+// злонамеренный storage_path не прочитал произвольный файл с диска и не слил его в ai-proxy.
+const MEDIA_ROOT = resolveMediaRoot(process.env.MEDIA_ROOT)
 
 /** Минимум полей сообщения, нужных buildContext — не весь `messages`-ряд (задача не должна
  *  тащить в сигнатуру всю таблицу ради 3 колонок). */

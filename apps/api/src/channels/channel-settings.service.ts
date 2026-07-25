@@ -54,13 +54,13 @@ function parseDecimalField(
   { min, max, minInclusive = true }: { min: number; max: number; minInclusive?: boolean },
 ): void {
   if (typeof raw !== 'string' || !DECIMAL_RE.test(raw)) {
-    throw new BadRequestException(`${field}: ожидается десятичное число без знака (например "300" или "10.5")`)
+    throw new BadRequestException(`${field}: expected an unsigned decimal number (e.g. "300" or "10.5")`)
   }
   const n = Number(raw)
   const belowMin = minInclusive ? n < min : n <= min
   if (!Number.isFinite(n) || belowMin || n > max) {
     const lo = minInclusive ? `>= ${min}` : `> ${min}`
-    throw new BadRequestException(`${field}: должно быть ${lo} и <= ${max}`)
+    throw new BadRequestException(`${field}: must be ${lo} and <= ${max}`)
   }
 }
 
@@ -80,10 +80,10 @@ function assertValid(input: UpdateChannelSettingsInput): void {
     parseDecimalField(input.defaultLeverage, 'defaultLeverage', { min: 1, max: 125 })
   }
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') {
-    throw new BadRequestException('enabled должен быть boolean')
+    throw new BadRequestException('enabled must be a boolean')
   }
   if (input.crossMargin !== undefined && typeof input.crossMargin !== 'boolean') {
-    throw new BadRequestException('crossMargin должен быть boolean')
+    throw new BadRequestException('crossMargin must be a boolean')
   }
 }
 
@@ -110,7 +110,7 @@ export class ChannelSettingsService {
       .returningAll()
       .executeTakeFirst()
 
-    if (!updated) throw new NotFoundException(`Канал ${channelId} не найден`)
+    if (!updated) throw new NotFoundException(`Channel ${channelId} not found`)
     return toChannelSettingsDto(updated)
   }
 }
