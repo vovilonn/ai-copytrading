@@ -10,6 +10,7 @@ import {
   saveAlbumWithEvent,
   advanceCursor,
   getCursor,
+  seedChannelRow,
   type AlbumMemberInput,
 } from '../src/repository.js'
 
@@ -378,5 +379,53 @@ describe('saveAlbumWithEvent', () => {
       SELECT count(*) FROM domain_events WHERE aggregate_id = ${created.anchorId} AND type = 'message.updated'
     `.execute(db)
     expect(rows[0]?.count).toBe(1)
+  })
+})
+
+// Водяной знак истории канала (миграция 008). Инцидент прода 25.07.2026: канал засеялся с нулевым
+// курсором, бэкфилл вытянул всю историю, и движок разобрал её как свежие сигналы — 2268 вызовов
+// AI и реальная позиция на mainnet по сообщению семимесячной давности. Знак ставится РОВНО один
+// раз — при первом появлении канала.
+describe('seedChannelRow — водяной знак истории', () => {
+  const base = {
+    ord: 77,
+    key: 'seed-watermark',
+    sourceKind: 'channel' as const,
+    topicId: null,
+    adapterId: 'ch1-structured',
+    title: 'Канал',
+    handle: null,
+  }
+
+  async function watermarkOf(id: number): Promise<number> {
+    const row = await db.selectFrom('channels').select('process_from_message_id').where('id', '=', id).executeTakeFirstOrThrow()
+    return Number(row.process_from_message_id)
+  }
+
+  it('новый канал -> знак равен последнему сообщению на момент подключения', async () => {
+    const id = 990_001
+    await seedChannelRow(db, { ...base, id, ord: 77, key: `k-${id}`, processFromMessageId: 1500 })
+    expect(await watermarkOf(id)).toBe(1500)
+  })
+
+  it('канал уже заведён со знаком -> повторный сид его НЕ трогает (иначе потеряются накопленные сообщения)', async () => {
+    const id = 990_002
+    await seedChannelRow(db, { ...base, id, ord: 78, key: `k-${id}`, processFromMessageId: 1500 })
+    // Рестарт воркера через сутки: в Telegram уже 1800-е сообщение, но 1501..1800 могли прийти,
+    // пока воркер лежал, — их обязан разобрать движок, а не съесть новый водяной знак.
+    await seedChannelRow(db, { ...base, id, ord: 78, key: `k-${id}`, title: 'Новое имя', processFromMessageId: 1800 })
+    expect(await watermarkOf(id)).toBe(1500)
+    const row = await db.selectFrom('channels').select('title').where('id', '=', id).executeTakeFirstOrThrow()
+    expect(row.title).toBe('Новое имя') // название при этом обновляется
+  })
+
+  it('канал создан сидером api (знак 0 — Telegram ему недоступен) -> tg-ingest проставляет знак', async () => {
+    const id = 990_003
+    await sql`INSERT INTO channels (id, ord, key, source_kind, adapter_id)
+              VALUES (${id}, 79, ${'k-' + id}, 'channel', 'ch1-structured')`.execute(db)
+    expect(await watermarkOf(id)).toBe(0)
+
+    await seedChannelRow(db, { ...base, id, ord: 79, key: `k-${id}`, processFromMessageId: 2200 })
+    expect(await watermarkOf(id)).toBe(2200)
   })
 })

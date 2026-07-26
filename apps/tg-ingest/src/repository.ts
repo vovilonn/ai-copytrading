@@ -344,6 +344,64 @@ export async function saveMessageWithEvent(
   })
 }
 
+export interface ChannelSeedRow {
+  id: number
+  ord: number
+  key: string
+  sourceKind: 'channel' | 'forum_topic'
+  topicId: number | null
+  adapterId: string
+  title: string | null
+  handle: string | null
+  /** Последнее сообщение канала в Telegram на момент подключения — граница истории. */
+  processFromMessageId: number
+}
+
+/**
+ * Заводит канал (или обновляет название/хендл уже заведённого) и — ТОЛЬКО при первом появлении —
+ * фиксирует водяной знак истории `process_from_message_id`.
+ *
+ * Почему знак ставится по условию `= 0`, а не безусловно: строку канала мог создать раньше сидер
+ * api (channel-seed.service.ts, onModuleInit) — у него нет доступа к Telegram, поэтому знак там
+ * остаётся нулевым, и ноль означает «граница истории ещё не определена». Уже определённый знак не
+ * трогаем никогда: перезапись при каждом рестарте выбросила бы сообщения, накопившиеся, пока
+ * воркер лежал (движок разбирает только `tg_message_id > process_from_message_id`).
+ */
+export async function seedChannelRow(db: Kysely<DB>, row: ChannelSeedRow): Promise<void> {
+  const now = new Date()
+  await db
+    .insertInto('channels')
+    .values({
+      id: row.id,
+      ord: row.ord,
+      key: row.key,
+      source_kind: row.sourceKind,
+      topic_id: row.topicId,
+      adapter_id: row.adapterId,
+      title: row.title,
+      handle: row.handle,
+      status: 'active',
+      last_seen_message_id: 0,
+      process_from_message_id: row.processFromMessageId,
+      bybit_sub_uid: null,
+      bybit_api_key_enc: null,
+      bybit_api_secret_enc: null,
+      created_at: now,
+      updated_at: now,
+    })
+    .onConflict((oc) =>
+      oc.column('id').doUpdateSet({
+        title: row.title,
+        handle: row.handle,
+        updated_at: now,
+        process_from_message_id: sql<number>`CASE WHEN channels.process_from_message_id = 0
+                                                  THEN ${row.processFromMessageId}
+                                                  ELSE channels.process_from_message_id END`,
+      }),
+    )
+    .execute()
+}
+
 export async function advanceCursor(
   db: Kysely<DB>,
   channelId: number,

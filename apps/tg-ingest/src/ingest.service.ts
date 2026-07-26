@@ -19,6 +19,7 @@ import {
   saveAlbumWithEvent,
   advanceCursor,
   getCursor,
+  seedChannelRow,
   type AlbumMemberInput,
   type IngestMediaInput,
 } from './repository.js'
@@ -355,36 +356,51 @@ export class IngestService {
     return Array.isArray(entity) ? entity[0]! : entity
   }
 
+  /**
+   * Последнее сообщение канала В TELEGRAM на момент подключения — водяной знак обработки
+   * (channels.process_from_message_id, миграция 008).
+   *
+   * Берём по каналу ЦЕЛИКОМ, а не по топику: watermark сравнивается с `tg_message_id`, а он
+   * сквозной для всего форума — id топика тут ничего не сузит, зато занизить водяной знак опаснее,
+   * чем завысить.
+   *
+   * Сбой здесь — не повод стартовать: не зная границы истории, воркер отдал бы движку весь архив
+   * канала как свежие сигналы (ровно инцидент 25.07.2026). connect() и так падает, если канал не
+   * резолвится, — это тот же класс отказа.
+   */
+  private async fetchLastMessageId(source: ChannelSource, entity: ResolvedEntity): Promise<number> {
+    const messages = await this.withFloodRetry(`последнее сообщение ${source.key}`, () =>
+      this.client.getMessages(entity, { limit: 1 }),
+    )
+    const lastId = messages[0]?.id
+    if (typeof lastId !== 'number') {
+      // Пустой канал — истории нет, водяной знак 0 честен: любое будущее сообщение новее.
+      return 0
+    }
+    return lastId
+  }
+
   private async seedChannel(source: ChannelSource, entity: ResolvedEntity): Promise<void> {
     const channelId = Number(source.channelId)
     const title = entityTitle(entity)
     const handle = entityHandle(entity)
-    const now = new Date()
 
-    // channels/channel_settings в DB-типах (apps/api/src/db/database.ts) не обёрнуты в Generated<>,
-    // хотя в схеме у части колонок есть DEFAULT — Kysely в этом случае требует все поля явно
-    // (см. комментарий у messages в database.ts). Значения ниже дублируют DEFAULT из 001_initial.ts.
-    await this.db
-      .insertInto('channels')
-      .values({
-        id: channelId,
-        ord: source.ord,
-        key: source.key,
-        source_kind: source.sourceKind,
-        topic_id: source.topicId,
-        adapter_id: source.adapterId,
-        title,
-        handle,
-        status: 'active',
-        last_seen_message_id: 0,
-        bybit_sub_uid: null,
-        bybit_api_key_enc: null,
-        bybit_api_secret_enc: null,
-        created_at: now,
-        updated_at: now,
-      })
-      .onConflict((oc) => oc.column('id').doUpdateSet({ title, handle, updated_at: new Date() }))
-      .execute()
+    // Граница истории на момент подключения. Применяется только к НОВОМУ каналу — см. seedChannelRow.
+    const processFromMessageId = await this.fetchLastMessageId(source, entity)
+
+    await seedChannelRow(this.db, {
+      id: channelId,
+      ord: source.ord,
+      key: source.key,
+      sourceKind: source.sourceKind,
+      topicId: source.topicId,
+      adapterId: source.adapterId,
+      title,
+      handle,
+      // История канала подтягивается (она нужна оператору и бэктесту), но разбирать её движок не
+      // будет: всё, что было ДО подключения, помечается archived — см. pipeline.ts.
+      processFromMessageId,
+    })
 
     await this.db
       .insertInto('channel_settings')

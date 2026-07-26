@@ -117,6 +117,29 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
       .selectAll()
       .where('id', '=', message.channelId)
       .executeTakeFirstOrThrow()
+    // ИСТОРИЯ КАНАЛА НЕ РАЗБИРАЕТСЯ — самый первый гейт, ДО adapter.parse и до любого вызова AI.
+    //
+    // Живой инцидент (прод, 25.07.2026): новый сервер, каналы засидились с курсором 0, бэкфилл
+    // вытянул всю историю (~3100 сообщений), и движок принял её за свежую: 2268 вызовов AI на
+    // $22.73, а сообщение от 30 декабря 2025 открыло РЕАЛЬНУЮ позицию на mainnet. Сигнал возрастом
+    // в полгода не «поздний» — он бессмысленный: цена ушла, позиция автора давно закрыта.
+    //
+    // Гейт стоит ЗДЕСЬ, а не в выборке `main.ts::processChannel`: фильтр в SELECT оставил бы
+    // исторические строки навсегда в статусе `received`, и поллер перечитывал бы их каждые 5 секунд.
+    // Ранний выход переводит их в терминальный `archived` (миграция 004 завела этот статус ровно
+    // под «вне окна обработки, разбор сознательно не запускался») и публикует событие — фронт
+    // снимает лоадер «Разбираем сообщение…».
+    if (message.tgMessageId <= channel.process_from_message_id) {
+      await trx
+        .updateTable('messages')
+        .set({ status: 'archived', status_reason: 'historical_backlog', updated_at: new Date() })
+        .where('id', '=', message.id)
+        .execute()
+      await emitMessageProcessed(trx, message)
+      notifyNeeded = true
+      return
+    }
+
     const settings = await trx
       .selectFrom('channel_settings')
       .selectAll()

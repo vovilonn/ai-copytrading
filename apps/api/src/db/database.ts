@@ -44,6 +44,13 @@ export interface DB {
     handle: string | null
     status: 'active' | 'paused' | 'error'
     last_seen_message_id: number
+    /**
+     * Последнее ИСТОРИЧЕСКОЕ сообщение канала: движок разбирает только `tg_message_id` СТРОГО
+     * больше этого значения, всё остальное помечает `archived` без разбора и без вызова AI
+     * (миграция 008 — живой инцидент с прогоном всей истории через AI-парсер).
+     * `Generated`, потому что у колонки есть DEFAULT 0: вставке канала её передавать не обязательно.
+     */
+    process_from_message_id: Generated<number>
     bybit_sub_uid: number | null
     bybit_api_key_enc: string | null
     bybit_api_secret_enc: string | null

@@ -62,6 +62,8 @@ interface SeedOpts {
   adapterId?: string
   defaultLeverage?: string | null
   maxLeverage?: string
+  /** Водяной знак истории канала: сообщения с tg_message_id <= него движок не разбирает. */
+  processFromMessageId?: number
 }
 
 async function seedChannel(opts: SeedOpts): Promise<void> {
@@ -79,6 +81,7 @@ async function seedChannel(opts: SeedOpts): Promise<void> {
       handle: null,
       status: 'active',
       last_seen_message_id: 0,
+      process_from_message_id: opts.processFromMessageId ?? 0,
       bybit_sub_uid: null,
       bybit_api_key_enc: null,
       bybit_api_secret_enc: null,
@@ -1013,5 +1016,66 @@ describe('pipeline — фиксация части: остаток, ключи �
     await processMessage(db, await insertMessage(channelId, 2, '#ATOM первая цель есть, зафиксировал 50%'), deps2)
 
     expect(calls).not.toContain('closePosition') // TP-ордер закроет объём сам
+  })
+})
+
+// Водяной знак истории канала (миграция 008). Живой инцидент прода 25.07.2026: новый сервер,
+// каналы засидились с курсором 0, бэкфилл вытянул всю историю (~3100 сообщений), движок принял её
+// за свежую — 2268 вызовов AI на $22.73, а сообщение от 30 декабря 2025 открыло РЕАЛЬНУЮ позицию
+// на mainnet. Гейт обязан стоять ДО разбора: ни парсера, ни модели, ни ордеров.
+describe('pipeline — история канала не разбирается (process_from_message_id)', () => {
+  it('сообщение НЕ новее водяного знака -> archived, ни одного вызова биржи и разбора', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT', processFromMessageId: 500 })
+    const { port, calls } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '1000', aiEnabled: false }
+
+    // Полноценный торговый сигнал: без гейта он бы исполнился (см. тесты выше с этим же текстом).
+    const text = '#ATOM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 500, text)
+    await processMessage(db, message, localDeps)
+
+    const row = await db.selectFrom('messages').selectAll().where('id', '=', message.id).executeTakeFirstOrThrow()
+    expect(row.status).toBe('archived')
+    expect(row.status_reason).toBe('historical_backlog')
+
+    expect(calls).toEqual([])
+    const actions = await db.selectFrom('actions').selectAll().where('channel_id', '=', channelId).execute()
+    expect(actions).toHaveLength(0)
+    // Разбор вообще не запускался — значит нет и строки parse_results (а с ней и повода звать AI).
+    const parses = await db.selectFrom('parse_results').selectAll().where('message_id', '=', message.id).execute()
+    expect(parses).toHaveLength(0)
+    // Событие опубликовано: иначе в UI навсегда остался бы лоадер «Разбираем сообщение…».
+    const events = await db.selectFrom('domain_events').selectAll().where('aggregate_id', '=', message.id).execute()
+    expect(events.map((e) => e.type)).toContain('message.processed')
+  })
+
+  it('сообщение СТРОГО новее водяного знака -> обрабатывается как обычно', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT', processFromMessageId: 500 })
+    const { port, calls } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '1000', aiEnabled: false }
+
+    const text = '#ATOM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 501, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 501)
+    expect(action.status).toBe('executed')
+    expect(calls).toEqual(['placeEntry:stopLoss=90'])
+  })
+
+  it('водяной знак 0 (канал без истории) -> обрабатываются все сообщения, включая самое первое', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT' })
+    const { port } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '1000', aiEnabled: false }
+
+    const text = '#ATOM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('executed')
   })
 })
