@@ -53,11 +53,20 @@ async function main() {
   const rl = createInterface({ input: stdin, output: stdout })
   const ask = (question) => rl.question(question)
 
-  const client = new TelegramClient(new StringSession(process.env.TG_SESSION ?? ''), apiId, apiHash, {
+  // ВСЕГДА пустая сессия — это команда ВХОДА, она обязана заводить НОВЫЙ auth-key.
+  //
+  // Раньше сюда подставлялась строка из .env, и это делало невозможным ровно тот случай, ради
+  // которого команду и запускают: если Telegram отозвал ключ (`AUTH_KEY_DUPLICATED` — одну строку
+  // сессии использовали с двух машин), клиент падал на первом же запросе, не дойдя до вопроса про
+  // номер. Проверить УЖЕ работающую сессию можно `pnpm tg:chats` — здесь для этого делать нечего.
+  const client = new TelegramClient(new StringSession(''), apiId, apiHash, {
     connectionRetries: 5,
   })
 
   console.log('\nВход в Telegram. Номер — в международном формате, например +79991234567.\n')
+  console.log('Заводится НОВАЯ строка сессии; прежняя (в .env) будет заменена.')
+  console.log('Держите отдельные строки сессии для прода и для локальной машины: один и тот же')
+  console.log('auth-key с двух IP Telegram отзывает без предупреждения.\n')
 
   await client.start({
     phoneNumber: () => ask('Номер телефона: '),
