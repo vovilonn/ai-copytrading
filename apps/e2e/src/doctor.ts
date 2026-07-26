@@ -130,7 +130,14 @@ export async function doctor(deps: DoctorDeps): Promise<Check[]> {
 
       const problems: string[] = []
       if (!described.canPost) problems.push('нет прав на постинг')
-      if (!state.enabled) problems.push('копирование выключено (channel_settings.enabled=false) — всё уйдёт в skipped')
+      if (!state.enabled) problems.push('копирование выключено (channel_settings.enabled=false) — сообщения даже не разбираются')
+      // Водяной знак истории: если он впереди последнего сообщения, КАЖДЫЙ пост прогона уйдёт в
+      // archived без разбора — и сценарии провалятся «необъяснимой тишиной» (pipeline.ts).
+      if ((state.processFromMessageId ?? 0) >= lastId) {
+        problems.push(
+          `водяной знак ${state.processFromMessageId} не позади последнего сообщения ${lastId} — новые посты уйдут в archived без разбора`,
+        )
+      }
       if (state.status !== 'active') problems.push(`статус канала '${state.status}'`)
       if (state.lastSeenMessageId < lastId) {
         problems.push(`курсор ${state.lastSeenMessageId} позади последнего сообщения ${lastId} — при старте бот переиграет историю (лечится \`pnpm e2e reset\`)`)
@@ -141,6 +148,7 @@ export async function doctor(deps: DoctorDeps): Promise<Check[]> {
         level: problems.length === 0 ? 'ok' : 'warn',
         detail:
           `«${described.title}» ${described.kind}, id=${channel.id}, курсор=${state.lastSeenMessageId}/${lastId}, ` +
+          `знак истории=${state.processFromMessageId ?? 0}, ` +
           `trade_size=${state.tradeSize}, max_notional=${state.maxSymbolNotional ?? '—'}, плечо≤${state.maxLeverage}` +
           (problems.length ? ` | ${problems.join('; ')}` : ''),
       })

@@ -37,6 +37,9 @@ const SKIP_REASON_LABELS: Readonly<Record<string, string>> = {
   // ── Настройки и ручное управление ─────────────────────────────────────────────────────────
   copy_disabled: 'copy trading disabled for the channel',
   manual_override: 'trade under manual control',
+  // Причины, по которым разбор вообще не запускался (статус СООБЩЕНИЯ, не действия) — см.
+  // pipeline.ts: выключённый канал и история старше водяного знака.
+  historical_backlog: 'message predates the channel connection',
 
   // ── Исходы AI/реконсилера (показываются как Needs review) ──────────────────────────────────
   ai_unavailable: 'AI unavailable',

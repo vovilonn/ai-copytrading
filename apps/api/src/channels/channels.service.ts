@@ -193,8 +193,9 @@ export class ChannelsService {
       media_kind: string | null
       grouped_id: string | null
       status: MessageStatus
+      status_reason: string | null
     }>`
-      SELECT id, tg_message_id, msg_ts, text, ai_summary, method, media_kind, grouped_id, status
+      SELECT id, tg_message_id, msg_ts, text, ai_summary, method, media_kind, grouped_id, status, status_reason
       FROM messages
       WHERE channel_id = ${channelId}
         AND coalesce(grouped_id, id::text) = ANY(${nodeKeys})
@@ -281,6 +282,7 @@ export class ChannelsService {
         actions: groupRows.flatMap((r) => actionsByMessage.get(r.id) ?? []),
         method: anchor.method as MessageDto['method'],
         status: anchor.status,
+        statusReason: anchor.status_reason,
       })
     }
     return result

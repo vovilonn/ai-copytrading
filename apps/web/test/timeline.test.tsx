@@ -29,6 +29,7 @@ function messageFixture(overrides: Partial<MessageDto> = {}): MessageDto {
     text: 'ETH/USDT LONG from 3,180',
     media: [],
     aiSummary: null,
+    statusReason: null,
     actions: [],
     method: 'auto',
     status: 'executed',
@@ -333,4 +334,16 @@ describe('MessageTimeline — разбор в процессе и причины
     await screen.findByText('Needs review')
     expect(screen.getByText('AI unavailable')).toBeInTheDocument()
   })
+})
+
+// Сообщение, которое движок сознательно НЕ разбирал (канал выключен оператором / история старше
+// водяного знака): действий нет, и без плашки узел выглядел бы обычным шумом — оператор не понял
+// бы, почему бот промолчал именно здесь.
+it('сообщение без действий, но с причиной пропуска -> показывает плашку с человекочитаемой причиной', async () => {
+  renderTimeline([messageFixture({ status: 'skipped', statusReason: 'copy_disabled', actions: [] })])
+
+  const note = await screen.findByTestId('message-skipped-note')
+  expect(note).toBeInTheDocument()
+  expect(note).toHaveTextContent(/skipped/i)
+  expect(note).toHaveTextContent('copy trading disabled for the channel')
 })

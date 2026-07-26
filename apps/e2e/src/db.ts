@@ -442,6 +442,8 @@ export async function pendingMessages(db: Kysely<DB>): Promise<{ channelId: numb
 }
 
 export interface ChannelState {
+  /** Водяной знак истории: движок разбирает только сообщения НОВЕЕ него (pipeline.ts). */
+  processFromMessageId?: number
   id: number
   ord: number
   key: string
@@ -469,6 +471,7 @@ export async function channelState(db: Kysely<DB>, channelId: number): Promise<C
       'channels.adapter_id',
       'channels.status',
       'channels.last_seen_message_id',
+      'channels.process_from_message_id',
       'channel_settings.enabled',
       'channel_settings.trade_size',
       'channel_settings.max_leverage',
@@ -487,6 +490,7 @@ export async function channelState(db: Kysely<DB>, channelId: number): Promise<C
     adapterId: row.adapter_id,
     status: row.status,
     lastSeenMessageId: Number(row.last_seen_message_id),
+    processFromMessageId: Number(row.process_from_message_id),
     enabled: row.enabled,
     tradeSize: row.trade_size,
     maxLeverage: row.max_leverage,

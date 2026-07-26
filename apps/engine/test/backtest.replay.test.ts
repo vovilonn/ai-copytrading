@@ -220,6 +220,9 @@ async function seedPublic(): Promise<void> {
       handle: null,
       status: 'active',
       last_seen_message_id: 0,
+      // Водяной знак СПЕЦИАЛЬНО впереди всей истории: реплей обязан сбросить его в 0 в своей
+      // схеме, иначе каждое сообщение ушло бы в archived до разбора и отчёт оказался бы пустым.
+      process_from_message_id: 10_000_000,
       bybit_sub_uid: null,
       bybit_api_key_enc: null,
       bybit_api_secret_enc: null,

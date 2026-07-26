@@ -145,6 +145,30 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
       .selectAll()
       .where('channel_id', '=', message.channelId)
       .executeTakeFirstOrThrow()
+
+    // ВЫКЛЮЧЕННОЕ КОПИРОВАНИЕ — второй гейт, тоже ДО разбора и до вызова AI.
+    //
+    // Раньше сообщение выключенного канала проходило ВЕСЬ путь (детерминированный разбор → модель
+    // → реконсиляция) и только на самом исходе каждое действие получало skip_reason='copy_disabled'.
+    // Разбор при этом стоил денег: инцидент 25.07.2026 — 2268 вызовов AI на $22.73 на канале, у
+    // которого копирование было выключено. Решение заказчика: «если отключён копитрейдинг, лишний
+    // раз ничего не обрабатывать».
+    //
+    // Статус `skipped` (не `archived`): сообщение живое и актуальное, его просто не берут в работу
+    // по решению оператора — причина видна в status_reason. Когда тумблер включат, уже разобранные
+    // так сообщения повторно не разбираются: они терминальные. Это осознанный размен — оператор
+    // выключает копирование именно затем, чтобы бот не тратился на канал.
+    if (settings.enabled === false) {
+      await trx
+        .updateTable('messages')
+        .set({ status: 'skipped', status_reason: 'copy_disabled', updated_at: new Date() })
+        .where('id', '=', message.id)
+        .execute()
+      await emitMessageProcessed(trx, message)
+      notifyNeeded = true
+      return
+    }
+
     const adapter = getAdapter(channel.adapter_id)
     const instruments = await listInstruments(trx, deps.network)
 
@@ -258,13 +282,10 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     // decision.outcome === 'executing' — decision.method всегда 'auto' либо 'ai' (never null/'review').
     const method: 'auto' | 'ai' = decision.method === 'ai' ? 'ai' : 'auto'
     const base: IntentBase = { message, channel, settings, instruments, deps, postCommit }
-    // Гейт "Copy trading" (channel_settings.enabled, DEFAULT false — design spec: "off → каждый
-    // action Skipped, ордера не отправляются"). Сообщение по-прежнему парсится и actions
-    // пишутся (нужны UI/таймлайну), но ни один intent НЕ доходит до handleEntrySignal/handleDelta —
-    // ExecutionPort не вызывается, символ не захватывается, trade/position не создаются.
-    const copySkipReason = settings.enabled === false ? 'copy_disabled' : undefined
+    // Гейт "Copy trading" сюда уже НЕ доходит: выключенный канал отсекается в самом начале
+    // processMessage, до разбора и до вызова AI (см. там же — почему).
     for (const { actionIndex, intent } of decision.decided) {
-      const emitted = await processIntent(trx, base, actionIndex, intent, method, copySkipReason)
+      const emitted = await processIntent(trx, base, actionIndex, intent, method)
       if (emitted) notifyNeeded = true
     }
 
@@ -642,9 +663,6 @@ function intentParams(intent: ParsedIntent): unknown {
  * довёл её до терминального состояния, повторно ничего не делаем (не плодим вторую trade/order).
  * @param method Method итоговой Decision ('auto' — детерминированный путь, 'ai' — AI-путь) —
  *   пишется в actions.method (design spec §6 / research §12 UI-поле "Method").
- * @param forceSkipReason Если задан (channel_settings.enabled===false, см. processMessage) —
- *   intent НЕ передаётся в handleEntrySignal/handleDelta вовсе: action сразу помечается skipped
- *   с этой причиной, ExecutionPort не вызывается и символ не захватывается.
  * @returns true, если был опубликован хотя бы один domain_events (нужно ли слать pg_notify).
  */
 async function processIntent(
@@ -653,7 +671,6 @@ async function processIntent(
   actionIndex: number,
   intent: ParsedIntent,
   method: 'auto' | 'ai',
-  forceSkipReason?: string,
 ): Promise<boolean> {
   const existing = await trx
     .selectFrom('actions')
@@ -683,34 +700,28 @@ async function processIntent(
   const actionId = inserted.id
 
   let result: HandlerResult
-  if (forceSkipReason) {
-    // channel_settings.enabled===false — не заходим ни в один хендлер вовсе (см. processMessage):
-    // ExecutionPort не вызывается, символ не захватывается, trade/position не создаются.
-    result = { skipReason: forceSkipReason }
-  } else {
-    switch (intent.kind) {
-      case 'entry_signal':
-        result = await handleOpen(trx, base, actionIndex, actionId, specFromEntrySignal(intent))
-        break
-      // «Long BTC, с текущих» — вход по рынку. Цены и стопа в сигнале нет: цену берём с рынка,
-      // стоп синтезируем защитный (см. handleOpen). Самый частый способ дать сигнал в свободном
-      // тексте — до этого он молча уходил в skip и НЕ торговался вовсе.
-      case 'market_entry': {
-        const spec = await specFromMarketEntry(base, intent)
-        result = 'skipReason' in spec ? spec : await handleOpen(trx, base, actionIndex, actionId, spec)
-        break
-      }
-      // «зайду от 76.3» — лимитный вход по названной цене.
-      case 'limit_entry':
-        result = await handleOpen(trx, base, actionIndex, actionId, specFromLimitEntry(intent))
-        break
-      case 'add':
-        result = await handleAdd(trx, base, actionIndex, actionId, intent)
-        break
-      case 'delta':
-        result = await handleDelta(trx, base, actionIndex, actionId, intent)
-        break
+  switch (intent.kind) {
+    case 'entry_signal':
+      result = await handleOpen(trx, base, actionIndex, actionId, specFromEntrySignal(intent))
+      break
+    // «Long BTC, с текущих» — вход по рынку. Цены и стопа в сигнале нет: цену берём с рынка,
+    // стоп синтезируем защитный (см. handleOpen). Самый частый способ дать сигнал в свободном
+    // тексте — до этого он молча уходил в skip и НЕ торговался вовсе.
+    case 'market_entry': {
+      const spec = await specFromMarketEntry(base, intent)
+      result = 'skipReason' in spec ? spec : await handleOpen(trx, base, actionIndex, actionId, spec)
+      break
     }
+    // «зайду от 76.3» — лимитный вход по названной цене.
+    case 'limit_entry':
+      result = await handleOpen(trx, base, actionIndex, actionId, specFromLimitEntry(intent))
+      break
+    case 'add':
+      result = await handleAdd(trx, base, actionIndex, actionId, intent)
+      break
+    case 'delta':
+      result = await handleDelta(trx, base, actionIndex, actionId, intent)
+      break
   }
 
   const now = new Date()

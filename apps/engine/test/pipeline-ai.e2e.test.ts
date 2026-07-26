@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { Kysely } from 'kysely'
+import { Kysely, sql } from 'kysely'
 import { Decimal } from 'decimal.js'
 import { resetTestSchema } from 'test-db'
 import { createDb, type DB } from 'api/db/database.js'
@@ -366,6 +366,36 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
     const actions = await actionsFor(db, message.id)
     expect(actions).toHaveLength(1)
     expect(actions[0]).toMatchObject({ type: 'partial_close', symbol: 'BTCUSDT', method: 'ai', status: 'executed', trade_id: tradeId })
+  })
+
+  // Ровно тот инвариант, ради которого гейт вынесли в начало пайплайна: у выключенного канала
+  // модель не должна вызываться ВООБЩЕ. Проверять это можно только здесь — в этом файле AI реально
+  // включён и есть мок-сервер с журналом запросов; остальные тесты гоняются с aiEnabled=false и
+  // на детерминированном CH1, где route==='ai' не возникает в принципе, поэтому доказать они
+  // ничего не могут. Инцидент прода: 2268 вызовов на $22.73 при выключенном копировании.
+  it('копирование выключено -> терсное сообщение CH2 НЕ уходит в модель: ноль запросов к ai-proxy', async () => {
+    await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform', enabled: false })
+    await seedInstrument(db, 'BTCUSDT')
+
+    // Очередь мока СПЕЦИАЛЬНО пуста: любой запрос к нему вернул бы 500 — вторая страховка к
+    // проверке mock.requests.
+    const message = await insertMessage(db, { channelId: CH2_ID, text: 'Фикс половину' })
+    await processMessage(db, message, deps)
+
+    expect(mock.requests).toHaveLength(0)
+    // ai_calls не типизирована в DB-интерфейсе (api/db/database.ts) — сырой SQL, как в других местах.
+    const aiCalls = await sql<{ n: string }>`SELECT count(*)::text AS n FROM ai_calls WHERE message_id = ${message.id}::uuid`.execute(db)
+    expect(aiCalls.rows[0]?.n).toBe('0')
+
+    const row = await messageRow(db, message.id)
+    expect(row.status).toBe('skipped')
+    expect(row.status_reason).toBe('copy_disabled')
+    expect(row.method).toBeNull()
+
+    // Ни разбора, ни действий — сообщение вообще не бралось в работу.
+    const parses = await db.selectFrom('parse_results').selectAll().where('message_id', '=', message.id).execute()
+    expect(parses).toHaveLength(0)
+    expect(await actionsFor(db, message.id)).toHaveLength(0)
   })
 
   it('гейт confidence=0.5: эскалация на Opus, Opus ТОЖЕ <0.7 -> needs_review low_confidence, 0 actions', async () => {

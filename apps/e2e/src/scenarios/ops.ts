@@ -7,11 +7,11 @@ import type { Scenario } from '../scenario.js'
 
 export const opsCopyDisabled: Scenario = {
   id: 'ops-copy-disabled',
-  title: 'Выключенное копирование: сигнал разбирается, но ордера не уходят',
+  title: 'Выключенное копирование: сообщение не разбирается вовсе',
   slot: 1,
   symbols: ['SOLUSDT'],
   tags: ['ops', 'guards'],
-  note: 'Тумблер channel_settings.enabled — главный «стоп-кран» оператора. Сообщение обязано разобраться и попасть в таблицу действий (иначе оператор не поймёт, что бот проигнорировал), но ExecutionPort вызываться не должен.',
+  note: 'Тумблер channel_settings.enabled — главный «стоп-кран» оператора: у выключенного канала сообщение НЕ разбирается вовсе (ни парсером, ни моделью) и уходит в skipped(copy_disabled). Так выключенный канал перестаёт стоить денег — раньше разбор шёл полностью и жёг AI.',
   steps: [
     {
       title: 'Оператор выключает копирование и присылает сигнал',
@@ -30,9 +30,16 @@ export const opsCopyDisabled: Scenario = {
         ].join('\n'),
       }),
       expect: {
-        status: 'executed',
-        actions: [{ type: 'open', status: 'skipped', symbol: 'SOLUSDT', skipReason: 'copy_disabled' }],
+        status: 'skipped',
+        reason: 'copy_disabled',
+        actions: [],
         exchange: { symbol: 'SOLUSDT', position: 'flat', openOrdersMax: 0 },
+        custom: (trace) => {
+          const problems: string[] = []
+          if (trace.parseResults.length > 0) problems.push('выключенный канал всё равно разобран — разбор должен был не запускаться')
+          if (trace.aiCalls.length > 0) problems.push(`выключенный канал позвал модель ${trace.aiCalls.length} раз(а) — это прямые деньги на ветер`)
+          return problems
+        },
       },
     },
     {

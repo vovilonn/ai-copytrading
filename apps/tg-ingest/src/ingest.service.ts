@@ -525,6 +525,8 @@ export class IngestService {
             // покажет лоадер на месте действий/саммари, вместо пустоты, неотличимой от «шума»;
             // финальный статус приедет отдельным 'message.updated' (outbox, после разбора).
             status: 'received',
+            // Разбор ещё не запускался — причины пропуска быть не может (её проставляет движок).
+            statusReason: null,
           },
         }
         return { type: kind === 'new' ? 'message.new' : 'message.updated', aggregate: 'message', payload }

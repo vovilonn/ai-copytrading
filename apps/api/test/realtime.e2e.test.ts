@@ -118,6 +118,7 @@ describe('realtime gateway', () => {
           text,
           media: [],
           aiSummary: null,
+          statusReason: null,
           actions: [],
           method: null,
           status: 'received',

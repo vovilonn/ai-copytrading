@@ -313,18 +313,29 @@ describe('pipeline — гейт безопасного стопа (Important #1)
 })
 
 describe('pipeline — channel_settings.enabled (Important #2)', () => {
-  it('enabled=false -> action skipped/copy_disabled, 0 orders/trades/positions', async () => {
+  // Решение заказчика (26.07.2026, после инцидента на $22.73): у выключенного канала сообщение НЕ
+  // разбирается вовсе — ни детерминированным парсером, ни моделью. Раньше разбор шёл полностью, и
+  // только каждое действие получало skip_reason='copy_disabled' — то есть выключенный тумблер
+  // исправно тратил деньги на AI.
+  it('enabled=false -> сообщение skipped/copy_disabled БЕЗ разбора: ни действий, ни разбора, ни AI', async () => {
     const channelId = nextChannelId++
     await seedChannel({ channelId, symbol: 'CCCUSDT', enabled: false })
     const text = '#CCC/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
     const message = await insertMessage(channelId, 1, text)
     await processMessage(db, message, deps)
 
-    const action = await actionFor(channelId, 1)
-    expect(action.status).toBe('skipped')
-    expect(action.skip_reason).toBe('copy_disabled')
-    // Action всё же создан (для UI/таймлайна) — символ/тип видны, просто не исполнено.
-    expect(action.symbol).toBe('CCCUSDT')
+    const row = await db.selectFrom('messages').selectAll().where('id', '=', message.id).executeTakeFirstOrThrow()
+    expect(row.status).toBe('skipped')
+    expect(row.status_reason).toBe('copy_disabled')
+
+    const actions = await db.selectFrom('actions').selectAll().where('channel_id', '=', channelId).execute()
+    expect(actions).toHaveLength(0)
+    // Разбор не запускался — значит и повода звать модель не возникало.
+    const parses = await db.selectFrom('parse_results').selectAll().where('message_id', '=', message.id).execute()
+    expect(parses).toHaveLength(0)
+    // Событие опубликовано: иначе в UI навсегда остался бы лоадер «Разбираем сообщение…».
+    const events = await db.selectFrom('domain_events').selectAll().where('aggregate_id', '=', message.id).execute()
+    expect(events.map((e) => e.type)).toContain('message.processed')
 
     const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
     expect(trades).toHaveLength(0)

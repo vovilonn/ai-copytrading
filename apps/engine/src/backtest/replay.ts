@@ -246,13 +246,17 @@ export async function replay(options: ReplayOptions): Promise<BacktestReport> {
     // прочитанные Kysely как строки, при вставке коерсятся к enum ЦЕЛЕВОЙ схемы. Батчами —
     // messages ~тысячи строк, один INSERT упёрся бы в лимит 65535 bind-параметров.
     const channelRows = await adminDb.selectFrom('channels').selectAll().where('id', '=', channelId).execute()
-    await schemaDb.insertInto('channels').values(channelRows).execute()
+    // Водяной знак истории сбрасывается в 0: бэктест ПО ОПРЕДЕЛЕНИЮ прогоняет старые сообщения, а
+    // в public знак стоит на последнем подтянутом id (миграция 008) — с ним каждое сообщение
+    // реплея ушло бы в `archived` до разбора, и отчёт оказался бы пустым.
+    await schemaDb.insertInto('channels').values(channelRows.map((c) => ({ ...c, process_from_message_id: 0 }))).execute()
 
     const settingsRows = await adminDb.selectFrom('channel_settings').selectAll().where('channel_id', '=', channelId).execute()
     // Бэктест отвечает на вопрос "сколько ИСПОЛНИЛОСЬ БЫ", поэтому copy-trading включается принудительно
     // (в public у канала enabled=false — иначе каждый вход был бы skip 'copy_disabled', отчёт бесполезен).
     await schemaDb.insertInto('channel_settings').values(settingsRows.map((s) => ({ ...s, enabled: true }))).execute()
     notes.push('channel_settings.enabled принудительно = true в изолированной схеме (в public канал off).')
+    notes.push('channels.process_from_message_id сброшен в 0 — иначе история ушла бы в archived без разбора.')
 
     const instrumentRows = await adminDb.selectFrom('instruments').selectAll().where('network', '=', network).execute()
     await insertBatched(schemaDb, 'instruments', instrumentRows)

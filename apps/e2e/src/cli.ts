@@ -230,13 +230,6 @@ async function main(): Promise<number> {
             console.log(`\n  ВНИМАНИЕ: после прогона на бирже осталось: ${cleanup.leftovers.join(', ')}`)
           }
         }
-        // Страховка: сценарий ops-copy-disabled выключает копирование первым шагом и включает
-        // последним. Сорвись он посередине — канал остался бы выключенным, и следующий прогон
-        // (или живой сигнал) молча ушёл бы в skipped(copy_disabled).
-        for (const channel of config.channels) {
-          await applyTestProfile(db, channel.id, DEFAULT_TEST_PROFILE)
-        }
-
         printSummary(results)
         const artifacts = await writeRunArtifacts(results, startedAt)
         console.log(`  отчёт: ${artifacts.markdownPath}\n`)
@@ -249,6 +242,18 @@ async function main(): Promise<number> {
         return 1
     }
   } finally {
+    // Страховка на ЛЮБОЙ исход, включая Ctrl+C и падение: сценарий ops-copy-disabled выключает
+    // копирование первым шагом и включает последним, а при срыве шага раннер помечает остальные
+    // пропущенными — «включаем обратно» тогда не выполняется. Оставленный выключенным канал
+    // теперь ещё коварнее: сообщения не разбираются вовсе, и следующий прогон даёт пустые трейсы
+    // без единой подсказки. Поэтому профиль восстанавливается здесь, а не в теле команды.
+    if (command === 'run') {
+      for (const channel of config.channels) {
+        await applyTestProfile(db, channel.id, DEFAULT_TEST_PROFILE).catch((err) =>
+          console.error(`  не удалось вернуть профиль канала ${channel.id}: ${String(err)}`),
+        )
+      }
+    }
     await poster?.close()
     await db.destroy()
   }

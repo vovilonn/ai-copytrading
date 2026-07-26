@@ -118,6 +118,12 @@ function MessageRow({ message }: { message: MessageDto }) {
           </div>
         ) : showNoteSummary ? (
           <AiSummary text={message.aiSummary!} variant="note" />
+        ) : message.statusReason ? (
+          // Разбор не дал ни одного действия, но причина известна: канал выключен оператором,
+          // сообщение старше водяного знака истории, либо биржа отвергла исполнение по существу.
+          // Без этой плашки узел выглядел бы как обычный шум, и оператор не понял бы, почему бот
+          // промолчал именно здесь.
+          <SkippedNote status={message.status} reason={message.statusReason} />
         ) : null}
       </div>
     </div>
@@ -157,6 +163,32 @@ function ActionRow({ action, onTradeClick }: { action: MessageActionDto; onTrade
           <ArrowUpRight size={13} className="flex-none" />
         </button>
       ) : null}
+    </div>
+  )
+}
+
+/**
+ * Причина, по которой у сообщения нет ни одного действия — берётся из статуса САМОГО сообщения.
+ * Подпись зависит от статуса: `needs_review` (напр. биржа отвергла исполнение по существу —
+ * main.ts) требует внимания оператора, `archived` — история канала, всё остальное — пропуск по
+ * решению оператора. Одна общая надпись «Skipped» на все три случая ввела бы в заблуждение.
+ */
+function statusNoteLabel(status: MessageDto['status']): string {
+  if (status === 'needs_review') return 'Needs review'
+  if (status === 'archived') return 'Archived'
+  return 'Skipped'
+}
+
+function SkippedNote({ status, reason }: { status: MessageDto['status']; reason: string }) {
+  return (
+    <div className="mt-[11px] inline-flex flex-wrap items-center gap-[6px]" data-testid="message-skipped-note">
+      <span
+        title={reason}
+        className="inline-flex items-center rounded-[5px] bg-skipped-bg px-2 py-[3px] text-[10.5px] font-bold uppercase tracking-[.04em] text-skipped"
+      >
+        {statusNoteLabel(status)}
+      </span>
+      <span className="text-[11.5px] leading-none text-muted-2">{skipReasonLabel(reason)}</span>
     </div>
   )
 }

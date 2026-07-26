@@ -100,6 +100,13 @@ export interface MessageDto {
   method: 'auto' | 'ai' | 'review' | null
   /** Статус разбора: пока он «в процессе» (isMessagePending), фронт крутит лоадер вместо действий. */
   status: MessageStatus
+  /**
+   * Почему сообщение не пошло в работу (`messages.status_reason`), если разбор вообще не
+   * запускался: `copy_disabled` — копирование канала выключено оператором, `historical_backlog` —
+   * сообщение старше водяного знака канала. Без этого поля такой узел выглядел бы в таймлайне
+   * пустым, и оператор гадал бы, почему бот промолчал.
+   */
+  statusReason: string | null
 }
 
 // Задача 8: строка таблицы Actions (design/project/Admin.dc.html:306-392) — один action = одна

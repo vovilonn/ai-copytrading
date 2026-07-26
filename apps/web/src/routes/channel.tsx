@@ -251,7 +251,7 @@ export function ChannelSettings({ channel }: { channel: ChannelDto }) {
     <div className="max-w-[620px] rounded-[10px] border border-card-border bg-card px-5 py-1">
       <SettingsRow
         title="Copy trading"
-        description="If off, messages are still parsed but every action is marked Skipped — no orders are sent to Bybit."
+        description="If off, messages are not parsed at all — no AI calls, no actions, no orders. Open positions of this channel keep running: close them before turning it off."
       >
         <Switch
           aria-label="Copy trading"
