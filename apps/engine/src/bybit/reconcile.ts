@@ -32,7 +32,7 @@ import { attributeExecution } from './sync/attribute.js'
 import { backfillExecutions } from './sync/backfill-executions.js'
 import { backfillClosedPnl } from './sync/backfill-closed-pnl.js'
 import { syncOrderStatuses } from './sync/sync-orders.js'
-import { BOOTSTRAP_LOOKBACK_MS, OVERLAP_MS, readCursor, writeCursor } from './sync/cursor.js'
+import { BOOTSTRAP_LOOKBACK_MS, OVERLAP_MS, cursorKey, readCursor, writeCursor } from './sync/cursor.js'
 import type { BybitRestClient, Order, Position } from './rest-client.js'
 
 /** Узкий срез BybitRestClient — тот же приём, что и BybitAdapterRestClient/BybitPrivateWsRestClient.
@@ -44,6 +44,19 @@ export type ReconcileRestClient = Pick<
   BybitRestClient,
   'getPositions' | 'getOpenOrders' | 'cancelOrder' | 'getExecutions' | 'getOrderHistory' | 'getClosedPnl'
 >
+
+/**
+ * Скоуп сверки: КАКИЕ каналы обслуживает аккаунт, чьим клиентом мы сейчас смотрим на биржу.
+ *
+ * Без него сверка аккаунта A увидела бы «сделки канала B, у которых на бирже нет позиции» — и
+ * закрыла бы их: позиции канала B живут на ДРУГОМ аккаунте и в этом снапшоте отсутствуют по
+ * определению. Не задан — прежнее глобальное поведение (один аккаунт на всё).
+ */
+export interface ReconcileScope {
+  channelIds?: readonly number[]
+  /** Курсоры догона истории у каждого аккаунта свои (cursor.ts::cursorKey). */
+  accountFingerprint?: string
+}
 
 export interface ReconcileResult {
   /** Позиция на бирже атрибутирована по orderLinkId к сделке журнала, которая не была 'open' —
@@ -135,15 +148,15 @@ export interface HistorySyncResult {
  * ордеров. Именно этот блок закрывает требование «полная синхронизация, даже если сервис лежал
  * день, и подтягиваются ручные действия с биржи».
  */
-async function syncHistory(db: Kysely<DB>, rest: ReconcileRestClient): Promise<HistorySyncResult> {
+async function syncHistory(db: Kysely<DB>, rest: ReconcileRestClient, scope: ReconcileScope = {}): Promise<HistorySyncResult> {
   const nowMs = Date.now()
-  const oldestLiveTradeMs = await findOldestLiveTradeMs(db)
+  const oldestLiveTradeMs = await findOldestLiveTradeMs(db, scope.channelIds)
 
   // 1. Исполнения. exec_pnl у REST-строк ещё 0 — его отдаёт только closed-pnl (шаг 2).
-  const execs = await backfillExecutions(db, rest, nowMs, oldestLiveTradeMs)
+  const execs = await backfillExecutions(db, rest, nowMs, oldestLiveTradeMs, scope.accountFingerprint)
 
   // 2. Реальный PnL закрытий (включая РУЧНЫЕ) → патч exec_pnl REST-строк.
-  const pnl = await backfillClosedPnl(db, rest, nowMs, oldestLiveTradeMs)
+  const pnl = await backfillClosedPnl(db, rest, nowMs, oldestLiveTradeMs, scope.accountFingerprint)
 
   // 3. Пересчёт денег затронутых сделок — ТОЛЬКО после того, как PnL проставлен.
   const affected = [...new Set([...execs.affectedTradeIds, ...pnl.affectedTradeIds])]
@@ -152,9 +165,9 @@ async function syncHistory(db: Kysely<DB>, rest: ReconcileRestClient): Promise<H
     : 0
 
   // 4. Статусы ордеров: единственный писатель раньше был WS, репара не существовало вовсе.
-  const historyFrom = (await readCursor(db, 'sync:order_history')) ?? nowMs - BOOTSTRAP_LOOKBACK_MS
+  const historyFrom = (await readCursor(db, cursorKey('sync:order_history', scope.accountFingerprint))) ?? nowMs - BOOTSTRAP_LOOKBACK_MS
   const orders = await syncOrderStatuses(db, rest, historyFrom - OVERLAP_MS, nowMs)
-  await writeCursor(db, 'sync:order_history', nowMs)
+  await writeCursor(db, cursorKey('sync:order_history', scope.accountFingerprint), nowMs)
 
   if (execs.inserted > 0 || pnl.patched > 0 || orders.updated > 0) {
     console.log(
@@ -175,15 +188,18 @@ async function syncHistory(db: Kysely<DB>, rest: ReconcileRestClient): Promise<H
 }
 
 /** Самая старая ЖИВАЯ сделка журнала — чтобы при первом запуске не обрезать её филлы окном в 7 дней. */
-async function findOldestLiveTradeMs(db: Kysely<DB>): Promise<number | null> {
-  const row = await db
+async function findOldestLiveTradeMs(db: Kysely<DB>, channelIds?: readonly number[]): Promise<number | null> {
+  let query = db
     .selectFrom('trades')
     .select('opened_at')
     .where('status', 'in', LIVE_JOURNAL_STATUSES)
     .where('opened_at', 'is not', null)
     .orderBy('opened_at', 'asc')
     .limit(1)
-    .executeTakeFirst()
+  // Глубина догона считается по САМОЙ СТАРОЙ живой сделке ЭТОГО аккаунта: чужая старая сделка
+  // заставила бы читать историю за лишние недели на каждом проходе.
+  if (channelIds) query = query.where('channel_id', 'in', channelIds.length > 0 ? [...channelIds] : [-1])
+  const row = await query.executeTakeFirst()
   return row?.opened_at ? row.opened_at.getTime() : null
 }
 
@@ -194,7 +210,11 @@ async function findOldestLiveTradeMs(db: Kysely<DB>): Promise<number | null> {
  * Одна транзакция БД — либо весь эффект коммитится, либо ничего (крэш посреди реконсиляции не
  * оставляет "половину" исправлений). Сетевые READ-вызовы — ДО транзакции (не держат её открытой).
  */
-export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient): Promise<ReconcileResult> {
+export async function reconcileOnStart(
+  db: Kysely<DB>,
+  rest: ReconcileRestClient,
+  scope: ReconcileScope = {},
+): Promise<ReconcileResult> {
   // ==========================================================================================
   // ДОГОН ИСТОРИИ (шаги 1-4) — ДО снапшота позиций. Порядок здесь принципиален и менять его нельзя.
   //
@@ -206,7 +226,7 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
   // realized_pnl. Закрыть сделку раньше, чем дочитаны её филлы, — значит навсегда записать is_win,
   // посчитанный по нулевому PnL, и получить лживый Win Rate канала.
   // ==========================================================================================
-  const historyResult = await syncHistory(db, rest).catch((err) => {
+  const historyResult = await syncHistory(db, rest, scope).catch((err) => {
     // Догон истории не должен ронять сверку позиций: она чинит более важное (что реально открыто).
     console.error('[reconcile] догон истории не удался — продолжаю со сверкой позиций:', err)
     return null
@@ -236,7 +256,7 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
   let phantomsZeroed = 0
 
   await db.transaction().execute(async (trx) => {
-    const localLiveTrades = await trx
+    let localLiveTradesQuery = trx
       .selectFrom('trades')
       .select(['id', 'symbol', 'status', 'channel_id', 'human_ref', 'opened_at'])
       .where('status', 'in', LIVE_JOURNAL_STATUSES)
@@ -249,7 +269,10 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
             .where('orders.order_link_id', 'like', `${LIVE_ORDER_LINK_PREFIX}%`),
         ),
       )
-      .execute()
+    if (scope.channelIds) {
+      localLiveTradesQuery = localLiveTradesQuery.where('channel_id', 'in', scope.channelIds.length > 0 ? [...scope.channelIds] : [-1])
+    }
+    const localLiveTrades = await localLiveTradesQuery.execute()
 
     const bySymbol = new Map<string, LocalTrade[]>()
     for (const t of localLiveTrades) {
@@ -351,6 +374,9 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
            WHERE o.trade_id = p.trade_id
              AND o.order_link_id LIKE ${`${LIVE_ORDER_LINK_PREFIX}%`}
         )
+        -- Скоуп аккаунта: фантом чужого канала лечит сверка ЕГО аккаунта, у которой есть настоящий
+        -- снапшот биржи. Отсюда мы про его позиции не знаем ничего.
+        AND (${scope.channelIds === undefined} OR p.channel_id = ANY(${[...(scope.channelIds ?? [])]}::bigint[]))
       RETURNING p.channel_id, p.symbol
     `.execute(trx)
     for (const row of phantoms.rows) {
@@ -374,6 +400,9 @@ export async function reconcileOnStart(db: Kysely<DB>, rest: ReconcileRestClient
   // реконсиляция снимала бы reduce-only ордера, выставленные ОПЕРАТОРОМ вручную с биржи (у них
   // чужой orderLinkId либо пустой, как у trading-stop). Чужие ордера — не наша зона ответственности:
   // мы не имеем права отменять то, что не ставили.
+  // Скоуп аккаунта тут не нужен отдельным фильтром: openOrders приходят с ЭТОГО аккаунта, а
+  // K-префикс уже отсекает чужие (ручные) ордера. Каналы другого аккаунта своих ордеров в этом
+  // снапшоте иметь не могут по определению.
   const orphans = openOrders.filter(
     (o) =>
       o.reduceOnly &&

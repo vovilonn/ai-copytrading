@@ -9,18 +9,28 @@ import { createExecutionPort } from '../src/execution/port.js'
 import { BybitPrivateWs } from '../src/bybit/private-ws.js'
 import type { ReconcileRestClient } from '../src/bybit/reconcile.js'
 import type { BybitRestClient, CreateOrderParams, Order, Position, SetTradingStopParams } from '../src/bybit/rest-client.js'
-import { decryptSecret, encryptSecret, getChannelKeys } from '../src/bybit/channel-keys.js'
-import { initLiveRuntime, sweepExpiredLimitOrders } from '../src/main.js'
+import {
+  clearChannelKeys,
+  decryptSecret,
+  encryptSecret,
+  getChannelKeys,
+  listChannelAccounts,
+  setChannelKeys,
+} from '../src/bybit/channel-keys.js'
+import type { AccountRuntime } from '../src/runtime/account-registry.js'
+import { startAccountRuntime, sweepExpiredLimitOrders } from '../src/main.js'
+import { parseArgs } from '../src/channel-keys-cli.js'
 
 // Задача 5 (Ф3, live-режим в main.ts): task-5-brief.md + LOOP_STATE.md.
-//  1) initLiveRuntime — единая точка ветвления EXECUTION_MODE=live в main.ts: реконсиляция ->
-//     приватный WS (сконструирован, НЕ подключён) -> ExecutionPort (BybitAdapter). dry_run-ветка
-//     фабрики createExecutionPort уже покрыта bybit-adapter.test.ts (describe('createExecutionPort')) —
-//     здесь НЕ дублируем, тестируем только НОВОЕ (initLiveRuntime/sweepExpiredLimitOrders/getChannelKeys).
+//  1) startAccountRuntime — подъём ОДНОГО торгового аккаунта при EXECUTION_MODE=live: часы ->
+//     сверка (в скоупе каналов аккаунта) -> приватный WS -> equity. dry_run-ветка фабрики
+//     createExecutionPort уже покрыта bybit-adapter.test.ts (describe('createExecutionPort')) —
+//     здесь НЕ дублируем, тестируем только НОВОЕ (startAccountRuntime/sweepExpiredLimitOrders/getChannelKeys).
 //  2) sweepExpiredLimitOrders — TTL-свип отложенных лимиток (design spec §9): один и тот же код
 //     работает в dry_run (DryRunAdapter — cancelOrder только в БД) и live (BybitAdapter — реальный
 //     rest.cancelOrder) БЕЗ единого if по режиму — ветвление уже сделано фабрикой createExecutionPort.
-//  3) getChannelKeys/encryptSecret/decryptSecret — per-channel ключи Bybit с фолбэком на env.
+//  3) getChannelKeys/setChannelKeys/clearChannelKeys/listChannelAccounts — ключи Bybit per-channel
+//     (свой субаккаунт канала) с фолбэком на env; их пишет CLI `pnpm channel:keys`.
 //
 // main.ts НЕ импортируется как entrypoint здесь — top-level `main().catch(...)` в конце файла
 // защищён проверкой `isMainModule` (import.meta.url === file://process.argv[1]), иначе сам факт
@@ -143,7 +153,9 @@ async function orderStatus(orderLinkId: string): Promise<string> {
  */
 // initLiveRuntime синхронизирует часы биржи (bybit/server-time.ts) до первой подписи, поэтому в
 // срез мока добавлены syncClock/serverNowMs — тем же приёмом «узкий Pick», что и остальные части.
-type MockRest = BybitAdapterRestClient & ReconcileRestClient & Pick<BybitRestClient, 'syncClock' | 'serverNowMs'>
+type MockRest = BybitAdapterRestClient &
+  ReconcileRestClient &
+  Pick<BybitRestClient, 'syncClock' | 'serverNowMs' | 'getWalletBalance'>
 
 function createMockRest(): { rest: MockRest; calls: string[] } {
   const calls: string[] = []
@@ -202,39 +214,75 @@ function createMockRest(): { rest: MockRest; calls: string[] } {
       calls.push(`cancelOrder:${params.orderLinkId}`)
       return { ok: true as const }
     }),
-    // Часы биржи (bybit/server-time.ts): initLiveRuntime синхронизирует их ДО первой подписи —
+    // Часы биржи (bybit/server-time.ts): startAccountRuntime синхронизирует их ДО первой подписи —
     // в моке достаточно нулевой поправки, сеть тест не трогает.
     syncClock: vi.fn(async () => {
       calls.push('syncClock')
       return 0
     }),
     serverNowMs: vi.fn(() => Date.now()),
+    // equity аккаунта и снапшот баланса при старте (getEquity/writeWalletSnapshot).
+    getWalletBalance: vi.fn(async () => {
+      calls.push('getWalletBalance')
+      return { totalEquity: '1234', totalAvailableBalance: '1000', coins: [] }
+    }),
   }
 
   return { rest, calls }
 }
 
-describe('initLiveRuntime — EXECUTION_MODE=live: реконсиляция -> приватный WS -> ExecutionPort', () => {
-  it('вызывает reconcileOnStart (мок rest), возвращает BybitAdapter и сконструированный (не подключённый) BybitPrivateWs', async () => {
+/** Подставной рантайм аккаунта: реальные клиенты здесь не нужны — проверяется последовательность
+ *  старта, а не сеть. `privateWs` заменён счётчиком start(), чтобы тест не открывал сокет. */
+function makeRuntime(
+  rest: MockRest & Pick<BybitRestClient, 'getWalletBalance'>,
+  overrides: Partial<AccountRuntime> = {},
+): AccountRuntime & { privateWs: { start: () => void; started: number } } {
+  const privateWs = { started: 0, start(): void { this.started += 1 }, stop: () => {} }
+  return {
+    fingerprint: 'acc00001',
+    channelIds: [CHANNEL_ID],
+    shared: false,
+    rest: rest as unknown as BybitRestClient,
+    executionPort: new BybitAdapter(rest, 'testnet'),
+    equity: '0',
+    ...overrides,
+    privateWs: privateWs as unknown as BybitPrivateWs,
+  } as AccountRuntime & { privateWs: { start: () => void; started: number } }
+}
+
+describe('startAccountRuntime — подъём аккаунта: часы -> сверка -> приватный WS -> equity', () => {
+  it('сверяет аккаунт, поднимает WS и заполняет equity рантайма', async () => {
     const { rest, calls } = createMockRest()
+    const runtime = makeRuntime(rest)
 
-    const runtime = await initLiveRuntime(db, rest as unknown as BybitRestClient, 'testnet', { apiKey: 'k', apiSecret: 's' })
+    const result = await startAccountRuntime(db, runtime)
 
-    // Реконсиляция реально вызвана (§14: "при старте" — до подъёма пайплайна).
-    expect(calls).toContain('getPositions')
+    // Часы биржи — ДО первой подписи (bybit/server-time.ts), потом сверка (design spec §14).
+    expect(calls.indexOf('syncClock')).toBeLessThan(calls.indexOf('getPositions'))
     expect(calls).toContain('getOpenOrders')
     // Пустой журнал/аккаунт -> всё по нулям (тот же контракт, что и живая проверка на testnet).
-    expect(runtime.reconcileResult).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
-    // Фабрика createExecutionPort('live', ...) действительно дала BybitAdapter.
-    expect(runtime.executionPort).toBeInstanceOf(BybitAdapter)
-    // Приватный WS сконструирован (готов к .start()), но НЕ подключается сам по себе —
-    // conn() зовётся только из start() (private-ws.ts) — эта функция start() не вызывает.
-    expect(runtime.privateWs).toBeInstanceOf(BybitPrivateWs)
+    expect(result).toEqual({ opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, phantomsZeroed: 0, reattributedExecutions: 0 })
+    // Приватный WS поднят ровно один раз, equity аккаунта подтянут с биржи.
+    expect(runtime.privateWs.started).toBe(1)
+    expect(runtime.equity).toBe('1234')
+  })
+
+  it('сверка упала -> движок всё равно стартует (degraded), WS поднят: иначе рестарт-петля без торговли', async () => {
+    const { rest } = createMockRest()
+    rest.getPositions = vi.fn(async () => {
+      throw new Error('Bybit 5xx')
+    })
+    const runtime = makeRuntime(rest)
+
+    const result = await startAccountRuntime(db, runtime)
+
+    expect(result.degraded).toBe(true)
+    expect(runtime.privateWs.started).toBe(1)
   })
 
   it("dry_run: createExecutionPort('dry_run') не требует и не создаёт ни одного live-ресурса", () => {
-    // Симметричная проверка стороны, за которую отвечает main() (initLiveRuntime дry_run вообще
-    // не вызывает) — сама фабрика уже тестируется в bybit-adapter.test.ts::createExecutionPort.
+    // Симметричная проверка стороны, за которую отвечает main() (в dry_run аккаунты не поднимаются)
+    // — сама фабрика уже тестируется в bybit-adapter.test.ts::createExecutionPort.
     const port = createExecutionPort('dry_run')
     expect(port).toBeInstanceOf(DryRunAdapter)
   })
@@ -249,7 +297,7 @@ describe('sweepExpiredLimitOrders — TTL-отмена отложенных ли
     const { rest, calls } = createMockRest()
     const port = new BybitAdapter(rest, 'testnet')
 
-    const cancelled = await sweepExpiredLimitOrders(db, port, now)
+    const cancelled = await sweepExpiredLimitOrders(db, () => port, now)
 
     expect(cancelled).toBe(1)
     expect(calls).toEqual(['cancelOrder:EXPIRED-E0'])
@@ -261,7 +309,7 @@ describe('sweepExpiredLimitOrders — TTL-отмена отложенных ли
     const now = new Date('2026-07-11T12:00:00Z')
     await seedOrder('DRY-EXPIRED-E0', { createdAt: new Date(now.getTime() - 8 * DAY_MS) })
 
-    const cancelled = await sweepExpiredLimitOrders(db, new DryRunAdapter(), now)
+    const cancelled = await sweepExpiredLimitOrders(db, () => new DryRunAdapter(), now)
 
     expect(cancelled).toBe(1)
     expect(await orderStatus('DRY-EXPIRED-E0')).toBe('cancelled')
@@ -276,7 +324,7 @@ describe('sweepExpiredLimitOrders — TTL-отмена отложенных ли
     })
 
     const { rest, calls } = createMockRest()
-    const cancelled = await sweepExpiredLimitOrders(db, new BybitAdapter(rest, 'testnet'), now)
+    const cancelled = await sweepExpiredLimitOrders(db, () => new BybitAdapter(rest, 'testnet'), now)
 
     expect(cancelled).toBe(1)
     expect(calls).toEqual(['cancelOrder:TTL-OVERRIDE-E0'])
@@ -289,7 +337,7 @@ describe('sweepExpiredLimitOrders — TTL-отмена отложенных ли
     await seedOrder('SL-OLD-S0', { purpose: 'sl', createdAt: old })
 
     const { rest, calls } = createMockRest()
-    const cancelled = await sweepExpiredLimitOrders(db, new BybitAdapter(rest, 'testnet'), now)
+    const cancelled = await sweepExpiredLimitOrders(db, () => new BybitAdapter(rest, 'testnet'), now)
 
     expect(cancelled).toBe(0)
     expect(calls).toEqual([])
@@ -302,7 +350,7 @@ describe('sweepExpiredLimitOrders — TTL-отмена отложенных ли
     await seedOrder('MARKET-OLD-E0', { orderType: 'market', createdAt: new Date(now.getTime() - 30 * DAY_MS) })
 
     const { rest, calls } = createMockRest()
-    const cancelled = await sweepExpiredLimitOrders(db, new BybitAdapter(rest, 'testnet'), now)
+    const cancelled = await sweepExpiredLimitOrders(db, () => new BybitAdapter(rest, 'testnet'), now)
 
     expect(cancelled).toBe(0)
     expect(calls).toEqual([])
@@ -315,7 +363,7 @@ describe('sweepExpiredLimitOrders — TTL-отмена отложенных ли
     await seedOrder('ALREADY-CANCELLED-E0', { status: 'cancelled', createdAt: old })
 
     const { rest, calls } = createMockRest()
-    const cancelled = await sweepExpiredLimitOrders(db, new BybitAdapter(rest, 'testnet'), now)
+    const cancelled = await sweepExpiredLimitOrders(db, () => new BybitAdapter(rest, 'testnet'), now)
 
     expect(cancelled).toBe(0)
     expect(calls).toEqual([])
@@ -381,5 +429,59 @@ describe('getChannelKeys / encryptSecret / decryptSecret — ключи Bybit pe
     delete process.env.BYBIT_API_SECRET
 
     await expect(getChannelKeys(db, null)).rejects.toThrow()
+  })
+
+  it('setChannelKeys -> канал читает СВОИ ключи; --clear возвращает его на общий аккаунт из env', async () => {
+    // Ровно жизненный цикл `pnpm channel:keys` (channel-keys-cli.ts): завели субаккаунт — сняли.
+    const channelId = 953
+    await sql`
+      INSERT INTO channels (id, ord, key, source_kind, adapter_id) VALUES (${channelId}, 5, 'ch-cli', 'channel', 'ch1')
+    `.execute(db)
+    process.env.BYBIT_API_KEY = 'env-key'
+    process.env.BYBIT_API_SECRET = 'env-secret'
+
+    await setChannelKeys(db, channelId, { apiKey: 'sub-key', apiSecret: 'sub-secret', subUid: 4242 })
+    expect(await getChannelKeys(db, channelId)).toEqual({ apiKey: 'sub-key', apiSecret: 'sub-secret' })
+
+    // В БД лежит ШИФРОТЕКСТ, а не сам ключ: дамп базы не выдаёт доступ к деньгам.
+    const stored = await db
+      .selectFrom('channels')
+      .select(['bybit_api_key_enc', 'bybit_api_secret_enc', 'bybit_sub_uid'])
+      .where('id', '=', channelId)
+      .executeTakeFirstOrThrow()
+    expect(stored.bybit_api_key_enc).not.toContain('sub-key')
+    expect(stored.bybit_sub_uid).toBe(4242)
+
+    const listed = await listChannelAccounts(db)
+    expect(listed.find((row) => row.id === channelId)?.ownAccount).toBe(true)
+
+    await clearChannelKeys(db, channelId)
+    expect(await getChannelKeys(db, channelId)).toEqual({ apiKey: 'env-key', apiSecret: 'env-secret' })
+    const afterClear = await listChannelAccounts(db)
+    expect(afterClear.find((row) => row.id === channelId)?.ownAccount).toBe(false)
+  })
+
+  it('несуществующий канал -> явная ошибка, а не молчаливый no-op', async () => {
+    await expect(setChannelKeys(db, 999_999, { apiKey: 'k', apiSecret: 's' })).rejects.toThrow(/999999/)
+    await expect(clearChannelKeys(db, 999_999)).rejects.toThrow(/999999/)
+  })
+})
+
+describe('channel-keys-cli — разбор аргументов', () => {
+  it('полный набор флагов', () => {
+    expect(parseArgs(['--channel', '1', '--key', 'k', '--secret', 's', '--sub-uid', '77'])).toEqual({
+      channel: 1,
+      key: 'k',
+      secret: 's',
+      subUid: 77,
+      clear: false,
+      list: false,
+    })
+  })
+
+  it('флаг без значения и неизвестный флаг -> ошибка, а не тихий пропуск ключа', () => {
+    expect(() => parseArgs(['--channel', '1', '--key'])).toThrow(/--key/)
+    expect(() => parseArgs(['--secret', '--channel', '1'])).toThrow(/--secret/)
+    expect(() => parseArgs(['--oops'])).toThrow(/--oops/)
   })
 })

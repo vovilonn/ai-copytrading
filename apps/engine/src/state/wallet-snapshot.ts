@@ -6,7 +6,9 @@
 // планировщика (кэш getEquity существует ради риск-сайзинга внутри одного тика пайплайна, это
 // другая задача — история баланса не должна "отставать" на TTL кэша).
 //
-// channel_id всегда NULL здесь — единственный вид снапшота, который сейчас провижинится (один
+// channel_id: NULL — снапшот всего аккаунта (общий аккаунт из env либо аккаунт, обслуживающий
+// несколько каналов); номер канала — когда у канала СВОЙ субаккаунт и снапшот описывает именно его
+// (см. runtime/account-registry.ts). Раньше здесь всегда стоял NULL — аккаунт был один (
 // demo-аккаунт на весь движок, design plan «Решения»: "Баланс: один demo-аккаунт... Реальные
 // субаккаунты на demo недоступны — DTO заложить под будущее, но не провижинить").
 
@@ -29,7 +31,13 @@ export type WalletSnapshotRestClient = Pick<BybitRestClient, 'getWalletBalance'>
  * вызов в try/catch, чтобы сбой похода за балансом (сеть/rate-limit Bybit) не ронял ни старт
  * движка, ни сам планировщик.
  */
-export async function writeWalletSnapshot(db: Kysely<DB>, rest: WalletSnapshotRestClient): Promise<void> {
+export async function writeWalletSnapshot(
+  db: Kysely<DB>,
+  rest: WalletSnapshotRestClient,
+  /** Канал субаккаунта, если этот аккаунт обслуживает ровно один канал; null — общий аккаунт
+   *  (или аккаунт нескольких каналов): снапшот тогда описывает весь аккаунт, а не канал. */
+  channelId: number | null = null,
+): Promise<void> {
   const balance: WalletBalance = await rest.getWalletBalance()
 
   // F4 (адверсариальное ревью): Bybit документированно возвращает totalEquity='' (сразу после
@@ -51,7 +59,7 @@ export async function writeWalletSnapshot(db: Kysely<DB>, rest: WalletSnapshotRe
   await db
     .insertInto('wallet_snapshots')
     .values({
-      channel_id: null,
+      channel_id: channelId,
       total_equity: totalEquity,
       available_balance: availableBalance,
       currency: 'USDT',

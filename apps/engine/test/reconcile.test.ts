@@ -33,24 +33,32 @@ afterAll(async () => {
   await db.destroy()
 })
 
+// Второй канал нужен блоку «скоуп по каналам» (субаккаунты): его сделки — это «сделки чужого
+// аккаунта», которые сверка не должна трогать. Остальным тестам лишняя строка каналов безразлична —
+// реконсиляция ходит по trades/positions, а не по channels.
+const OTHER_CHANNEL_ID = 2
+const OTHER_CHANNEL_ORD = 2
+
 // reconcileOnStart сканирует ВСЮ таблицу trades (не по одному каналу/символу, в отличие от
 // большинства тестов engine) — полный TRUNCATE перед КАЖДЫМ тестом обязателен, иначе сделки
 // одного сценария всплывали бы в шаге "закрыть по бирже" следующего сценария.
 beforeEach(async () => {
   await resetTestSchema(db)
   await sql`
-    INSERT INTO channels (id, ord, key, source_kind, adapter_id) VALUES (${CHANNEL_ID}, ${CHANNEL_ORD}, 'ch1', 'channel', 'ch1')
+    INSERT INTO channels (id, ord, key, source_kind, adapter_id) VALUES
+      (${CHANNEL_ID}, ${CHANNEL_ORD}, 'ch1', 'channel', 'ch1'),
+      (${OTHER_CHANNEL_ID}, ${OTHER_CHANNEL_ORD}, 'ch2', 'channel', 'ch2')
   `.execute(db)
 })
 
 let tgMessageSeq = 400_000
 
-async function seedMessage(): Promise<{ messageId: string; tgMessageId: number }> {
+async function seedMessage(channelId: number = CHANNEL_ID): Promise<{ messageId: string; tgMessageId: number }> {
   const tgMessageId = tgMessageSeq++
   const row = await db
     .insertInto('messages')
     .values({
-      channel_id: CHANNEL_ID,
+      channel_id: channelId,
       tg_message_id: tgMessageId,
       is_topic_message: false,
       text: '',
@@ -63,12 +71,12 @@ async function seedMessage(): Promise<{ messageId: string; tgMessageId: number }
   return { messageId: row.id, tgMessageId }
 }
 
-async function seedAction(params: { messageId: string; symbol: string; side: Side }): Promise<string> {
+async function seedAction(params: { messageId: string; symbol: string; side: Side; channelId?: number }): Promise<string> {
   const row = await db
     .insertInto('actions')
     .values({
       message_id: params.messageId,
-      channel_id: CHANNEL_ID,
+      channel_id: params.channelId ?? CHANNEL_ID,
       action_index: 0,
       type: 'open',
       side: params.side,
@@ -131,6 +139,8 @@ interface SeedTradeOpts {
   openedAt?: Date
   /** По умолчанию true для open/partially_closed — реалистичный "сделка реально держит символ". */
   acquireOwnership?: boolean
+  /** Канал сделки: по умолчанию CHANNEL_ID; OTHER_CHANNEL_ID — «сделка чужого аккаунта». */
+  channelId?: number
 }
 
 /**
@@ -141,14 +151,16 @@ interface SeedTradeOpts {
  * последовательность воспроизведена здесь вручную (задача 4 не трогает pipeline.ts).
  */
 async function seedTrade(opts: SeedTradeOpts): Promise<{ tradeId: string; humanRef: string; orderLinkId: string }> {
-  const { messageId, tgMessageId } = await seedMessage()
-  const actionId = await seedAction({ messageId, symbol: opts.symbol, side: opts.side })
-  const trade = await openTrade(db, { channelId: CHANNEL_ID, symbol: opts.symbol, side: opts.side })
+  const channelId = opts.channelId ?? CHANNEL_ID
+  const channelOrd = channelId === OTHER_CHANNEL_ID ? OTHER_CHANNEL_ORD : CHANNEL_ORD
+  const { messageId, tgMessageId } = await seedMessage(channelId)
+  const actionId = await seedAction({ messageId, symbol: opts.symbol, side: opts.side, channelId })
+  const trade = await openTrade(db, { channelId, symbol: opts.symbol, side: opts.side })
   const leg = await addLeg(db, { tradeId: trade.tradeId, legIndex: 0, kind: 'entry', requestedQty: opts.size ?? '1' })
 
   const entryParams = {
-    channelId: CHANNEL_ID,
-    channelOrd: CHANNEL_ORD,
+    channelId,
+    channelOrd,
     tgMessageId,
     actionIndex: 0,
     actionId,
@@ -189,7 +201,7 @@ async function seedTrade(opts: SeedTradeOpts): Promise<{ tradeId: string; humanR
     .execute()
 
   if ((opts.acquireOwnership ?? true) && (status === 'open' || status === 'partially_closed')) {
-    await acquireSymbol(db, { channelId: CHANNEL_ID, symbol: opts.symbol, tradeId: trade.tradeId })
+    await acquireSymbol(db, { channelId, symbol: opts.symbol, tradeId: trade.tradeId })
   }
 
   return { tradeId: trade.tradeId, humanRef: trade.humanRef, orderLinkId }
@@ -850,6 +862,42 @@ describe('reconcileOnStart — шаг Б2: фантомные строки зе�
     expect(row.size).toBe('5.0000000000')
   })
 
+  it('НЕ трогает зеркало ЧУЖОГО канала: его позиция живёт на другом аккаунте, эта биржа о ней и не знает', async () => {
+    const symbol = 'PHANTOM4USDT'
+    const { tradeId } = await seedTrade({ channelId: OTHER_CHANNEL_ID, symbol, side: 'long', live: true, status: 'closed' })
+    await db
+      .insertInto('positions')
+      .values({
+        channel_id: OTHER_CHANNEL_ID,
+        symbol,
+        trade_id: tradeId,
+        side: 'long',
+        size: '4',
+        avg_price: '100',
+        updated_at: new Date(Date.now() - 60_000),
+      })
+      .onConflict((oc) =>
+        oc.columns(['channel_id', 'symbol']).doUpdateSet((eb) => ({
+          size: eb.ref('excluded.size'),
+          side: eb.ref('excluded.side'),
+          trade_id: eb.ref('excluded.trade_id'),
+          updated_at: eb.ref('excluded.updated_at'),
+        })),
+      )
+      .execute()
+
+    const result = await reconcileOnStart(db, makeRest([]).rest, { channelIds: [CHANNEL_ID] })
+
+    expect(result.phantomsZeroed).toBe(0)
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', OTHER_CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(row.size).toBe('4.0000000000')
+  })
+
   it('НЕ трогает зеркало, обновлённое ПОЗЖЕ снапшота биржи (WS знает свежее)', async () => {
     const symbol = 'PHANTOM3USDT'
     const { tradeId } = await seedTrade({ symbol, side: 'long', live: true, status: 'closed' })
@@ -887,5 +935,74 @@ describe('reconcileOnStart — шаг Б2: фантомные строки зе�
       .where('symbol', '=', symbol)
       .executeTakeFirstOrThrow()
     expect(row.size).toBe('2.0000000000')
+  })
+})
+
+// Субаккаунты (docs/superpowers/specs/2026-07-26-per-channel-subaccounts-design.md): у каждого
+// канала может быть СВОЙ аккаунт Bybit, и сверка запускается ОТДЕЛЬНО на каждый аккаунт своим
+// rest-клиентом. Без скоупа по каналам сверка аккаунта A увидела бы «сделки канала B без позиции
+// на бирже» (позиции B лежат на аккаунте B, этот клиент их не видит) и закрыла бы их — то есть
+// потушила бы живые чужие сделки. Это самое опасное место задачи, поэтому оно закреплено тестами.
+describe('reconcileOnStart — скоуп по каналам аккаунта (субаккаунты)', () => {
+  it('сверка аккаунта одного канала НЕ закрывает устаревшую сделку чужого канала', async () => {
+    const mine = await seedTrade({
+      symbol: 'SCOPEMINEUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      openedAt: new Date(Date.now() - 10 * 60_000),
+    })
+    const other = await seedTrade({
+      channelId: OTHER_CHANNEL_ID,
+      symbol: 'SCOPEOTHERUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      openedAt: new Date(Date.now() - 10 * 60_000),
+    })
+
+    // Аккаунт канала 1: на бирже пусто. Позиция канала 2 живёт на ДРУГОМ аккаунте.
+    const result = await reconcileOnStart(db, makeRest([]).rest, { channelIds: [CHANNEL_ID] })
+
+    expect(result.closed).toBe(1)
+    const mineRow = await db.selectFrom('trades').selectAll().where('id', '=', mine.tradeId).executeTakeFirstOrThrow()
+    expect(mineRow.status).toBe('closed')
+    const otherRow = await db.selectFrom('trades').selectAll().where('id', '=', other.tradeId).executeTakeFirstOrThrow()
+    expect(otherRow.status).toBe('open')
+    expect(otherRow.closed_at).toBeNull()
+  })
+
+  it('вызов БЕЗ скоупа (общий аккаунт из env) по-прежнему сверяет все каналы — поведение до задачи', async () => {
+    await seedTrade({ symbol: 'SHARED1USDT', side: 'long', live: true, status: 'open', openedAt: new Date(Date.now() - 10 * 60_000) })
+    await seedTrade({
+      channelId: OTHER_CHANNEL_ID,
+      symbol: 'SHARED2USDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      openedAt: new Date(Date.now() - 10 * 60_000),
+    })
+
+    const result = await reconcileOnStart(db, makeRest([]).rest)
+
+    expect(result.closed).toBe(2)
+  })
+
+  it('аккаунт БЕЗ каналов (все ключи канала отвалились) не закрывает ничего чужого', async () => {
+    const other = await seedTrade({
+      channelId: OTHER_CHANNEL_ID,
+      symbol: 'SCOPEEMPTYUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      openedAt: new Date(Date.now() - 10 * 60_000),
+    })
+
+    // Пустой список каналов — НЕ то же самое, что «скоуп не задан»: сверять нечего.
+    const result = await reconcileOnStart(db, makeRest([]).rest, { channelIds: [] })
+
+    expect(result.closed).toBe(0)
+    const row = await db.selectFrom('trades').selectAll().where('id', '=', other.tradeId).executeTakeFirstOrThrow()
+    expect(row.status).toBe('open')
   })
 })

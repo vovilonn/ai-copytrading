@@ -191,13 +191,18 @@ let db: Kysely<DB>
 
 const CHANNEL_ID = 1
 const CHANNEL_ORD = 1
+// Второй канал — «канал чужого аккаунта» для блока про скоуп атрибуции (субаккаунты).
+const OTHER_CHANNEL_ID = 2
+const OTHER_CHANNEL_ORD = 2
 
 beforeAll(async () => {
   db = createDb(process.env.DATABASE_URL!)
   await migrateToLatest(db)
   await resetTestSchema(db)
   await sql`
-    INSERT INTO channels (id, ord, key, source_kind, adapter_id) VALUES (${CHANNEL_ID}, ${CHANNEL_ORD}, 'ch1', 'channel', 'ch1')
+    INSERT INTO channels (id, ord, key, source_kind, adapter_id) VALUES
+      (${CHANNEL_ID}, ${CHANNEL_ORD}, 'ch1', 'channel', 'ch1'),
+      (${OTHER_CHANNEL_ID}, ${OTHER_CHANNEL_ORD}, 'ch2', 'channel', 'ch2')
   `.execute(db)
 })
 
@@ -207,12 +212,12 @@ afterAll(async () => {
 
 let tgMessageSeq = 800_000
 
-async function seedMessage(): Promise<{ messageId: string; tgMessageId: number }> {
+async function seedMessage(channelId: number = CHANNEL_ID): Promise<{ messageId: string; tgMessageId: number }> {
   const tgMessageId = tgMessageSeq++
   const row = await db
     .insertInto('messages')
     .values({
-      channel_id: CHANNEL_ID,
+      channel_id: channelId,
       tg_message_id: tgMessageId,
       is_topic_message: false,
       text: '',
@@ -225,12 +230,12 @@ async function seedMessage(): Promise<{ messageId: string; tgMessageId: number }
   return { messageId: row.id, tgMessageId }
 }
 
-async function seedAction(params: { messageId: string; symbol: string; side: Side }): Promise<string> {
+async function seedAction(params: { messageId: string; symbol: string; side: Side; channelId?: number }): Promise<string> {
   const row = await db
     .insertInto('actions')
     .values({
       message_id: params.messageId,
-      channel_id: CHANNEL_ID,
+      channel_id: params.channelId ?? CHANNEL_ID,
       action_index: 0,
       type: 'open',
       side: params.side,
@@ -243,11 +248,11 @@ async function seedAction(params: { messageId: string; symbol: string; side: Sid
 }
 
 /** Сделка + активное владение символом (attributeSymbol в private-ws.ts читает symbol_ownership). */
-async function setupTrade(symbol: string, side: Side): Promise<{ tradeId: string; actionId: string }> {
-  const { messageId } = await seedMessage()
-  const actionId = await seedAction({ messageId, symbol, side })
-  const trade = await openTrade(db, { channelId: CHANNEL_ID, symbol, side, openedActionId: actionId, openedMsgId: messageId })
-  const acquired = await acquireSymbol(db, { channelId: CHANNEL_ID, symbol, tradeId: trade.tradeId })
+async function setupTrade(symbol: string, side: Side, channelId: number = CHANNEL_ID): Promise<{ tradeId: string; actionId: string }> {
+  const { messageId } = await seedMessage(channelId)
+  const actionId = await seedAction({ messageId, symbol, side, channelId })
+  const trade = await openTrade(db, { channelId, symbol, side, openedActionId: actionId, openedMsgId: messageId })
+  const acquired = await acquireSymbol(db, { channelId, symbol, tradeId: trade.tradeId })
   expect(acquired).toBe(true)
   return { tradeId: trade.tradeId, actionId }
 }
@@ -796,5 +801,65 @@ describe('applyPositionPush — плоский пуш не закрывает т
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', tradeId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('closed')
+  })
+})
+
+// Субаккаунты (docs/superpowers/specs/2026-07-26-per-channel-subaccounts-design.md): приватный WS
+// поднимается НА АККАУНТ, и его пуши относятся только к каналам этого аккаунта. Без скоупа
+// attributeSymbol нашла бы владельца символа в ЛЮБОМ канале — пуш аккаунта A применился бы к
+// сделке канала B (чужие деньги, чужое зеркало). channelIds приходит из реестра аккаунтов.
+describe('applyPositionPush — скоуп атрибуции по каналам аккаунта (субаккаунты)', () => {
+  it('символом владеет ЧУЖОЙ канал -> пуш не применяется, зеркало чужого канала не тронуто', async () => {
+    const symbol = 'SCOPEWSAUSDT'
+    await setupTrade(symbol, 'long', OTHER_CHANNEL_ID)
+    const { rest, calls } = mockCancelAllRest()
+
+    const applied = await applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '3', seq: 1 }), rest, [CHANNEL_ID])
+
+    expect(applied).toBe(false)
+    expect(calls).toEqual([])
+    const row = await db.selectFrom('positions').selectAll().where('symbol', '=', symbol).executeTakeFirst()
+    expect(row).toBeUndefined()
+    // Отказ атрибуции проходит ПОЛНУЮ лестницу ретраев (ATTRIBUTION_RETRY_DELAYS_MS ≈ 6.2с) —
+    // она рассчитана на гонку с коммитом пайплайна, поэтому тесту нужен запас по времени.
+  }, 15_000)
+
+  it('символом владеет СВОЙ канал -> пуш применяется как обычно', async () => {
+    const symbol = 'SCOPEWSBUSDT'
+    const { tradeId } = await setupTrade(symbol, 'long', OTHER_CHANNEL_ID)
+    const { rest } = mockCancelAllRest()
+
+    const applied = await applyPositionPush(
+      db,
+      buildPositionPush({ symbol, side: 'Buy', size: '3', seq: 1 }),
+      rest,
+      [OTHER_CHANNEL_ID],
+    )
+
+    expect(applied).toBe(true)
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', OTHER_CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(row.trade_id).toBe(tradeId)
+  })
+
+  it('скоуп НЕ задан (общий аккаунт из env) -> атрибуция ищет владельца во всех каналах, как раньше', async () => {
+    const symbol = 'SCOPEWSCUSDT'
+    const { tradeId } = await setupTrade(symbol, 'long', OTHER_CHANNEL_ID)
+    const { rest } = mockCancelAllRest()
+
+    const applied = await applyPositionPush(db, buildPositionPush({ symbol, side: 'Buy', size: '2', seq: 1 }), rest)
+
+    expect(applied).toBe(true)
+    const row = await db
+      .selectFrom('positions')
+      .selectAll()
+      .where('channel_id', '=', OTHER_CHANNEL_ID)
+      .where('symbol', '=', symbol)
+      .executeTakeFirstOrThrow()
+    expect(row.trade_id).toBe(tradeId)
   })
 })

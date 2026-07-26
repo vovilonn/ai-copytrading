@@ -1,6 +1,6 @@
 import { Decimal } from 'decimal.js'
 import type { ChannelSlot } from './env.js'
-import type { MessageTrace } from './db.js'
+import type { MessageTrace, PositionRow, TradeRow } from './db.js'
 import type { PostSpec } from './tg.js'
 
 /**
@@ -19,6 +19,15 @@ export interface StepContext {
   postedId(stepIndex: number): number
   /** Символы сценария — удобно в custom-проверках. */
   symbols: string[]
+  /**
+   * Состояние КОНКРЕТНОГО канала — для сценариев про несколько каналов сразу (субаккаунты):
+   * проверка «зеркало и сделки не перепутались между каналами» иначе невыразима, ведь обычные
+   * ожидания шага смотрят только на его собственный канал.
+   */
+  channelState: {
+    positions(slot: ChannelSlot, symbols?: string[]): Promise<PositionRow[]>
+    trades(slot: ChannelSlot, symbols?: string[]): Promise<TradeRow[]>
+  }
   /** Путь к файлу из apps/e2e/fixtures (картинки для медиа-сценариев). */
   fixture(name: string): string
   /**
@@ -92,6 +101,11 @@ export interface StepExpect {
 
 export interface Step {
   title: string
+  /**
+   * Канал ЭТОГО шага, если он отличается от канала сценария. Нужен сценариям про несколько
+   * каналов сразу (субаккаунты): пост уходит в свой канал, и проверки шага смотрят на него же.
+   */
+  slot?: ChannelSlot
   /** Пост в тестовый канал. Отсутствует — шаг только проверяет/действует (см. `act`). */
   post?: PostFactory
   /** Правка ранее отправленного поста: { step: индекс шага, text }. */

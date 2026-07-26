@@ -1,15 +1,16 @@
-// Ключи Bybit per-channel с фолбэком на env (Ф3, задача 5, task-5-brief.md): "Ключи Bybit — из
-// env (BYBIT_API_KEY/SECRET), либо per-channel из channels.bybit_api_key_enc (с фолбэком на env,
-// если субаккаунт не заведён)". В Ф3 у ВСЕХ каналов bybit_api_key_enc/bybit_api_secret_enc — NULL
-// (channel-seed.service.ts сознательно пишет null, провижининг субаккаунтов — design plan
-// "что осознанно не делается в Ф3") — поэтому сегодня этот путь всегда возвращает env-ключи. Но
-// структура (расшифровка через ENCRYPTION_KEY) готова к моменту, когда админ-UI заведёт субаккаунт
-// каналу — сигнатура getChannelKeys уже не изменится.
+// Ключи Bybit per-channel с фолбэком на env: "Ключи Bybit — из env (BYBIT_API_KEY/SECRET), либо
+// per-channel из channels.bybit_api_key_enc (с фолбэком на env, если субаккаунт не заведён)".
+// Канал со своими ключами торгует СВОИМ аккаунтом Bybit (реестр — runtime/account-registry.ts);
+// канал без ключей — общим аккаунтом из env, ровно как до появления субаккаунтов.
+//
+// Ключи заводит CLI `pnpm channel:keys` (channel-keys-cli.ts -> setChannelKeys ниже), а НЕ админка:
+// секрет не должен идти через браузер и логи запросов (docs/superpowers/specs/
+// 2026-07-26-per-channel-subaccounts-design.md §2).
 //
 // Формат шифрования: AES-256-GCM, ключ — `ENCRYPTION_KEY` из .env (64 hex-символа = 32 байта,
 // см. .env.example), хранимая строка — `<iv:12байт-hex>:<authTag:16байт-hex>:<ciphertext-hex>`.
-// encryptSecret экспортирована ради тестов этого файла (и будущего admin-UI, который сегодня ещё
-// не пишет эту колонку) — единственный способ получить валидную зашифрованную строку без живого UI.
+// ВАЖНО: смена ENCRYPTION_KEY делает уже записанные ключи каналов нерасшифровываемыми — канал
+// выпадет из реестра аккаунтов (лог + пропуск сообщений), лечится повторным `pnpm channel:keys`.
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import type { Kysely } from 'kysely'
@@ -63,10 +64,8 @@ export interface ChannelKeys {
 /**
  * Ключи Bybit для канала: `channels.bybit_api_key_enc`/`bybit_api_secret_enc` (расшифровка), с
  * фолбэком на `BYBIT_API_KEY`/`BYBIT_API_SECRET` из env, если у канала обе колонки NULL (субаккаунт
- * не заведён). `channelId=null` — глобальный вызов БЕЗ привязки к конкретному каналу (main.ts:
- * единый REST/приватный WS-клиент движка в Ф3 — "один аккаунт на все каналы", design plan
- * "что осознанно не делается в Ф3": провижининг субаккаунтов не запускается) — пропускает поход
- * в БД и сразу берёт env.
+ * не заведён). `channelId=null` — ключи ОБЩЕГО аккаунта движка: поход в БД пропускается, сразу env
+ * (реестр аккаунтов спрашивает их так, чтобы понять, свой у канала аккаунт или общий).
  */
 export async function getChannelKeys(db: Kysely<DB>, channelId: number | null): Promise<ChannelKeys> {
   if (channelId !== null) {
@@ -88,4 +87,71 @@ export async function getChannelKeys(db: Kysely<DB>, channelId: number | null): 
     )
   }
   return { apiKey, apiSecret }
+}
+
+/** Строка отчёта `pnpm channel:keys --list`: какой канал каким аккаунтом торгует. */
+export interface ChannelAccountRow {
+  id: number
+  key: string
+  title: string | null
+  status: string
+  /** false — канал торгует общим аккаунтом из BYBIT_API_KEY. */
+  ownAccount: boolean
+  subUid: number | null
+}
+
+/**
+ * Привязывает каналу собственный субаккаунт Bybit. Ключ и секрет шифруются под ENCRYPTION_KEY —
+ * в БД открытым текстом не попадает ничего, дампы БД и бэкапы остаются безопасными.
+ *
+ * Проверка ключа живым запросом к бирже делается ВЫШЕ (channel-keys-cli.ts): здесь чистая запись,
+ * чтобы функция тестировалась без сети.
+ */
+export async function setChannelKeys(
+  db: Kysely<DB>,
+  channelId: number,
+  keys: ChannelKeys & { subUid?: number | null },
+): Promise<void> {
+  const result = await db
+    .updateTable('channels')
+    .set({
+      bybit_api_key_enc: encryptSecret(keys.apiKey),
+      bybit_api_secret_enc: encryptSecret(keys.apiSecret),
+      ...(keys.subUid === undefined ? {} : { bybit_sub_uid: keys.subUid }),
+      updated_at: new Date(),
+    })
+    .where('id', '=', channelId)
+    .executeTakeFirst()
+  if (Number(result.numUpdatedRows) === 0) {
+    throw new Error(`setChannelKeys: канала ${channelId} нет в БД`)
+  }
+}
+
+/** Возвращает канал на ОБЩИЙ аккаунт из env (обе колонки → NULL). */
+export async function clearChannelKeys(db: Kysely<DB>, channelId: number): Promise<void> {
+  const result = await db
+    .updateTable('channels')
+    .set({ bybit_api_key_enc: null, bybit_api_secret_enc: null, bybit_sub_uid: null, updated_at: new Date() })
+    .where('id', '=', channelId)
+    .executeTakeFirst()
+  if (Number(result.numUpdatedRows) === 0) {
+    throw new Error(`clearChannelKeys: канала ${channelId} нет в БД`)
+  }
+}
+
+/** Каналы и их аккаунты — БЕЗ расшифровки: сам факт наличия ключей, а не значения. */
+export async function listChannelAccounts(db: Kysely<DB>): Promise<ChannelAccountRow[]> {
+  const rows = await db
+    .selectFrom('channels')
+    .select(['id', 'key', 'title', 'status', 'bybit_api_key_enc', 'bybit_api_secret_enc', 'bybit_sub_uid'])
+    .orderBy('ord')
+    .execute()
+  return rows.map((row) => ({
+    id: row.id,
+    key: row.key,
+    title: row.title,
+    status: row.status,
+    ownAccount: row.bybit_api_key_enc !== null && row.bybit_api_secret_enc !== null,
+    subUid: row.bybit_sub_uid,
+  }))
 }

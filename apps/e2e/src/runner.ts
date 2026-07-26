@@ -4,7 +4,7 @@ import type { Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 import type { BybitRestClient, Order, Position } from 'engine/bybit/rest-client.js'
 import { channelBySlot, type E2eConfig } from './env.js'
-import { findMessage, instrument, trace as traceMessage, waitForProcessed, type MessageTrace } from './db.js'
+import { findMessage, instrument, positionsOf, trace as traceMessage, tradesOf, waitForProcessed, type MessageTrace } from './db.js'
 import { flatten, markPrice, openOrdersOf, positionOf } from './exchange.js'
 import { TgPoster, type PostSpec } from './tg.js'
 import { checkActions, checkExchange, checkMessage, checkOrders, checkPosition } from './assert.js'
@@ -118,7 +118,10 @@ export class ScenarioRunner {
         results.push({ index, title: step.title, status: 'skipped', problems: [], notes: [], postedIds: [], durationMs: 0 })
         continue
       }
-      const result = await this.runStep(scenario, channel.id, step, index, postedByStep)
+      // Канал шага: сценарии про несколько каналов сразу (субаккаунты) публикуют шаги в разные
+      // каналы, поэтому и пост, и проверки шага идут по ЕГО каналу, а не по каналу сценария.
+      const stepChannel = step.slot === undefined ? channel : channelBySlot(this.deps.config, step.slot)
+      const result = await this.runStep(scenario, stepChannel.id, step, index, postedByStep)
       results.push(result)
       // Сорванный шаг делает последующие бессмысленными: состояние сделки уже не то, которое
       // они предполагают (шаг «двигаем стоп» после несостоявшегося входа проверял бы пустоту).
@@ -167,7 +170,7 @@ export class ScenarioRunner {
 
       if (step.post) {
         const spec: PostSpec = typeof step.post === 'function' ? await step.post(ctx) : step.post
-        const posted = await this.deps.poster.post(scenario.slot, spec)
+        const posted = await this.deps.poster.post(step.slot ?? scenario.slot, spec)
         postedByStep.set(index, posted.ids)
         base.postedIds = posted.ids
         if (spec.text !== undefined) base.postedText = spec.text
@@ -177,7 +180,7 @@ export class ScenarioRunner {
         const targetIds = postedByStep.get(step.edit.step)
         if (!targetIds || targetIds.length === 0) throw new Error(`шаг ${index}: нет поста шага ${step.edit.step} для правки`)
         anchorId = targetIds[0]!
-        await this.deps.poster.edit(scenario.slot, anchorId, step.edit.text)
+        await this.deps.poster.edit(step.slot ?? scenario.slot, anchorId, step.edit.text)
         expectedText = step.edit.text
         base.postedIds = [anchorId]
         base.postedText = step.edit.text
@@ -186,7 +189,7 @@ export class ScenarioRunner {
         const targetIds = postedByStep.get(step.deletePost.step)
         if (!targetIds || targetIds.length === 0) throw new Error(`шаг ${index}: нет поста шага ${step.deletePost.step} для удаления`)
         anchorId = targetIds[0]!
-        await this.deps.poster.delete(scenario.slot, targetIds)
+        await this.deps.poster.delete(step.slot ?? scenario.slot, targetIds)
         base.postedIds = targetIds
         this.log(`  · шаг ${index + 1}. ${step.title} → удаление #${anchorId}`)
       } else {
@@ -289,7 +292,6 @@ export class ScenarioRunner {
   }
 
   private async positionsFor(channelId: number, symbols: string[]): Promise<MessageTrace['positions']> {
-    const { positionsOf } = await import('./db.js')
     return positionsOf(this.deps.db, channelId, symbols)
   }
 
@@ -318,6 +320,10 @@ export class ScenarioRunner {
       },
       symbols: scenario.symbols,
       fixture: (name) => fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url)),
+      channelState: {
+        positions: async (slot, symbols) => positionsOf(this.deps.db, channelBySlot(this.deps.config, slot).id, symbols),
+        trades: async (slot, symbols) => tradesOf(this.deps.db, channelBySlot(this.deps.config, slot).id, symbols),
+      },
       ops: {
         setCopyEnabled: async (enabled) => {
           await this.deps.db

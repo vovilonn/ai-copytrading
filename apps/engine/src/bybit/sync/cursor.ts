@@ -8,7 +8,22 @@
 import { sql, type Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 
-export type SyncCursorKey = 'sync:executions' | 'sync:closed_pnl' | 'sync:order_history'
+export type SyncCursorBase = 'sync:executions' | 'sync:closed_pnl' | 'sync:order_history'
+/** Ключ курсора в app_state: базовый для общего аккаунта, с суффиксом `:<fingerprint>` — для
+ *  аккаунта конкретного канала (см. runtime/account-registry.ts). */
+export type SyncCursorKey = SyncCursorBase | `${SyncCursorBase}:${string}`
+
+/**
+ * Курсор ПРИВЯЗАН К АККАУНТУ. Догон истории читает execution/closed-pnl/order-history конкретных
+ * кредов — общий водяной знак на несколько аккаунтов означал бы, что первый же успешный проход
+ * «съедает» окно за остальных, и их история теряется без единой ошибки.
+ *
+ * Общий аккаунт из env сохраняет БАЗОВЫЙ ключ без суффикса: иначе после этой задачи он начал бы
+ * догонять историю с нуля (bootstrap на 7 дней) на уже работающем проде.
+ */
+export function cursorKey(base: SyncCursorBase, accountFingerprint?: string): SyncCursorKey {
+  return accountFingerprint === undefined ? base : `${base}:${accountFingerprint}`
+}
 
 /** Максимальное окно ОДНОГО запроса к Bybit — 7 дней (retCode 10001 при превышении). Берём 6 суток:
  *  запас на дрейф часов и на OVERLAP ниже. */

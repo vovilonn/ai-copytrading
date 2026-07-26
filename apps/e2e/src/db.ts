@@ -379,6 +379,29 @@ export async function positionsOf(db: Kysely<DB>, channelId: number, symbols?: s
   }))
 }
 
+/** Сделки канала (при необходимости — по символам): проверки «сделка ушла не в тот канал». */
+export async function tradesOf(db: Kysely<DB>, channelId: number, symbols?: string[]): Promise<TradeRow[]> {
+  let query = db
+    .selectFrom('trades')
+    .select(['id', 'human_ref', 'symbol', 'side', 'status', 'size', 'initial_size', 'avg_entry', 'leverage', 'realized_pnl', 'needs_review'])
+    .where('channel_id', '=', channelId)
+  if (symbols && symbols.length > 0) query = query.where('symbol', 'in', symbols)
+  const rows = await query.orderBy('seq', 'asc').execute()
+  return rows.map((t) => ({
+    id: t.id,
+    humanRef: t.human_ref,
+    symbol: t.symbol,
+    side: t.side,
+    status: t.status,
+    size: t.size,
+    initialSize: t.initial_size,
+    avgEntry: t.avg_entry,
+    leverage: t.leverage,
+    realizedPnl: t.realized_pnl,
+    needsReview: t.needs_review,
+  }))
+}
+
 /** Инструмент из локального кэша (таблица instruments) — шаг цены/лота для генерации текстов. */
 export interface InstrumentInfo {
   symbol: string

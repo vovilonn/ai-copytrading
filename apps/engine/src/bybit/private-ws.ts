@@ -338,21 +338,33 @@ async function resolveWithRetry<T>(lookup: () => Promise<T | undefined | null>):
  *     чем сюда пришёл финальный пуш `position size→0` с той же биржи — без фолбэка этот пуш
  *     не удалось бы атрибутировать (channel_id обязателен для positions), и state UI устарел бы.
  */
-async function attributeSymbol(db: Kysely<DB>, symbol: string): Promise<SymbolAttribution | null> {
-  const owned = await db
+async function attributeSymbol(
+  db: Kysely<DB>,
+  symbol: string,
+  channelIds?: readonly number[],
+): Promise<SymbolAttribution | null> {
+  // Скоуп аккаунта: пуш пришёл на соединение конкретных кредов, и относиться он может только к
+  // каналам, которые этими кредами торгуют. Пустой список — «таких каналов нет», и фильтр обязан
+  // отсечь всё: превратить его в «разрешить всё» было бы ровно той ошибкой, от которой скоуп и
+  // защищает (impossible id вместо пустого IN — Kysely не строит валидный SQL для пустого списка).
+  const scope = channelIds === undefined ? null : channelIds.length > 0 ? [...channelIds] : [-1]
+
+  let ownedQuery = db
     .selectFrom('symbol_ownership')
     .select(['channel_id', 'trade_id'])
     .where('symbol', '=', symbol)
     .where('released_at', 'is', null)
-    .executeTakeFirst()
+  if (scope) ownedQuery = ownedQuery.where('channel_id', 'in', scope)
+  const owned = await ownedQuery.executeTakeFirst()
   if (owned) return { channelId: owned.channel_id, tradeId: owned.trade_id }
 
-  const lastKnown = await db
+  let lastKnownQuery = db
     .selectFrom('positions')
     .select(['channel_id', 'trade_id'])
     .where('symbol', '=', symbol)
     .where(sql<boolean>`size <> 0`)
-    .executeTakeFirst()
+  if (scope) lastKnownQuery = lastKnownQuery.where('channel_id', 'in', scope)
+  const lastKnown = await lastKnownQuery.executeTakeFirst()
   if (lastKnown) return { channelId: lastKnown.channel_id, tradeId: lastKnown.trade_id }
 
   //  3) фолбэк на НЕДАВНО закрытую сделку. С тех пор как пайплайн зануляет зеркало сам, сразу
@@ -362,7 +374,7 @@ async function attributeSymbol(db: Kysely<DB>, symbol: string): Promise<SymbolAt
   //     потоке, перестают читать — а оно должно означать реальную аномалию (чужая ручная торговля
   //     тем же аккаунтом). Пуш здесь применяется идемпотентно (тот же ноль), побочные эффекты
   //     закрытия не срабатывают: `hadOpenPosition` уже false.
-  const recentlyClosed = await db
+  let recentlyClosedQuery = db
     .selectFrom('positions')
     .innerJoin('trades', 'trades.id', 'positions.trade_id')
     .select(['positions.channel_id as channel_id', 'positions.trade_id as trade_id'])
@@ -370,7 +382,8 @@ async function attributeSymbol(db: Kysely<DB>, symbol: string): Promise<SymbolAt
     .where('trades.closed_at', 'is not', null)
     .where('trades.closed_at', '>', new Date(Date.now() - RECENT_CLOSE_WINDOW_MS))
     .orderBy('trades.closed_at', 'desc')
-    .executeTakeFirst()
+  if (scope) recentlyClosedQuery = recentlyClosedQuery.where('positions.channel_id', 'in', scope)
+  const recentlyClosed = await recentlyClosedQuery.executeTakeFirst()
   if (recentlyClosed) return { channelId: recentlyClosed.channel_id, tradeId: recentlyClosed.trade_id }
 
   return null
@@ -388,9 +401,10 @@ export async function applyPositionPush(
   db: Kysely<DB>,
   push: PositionPush,
   rest: BybitPrivateWsRestClient,
+  channelIds?: readonly number[],
 ): Promise<boolean> {
   // Ретрай — на случай, что транзакция pipeline ещё не закоммитила symbol_ownership (см. resolveWithRetry).
-  const attribution = await resolveWithRetry(() => attributeSymbol(db, push.symbol))
+  const attribution = await resolveWithRetry(() => attributeSymbol(db, push.symbol, channelIds))
   if (!attribution) {
     console.warn(`[private-ws] пуш position по ${push.symbol}: владение символом не найдено в БД — пропускаю`)
     return false
@@ -729,6 +743,14 @@ export interface BybitPrivateWsOptions {
   rest: BybitPrivateWsRestClient
   log?: BybitPrivateWsLogger
   /**
+   * Каналы, которые торгуют ЭТИМ аккаунтом (runtime/account-registry.ts). Пуши приходят на
+   * соединение конкретного аккаунта, поэтому и атрибуция обязана ограничиваться его каналами:
+   * иначе позиция по символу, открытая каналом другого аккаунта, «притянула» бы к себе чужой пуш
+   * (symbol_ownership уникален по паре (канал, символ) именно в расчёте на разные субаккаунты).
+   * Не задано — атрибуция глобальная, как было до появления субаккаунтов.
+   */
+  channelIds?: readonly number[]
+  /**
    * Время БИРЖИ (rest.serverNowMs) — им подписывается `expires` в auth. Локальные часы для этого
    * негодны ровно по той же причине, что и в REST: уехавшая на секунды VM даёт биржевую метку из
    * прошлого/будущего, auth не проходит, и приватный поток молча замолкает — позиции и филлы
@@ -874,7 +896,7 @@ export class BybitPrivateWs {
       case 'position':
         for (const item of frame.data) {
           const push = toPositionPush(item)
-          if (push && (await applyPositionPush(this.opts.db, push, this.opts.rest))) notifyNeeded = true
+          if (push && (await applyPositionPush(this.opts.db, push, this.opts.rest, this.opts.channelIds))) notifyNeeded = true
         }
         break
       case 'execution':

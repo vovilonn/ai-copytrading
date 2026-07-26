@@ -2,7 +2,7 @@ import type { Scenario } from '../scenario.js'
 import { smokeCh1 } from './smoke.js'
 import { ch1Busy, ch1Fraction, ch1Guards, ch1Lifecycle, ch1Media, ch1Noise, ch1ShortBreakeven } from './ch1.js'
 import { ch2Freeform, ch2Limit, ch2MarketFlow, ch2Noise, ch2Structured, ch2Vision } from './ch2.js'
-import { opsCopyDisabled, opsManualClose } from './ops.js'
+import { opsCopyDisabled, opsManualClose, opsTwoChannels } from './ops.js'
 
 /**
  * Каталог сценариев. Порядок = порядок прогона (`pnpm e2e run`): сначала дымовой (если он
@@ -28,4 +28,5 @@ export const SCENARIOS: readonly Scenario[] = [
   ch2Vision,
   opsCopyDisabled,
   opsManualClose,
+  opsTwoChannels,
 ]

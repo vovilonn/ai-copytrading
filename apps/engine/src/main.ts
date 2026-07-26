@@ -7,12 +7,11 @@ import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
 import type { Network } from 'shared/domain.js'
 import { createExecutionPort, type ExecutionPort } from './execution/port.js'
-import { BybitApiError, BybitRestClient } from './bybit/rest-client.js'
-import { BybitPrivateWs } from './bybit/private-ws.js'
-import { reconcileOnStart, type ReconcileResult } from './bybit/reconcile.js'
+import { BybitApiError } from './bybit/rest-client.js'
+import { reconcileOnStart, type ReconcileResult, type ReconcileScope } from './bybit/reconcile.js'
 import { getEquity } from './state/equity.js'
 import { writeWalletSnapshot } from './state/wallet-snapshot.js'
-import { getChannelKeys } from './bybit/channel-keys.js'
+import { buildAccountRegistry, type AccountRegistry, type AccountRuntime } from './runtime/account-registry.js'
 import { TickersFeed } from './market-data/tickers-feed.js'
 import { processMessage, type PipelineDeps, type PipelineMessage } from './pipeline.js'
 
@@ -164,10 +163,10 @@ async function processChannel(db: Kysely<DB>, channelId: number, deps: PipelineD
   }
 }
 
-export interface LiveRuntime {
-  executionPort: ExecutionPort
-  privateWs: BybitPrivateWs
-  reconcileResult: ReconcileResult
+/** Снапшот баланса подписывается каналом ТОЛЬКО если аккаунт обслуживает ровно один канал —
+ *  иначе цифра относится к аккаунту целиком, и приписывать её одному каналу было бы ложью. */
+function walletSnapshotChannelId(runtime: AccountRuntime): number | null {
+  return !runtime.shared && runtime.channelIds.length === 1 ? runtime.channelIds[0]! : null
 }
 
 /** Минимальный контракт rest-клиента, нужный `createMarkPriceGetter` — тестируется мок-объектом
@@ -205,61 +204,61 @@ export function createMarkPriceGetter(rest: MarkPriceRestClient): (symbol: strin
 }
 
 /**
- * Единая точка ветвления EXECUTION_MODE внутри main.ts (design spec §14: "EXECUTION_MODE —
- * единственная точка ветвления... никаких if(dryRun) по коду"): main() (ниже) — ЕДИНСТВЕННЫЙ
- * `if` по режиму в этом файле, а эта функция поднимает live-ресурсы в порядке брифа задачи 5 —
- * реконсиляция → приватный WS → ExecutionPort. dry_run вообще не заходит сюда. Второе (парное)
- * место ветвления — фабрика `createExecutionPort` (execution/port.ts): pipeline.ts и сами адаптеры
- * не содержат ни одного `if` по режиму.
+ * Подъём ОДНОГО торгового аккаунта при старте live-движка: часы → сверка → приватный WS → equity →
+ * снапшот баланса. Клиенты аккаунта уже собраны реестром (runtime/account-registry.ts), здесь —
+ * только последовательность и её отказоустойчивость, поэтому функция тестируется подставным
+ * рантаймом без сети.
  *
- * `rest` конструируется ВЫЗЫВАЮЩЕЙ стороной (main() — реальным `BybitRestClient` с ключами канала/
- * env; тесты — мок-объектом с приведением типа `as unknown as BybitRestClient`, тот же приём, что
- * и `createExecutionPort` в bybit-adapter.test.ts) — так реконсиляция и фабрика тестируются без
- * реальной сети. `privateWs.start()` (реальный WebSocket-коннект) сознательно ОСТАЁТСЯ ЗА
- * пределами этой функции — вызывается отдельно в main() СРАЗУ после — тесты этой функции поэтому
- * не открывают сокет (private-ws.ts: `connect()` вызывается только из `start()`, конструктор сам
- * по себе безопасен).
+ * EXECUTION_MODE остаётся единственной точкой ветвления в main() (design spec §14): dry_run сюда
+ * вообще не заходит, а pipeline.ts и адаптеры не содержат ни одного `if` по режиму.
  */
-export async function initLiveRuntime(
-  db: Kysely<DB>,
-  rest: BybitRestClient,
-  network: Network,
-  keys: { apiKey: string; apiSecret: string },
-): Promise<LiveRuntime> {
-  // Сбой реконсиляции на старте НЕ должен ронять движок: раньше исключение отсюда (5xx/таймаут
-  // Bybit, битое поле в ответе) уходило в main().catch → process.exitCode=1 → рестарт → снова
-  // тот же вызов = crash-loop, при котором пайплайн не обрабатывает сообщения вообще. Живём
-  // дальше с неполной сверкой — периодический проход (RECONCILE_INTERVAL_MS) повторит попытку.
-  // Часы биржи — ДО первой подписи: локальные часы контейнера могут уехать (сон хоста/VM), и
-  // тогда КАЖДЫЙ приватный запрос отвергается кодом 10002, а приватный WS не проходит auth —
-  // движок молча слепнет (см. bybit/server-time.ts). Сбой самой синхронизации не критичен:
-  // поправка останется нулевой, а 10002 форсирует повтор.
-  const clockOffsetMs = await rest.syncClock()
-  console.log(`[engine] часы биржи: поправка ${clockOffsetMs} мс`)
+export async function startAccountRuntime(db: Kysely<DB>, runtime: AccountRuntime): Promise<ReconcileResult> {
+  // Часы биржи — ДО первой подписи: локальные часы контейнера могут уехать (сон хоста/VM), и тогда
+  // КАЖДЫЙ приватный запрос отвергается кодом 10002, а приватный WS не проходит auth — движок молча
+  // слепнет (см. bybit/server-time.ts). Сбой самой синхронизации не критичен: поправка останется
+  // нулевой, а 10002 форсирует повтор.
+  const clockOffsetMs = await runtime.rest.syncClock()
+  console.log(`[engine] аккаунт ${runtime.fingerprint}: часы биржи, поправка ${clockOffsetMs} мс`)
 
-  const reconcileResult = await reconcileOnStart(db, rest).catch((err): ReconcileResult => {
-    console.error('[engine] reconcileOnStart не удалась — стартуем без стартовой сверки:', err)
+  // Сверка ограничена каналами ЭТОГО аккаунта: иначе она увидела бы сделки чужих каналов без
+  // позиции на бирже (их позиции живут на другом аккаунте) и закрыла бы их. Сбой сверки НЕ должен
+  // ронять движок: исключение отсюда уходило бы в main().catch → exitCode=1 → рестарт → снова тот
+  // же вызов = crash-loop, при котором пайплайн не обрабатывает сообщения вообще. Живём дальше с
+  // неполной сверкой — периодический проход (RECONCILE_INTERVAL_MS) повторит попытку.
+  const result = await reconcileOnStart(db, runtime.rest, reconcileScope(runtime)).catch((err): ReconcileResult => {
+    console.error(`[engine] reconcileOnStart аккаунта ${runtime.fingerprint} не удалась:`, err)
     return { opened: 0, closed: 0, flagged: 0, orphansCancelled: 0, reattributedExecutions: 0, phantomsZeroed: 0, degraded: true }
   })
   console.log(
-    `[engine] reconcileOnStart: opened=${reconcileResult.opened} closed=${reconcileResult.closed} ` +
-      `flagged=${reconcileResult.flagged} orphansCancelled=${reconcileResult.orphansCancelled} ` +
-      `reattributedExecutions=${reconcileResult.reattributedExecutions} ` +
-      `phantomsZeroed=${reconcileResult.phantomsZeroed}` +
-      (reconcileResult.degraded ? ' (DEGRADED: сверка не выполнена)' : ''),
+    `[engine] reconcileOnStart ${runtime.fingerprint}: opened=${result.opened} closed=${result.closed} ` +
+      `flagged=${result.flagged} orphansCancelled=${result.orphansCancelled} ` +
+      `reattributedExecutions=${result.reattributedExecutions} phantomsZeroed=${result.phantomsZeroed}` +
+      (result.degraded ? ' (DEGRADED: сверка не выполнена)' : ''),
   )
-  // nowMs — часы БИРЖИ того же rest-клиента: auth приватного WS подписывается временем, и на
-  // уехавших локальных часах поток молча не поднимается (см. bybit/server-time.ts).
-  const privateWs = new BybitPrivateWs({
-    apiKey: keys.apiKey,
-    apiSecret: keys.apiSecret,
-    network,
-    db,
-    rest,
-    nowMs: () => rest.serverNowMs(),
-  })
-  const executionPort = createExecutionPort('live', { rest, network })
-  return { executionPort, privateWs, reconcileResult }
+
+  runtime.privateWs.start()
+  runtime.equity = (await getEquity(runtime.rest)).toString()
+  console.log(`[engine] аккаунт ${runtime.fingerprint}: equity ${runtime.equity}`)
+
+  try {
+    await writeWalletSnapshot(db, runtime.rest, walletSnapshotChannelId(runtime))
+  } catch (err) {
+    console.error(`[engine] writeWalletSnapshot (старт, аккаунт ${runtime.fingerprint}):`, err)
+  }
+
+  return result
+}
+
+/**
+ * Скоуп сверки аккаунта: свои каналы + свой водяной знак догона истории. Общий (env) аккаунт
+ * сохраняет ПРЕЖНИЙ ключ курсора без fingerprint — иначе первый же старт после обновления
+ * перечитал бы всю историю прода заново.
+ */
+function reconcileScope(runtime: AccountRuntime): ReconcileScope {
+  return {
+    channelIds: runtime.channelIds,
+    ...(runtime.shared ? {} : { accountFingerprint: runtime.fingerprint }),
+  }
 }
 
 /**
@@ -281,11 +280,21 @@ export async function initLiveRuntime(
  *
  * @returns число отменённых ордеров (для лога планировщика).
  */
-export async function sweepExpiredLimitOrders(db: Kysely<DB>, executionPort: ExecutionPort, now: Date = new Date()): Promise<number> {
+export async function sweepExpiredLimitOrders(
+  db: Kysely<DB>,
+  /**
+   * Порт КАНАЛА, а не движка: с субаккаунтами лимитку канала может отменить только клиент его
+   * аккаунта — чужими ключами Bybit просто не найдёт этот ордер (110001). Функция получает
+   * резолвер, а не готовый порт; `null` от резолвера означает «канал не обслуживается» — такие
+   * ордера пропускаем, их отменит следующий свип после починки ключей.
+   */
+  portForChannel: (channelId: number) => ExecutionPort | null,
+  now: Date = new Date(),
+): Promise<number> {
   const expired = await db
     .selectFrom('orders')
     .innerJoin('channel_settings', 'channel_settings.channel_id', 'orders.channel_id')
-    .select(['orders.order_link_id as orderLinkId'])
+    .select(['orders.order_link_id as orderLinkId', 'orders.channel_id as channelId'])
     .where('orders.purpose', 'in', ['entry', 'add'])
     .where('orders.order_type', '=', 'limit')
     .where('orders.status', '=', 'submitted')
@@ -294,13 +303,17 @@ export async function sweepExpiredLimitOrders(db: Kysely<DB>, executionPort: Exe
     )
     .execute()
 
+  let cancelled = 0
   for (const row of expired) {
+    const port = portForChannel(row.channelId)
+    if (!port) continue
     // Один ордер — одна транзакция (не пачкой): cancelOrder(tx,...) сам решает, filled/cancelled
     // ли уже ордер (идемпотентно) — крэш посреди свипа отменяет то, что успел, остальное подхватит
     // следующий тик планировщика, не оставляя "половину" эффекта одной строки.
-    await db.transaction().execute((trx) => executionPort.cancelOrder(trx, { orderLinkId: row.orderLinkId }))
+    await db.transaction().execute((trx) => port.cancelOrder(trx, { orderLinkId: row.orderLinkId }))
+    cancelled++
   }
-  return expired.length
+  return cancelled
 }
 
 async function main(): Promise<void> {
@@ -312,53 +325,67 @@ async function main(): Promise<void> {
   // реальный REST-клиент/реконсиляцию/приватный WS ДО первого тика пайплайна; dry_run — как раньше,
   // без единого сетевого похода к Bybit (задача не должна ничего сломать в dry_run пути).
   let executionPort: ExecutionPort
-  let liveRest: BybitRestClient | null = null
-  let privateWs: BybitPrivateWs | null = null
-  let initialEquity = DRY_RUN_EQUITY
-  // Important I2: undefined в dry_run — гейт в pipeline.ts::handleEntrySignal вообще не
-  // вызывается, если это поле не задано (нет сети в dry_run, тот же принцип, что и initialEquity
-  // выше) — это единственный fail-open случай. В live поле ВСЕГДА задано (createMarkPriceGetter
-  // ниже); если сам вызов вернёт null (сбой похода за ценой) — фикс p3-slippage-fix делает гейт
-  // fail-CLOSED (pipeline.ts: skip mark_price_unavailable), а не fail-open.
-  let getMarkPrice: PipelineDeps['getMarkPrice']
+
+  // Реестр аккаунтов (runtime/account-registry.ts): у каждого канала может быть СВОЙ субаккаунт
+  // Bybit. Каналы без собственных ключей обслуживает общий аккаунт из BYBIT_API_KEY — поведение до
+  // появления субаккаунтов, поэтому существующий прод продолжает работать без единого действия.
+  let registry: AccountRegistry | null = null
 
   if (config.executionMode === 'live') {
-    // Ф3: одно окружение → все каналы (channels.bybit_api_key_enc/secret_enc сегодня всегда NULL,
-    // channel-seed.service.ts) — getChannelKeys(db, null) сразу берёт BYBIT_API_KEY/SECRET из env,
-    // не угадывая "какой канал главный". Per-channel субаккаунты — готовая структура, не мандат Ф3.
-    const keys = await getChannelKeys(db, null)
-    liveRest = new BybitRestClient({ apiKey: keys.apiKey, apiSecret: keys.apiSecret, network: config.bybitNetwork })
-    const live = await initLiveRuntime(db, liveRest, config.bybitNetwork, keys)
-    executionPort = live.executionPort
-    privateWs = live.privateWs
-    privateWs.start()
-    initialEquity = (await getEquity(liveRest)).toString()
-    console.log(`[engine] equity (wallet-balance totalEquity): ${initialEquity}`)
+    const liveChannels = await db
+      .selectFrom('channels')
+      .select('id')
+      .where('adapter_id', 'in', KNOWN_ADAPTER_IDS)
+      .where('status', '=', 'active')
+      .execute()
 
-    // Task 3: первый снапшот wallet_snapshots сразу при старте live — не ждать первого тика
-    // планировщика ниже (см. WALLET_SNAPSHOT_INTERVAL_MS). Сбой похода к Bybit не должен ронять
-    // старт движка — лог и продолжаем (writeWalletSnapshot сама не ловит ошибки, см. её топ-комментарий).
-    try {
-      await writeWalletSnapshot(db, liveRest)
-    } catch (err) {
-      console.error('[engine] writeWalletSnapshot (первый снапшот при старте):', err)
+    registry = await buildAccountRegistry({
+      db,
+      network: config.bybitNetwork,
+      channelIds: liveChannels.map((c) => c.id),
+      initialEquity: DRY_RUN_EQUITY,
+    })
+
+    for (const runtime of registry.all()) {
+      await startAccountRuntime(db, runtime)
     }
 
-    // Important I2 / фикс p3-slippage-fix: живой mark price — публичный тикер (createMarkPriceGetter
-    // выше), не стаб-позиция `position/list` (та отдаёт markPrice="" на аккаунте без истории по
-    // символу — см. комментарий над createMarkPriceGetter). Сбой похода за ценой -> null -> гейт
-    // теперь fail-CLOSED (pipeline.ts: skip mark_price_unavailable), не fail-open.
-    getMarkPrice = createMarkPriceGetter(liveRest)
+    for (const { channelId, reason } of registry.unavailable()) {
+      console.error(`[engine] канал ${channelId} пропускается: ${reason}`)
+    }
+
+    // Порт по умолчанию (каналы вне реестра его не получат — их сообщения не обрабатываются).
+    executionPort = registry.all()[0]?.executionPort ?? createExecutionPort('dry_run')
   } else {
     executionPort = createExecutionPort('dry_run')
   }
 
-  const deps: PipelineDeps = {
-    executionPort,
-    network: config.bybitNetwork,
-    equity: initialEquity,
-    ...(getMarkPrice ? { getMarkPrice } : {}),
-    maxEntrySlippagePct: MAX_ENTRY_SLIPPAGE_PCT,
+  /**
+   * Зависимости пайплайна ДЛЯ КОНКРЕТНОГО КАНАЛА: порт исполнения, equity и источник цены берутся
+   * у аккаунта этого канала. Раньше объект был один на весь движок — с субаккаунтами это означало
+   * бы, что ордер канала уходит чужими ключами, а риск считается от чужого депозита.
+   *
+   * `null` — канал не обслуживается (нет рабочих ключей): его сообщения пропускаются до тех пор,
+   * пока оператор не поправит ключи и не перезапустит движок.
+   */
+  function depsForChannel(channelId: number): PipelineDeps | null {
+    if (config.executionMode !== 'live') {
+      return {
+        executionPort,
+        network: config.bybitNetwork,
+        equity: DRY_RUN_EQUITY,
+        maxEntrySlippagePct: MAX_ENTRY_SLIPPAGE_PCT,
+      }
+    }
+    const runtime = registry?.forChannel(channelId) ?? null
+    if (!runtime) return null
+    return {
+      executionPort: runtime.executionPort,
+      network: config.bybitNetwork,
+      equity: runtime.equity,
+      getMarkPrice: createMarkPriceGetter(runtime.rest),
+      maxEntrySlippagePct: MAX_ENTRY_SLIPPAGE_PCT,
+    }
   }
 
   // Задача 10: публичный WS-фид mark price для символов с открытыми позициями — независим от
@@ -389,7 +416,9 @@ async function main(): Promise<void> {
         .where('status', '=', 'active')
         .execute()
       for (const { id: channelId } of channels) {
-        await withChannelLock(config.databaseUrl, channelId, () => processChannel(db, channelId, deps))
+        const channelDeps = depsForChannel(channelId)
+        if (!channelDeps) continue // канал без рабочих ключей — уже залогирован при старте
+        await withChannelLock(config.databaseUrl, channelId, () => processChannel(db, channelId, channelDeps))
       }
     } catch (err) {
       console.error('[engine] ошибка тика обработки:', err)
@@ -444,55 +473,56 @@ async function main(): Promise<void> {
   // TTL-свип — оба режима безусловно (sweepExpiredLimitOrders сам не ветвится по режиму, см.
   // комментарий над функцией выше).
   ttlSweepTimer = setInterval(() => {
-    sweepExpiredLimitOrders(db, executionPort)
+    sweepExpiredLimitOrders(db, (channelId) => depsForChannel(channelId)?.executionPort ?? null)
       .then((n) => {
         if (n > 0) console.log(`[engine] TTL-свип: отменено лимиток ${n}`)
       })
       .catch((err) => console.error('[engine] TTL-свип лимиток:', err))
   }, TTL_SWEEP_INTERVAL_MS)
 
-  if (liveRest) {
-    // Захват в const: `liveRest` объявлен как `let` выше, TS не сужает такую переменную внутри
-    // замыканий setInterval (могла бы быть переприсвоена между определением и вызовом) — локальная
-    // const убирает необходимость в `!`-assertion и гарантированно не null внутри таймеров.
-    const rest = liveRest
-    // Проходы не должны накладываться: сверка ходит в сеть и с догоном истории (окна execution/
-    // order-history/closed-pnl) легко переживёт свой интервал. Тот же приём, что `draining` у tick().
-    let reconciling = false
+  if (registry) {
+    const runtimes = registry.all()
+    // Проходы не должны накладываться: сверка ходит в сеть и с догоном истории легко переживёт свой
+    // интервал. Тот же приём, что `draining` у tick(), но теперь на КАЖДЫЙ аккаунт свой флаг.
+    const reconciling = new Set<string>()
     reconcileTimer = setInterval(() => {
-      if (reconciling) {
-        console.warn('[engine] реконсиляция ещё идёт — пропускаю тик')
-        return
+      for (const runtime of runtimes) {
+        if (reconciling.has(runtime.fingerprint)) {
+          console.warn(`[engine] реконсиляция аккаунта ${runtime.fingerprint} ещё идёт — пропускаю тик`)
+          continue
+        }
+        reconciling.add(runtime.fingerprint)
+        reconcileOnStart(db, runtime.rest, reconcileScope(runtime))
+          .then((result) =>
+            console.log(
+              `[engine] периодическая реконсиляция ${runtime.fingerprint}: opened=${result.opened} closed=${result.closed} ` +
+                `flagged=${result.flagged} orphansCancelled=${result.orphansCancelled} ` +
+                `reattributedExecutions=${result.reattributedExecutions} phantomsZeroed=${result.phantomsZeroed}`,
+            ),
+          )
+          .catch((err) => console.error(`[engine] периодическая реконсиляция ${runtime.fingerprint}:`, err))
+          .finally(() => reconciling.delete(runtime.fingerprint))
       }
-      reconciling = true
-      reconcileOnStart(db, rest)
-        .then((result) =>
-          console.log(
-            `[engine] периодическая реконсиляция: opened=${result.opened} closed=${result.closed} ` +
-              `flagged=${result.flagged} orphansCancelled=${result.orphansCancelled} ` +
-              `reattributedExecutions=${result.reattributedExecutions} phantomsZeroed=${result.phantomsZeroed}`,
-          ),
-        )
-        .catch((err) => console.error('[engine] периодическая реконсиляция:', err))
-        .finally(() => {
-          reconciling = false
-        })
     }, RECONCILE_INTERVAL_MS)
 
     equityTimer = setInterval(() => {
-      getEquity(rest, { forceRefresh: true })
-        .then((value) => {
-          deps.equity = value.toString()
-        })
-        .catch((err) => console.error('[engine] рефреш equity:', err))
+      for (const runtime of runtimes) {
+        getEquity(runtime.rest, { forceRefresh: true })
+          .then((value) => {
+            // Пайплайн читает equity через depsForChannel на каждом тике — достаточно обновить
+            // поле рантайма, пересобирать deps не нужно.
+            runtime.equity = value.toString()
+          })
+          .catch((err) => console.error(`[engine] рефреш equity ${runtime.fingerprint}:`, err))
+      }
     }, EQUITY_REFRESH_INTERVAL_MS)
 
-    // Task 3: планировщик снапшотов wallet_snapshots — только live (первый снапшот уже написан
-    // синхронно при старте выше, этот таймер продолжает писать периодически). Ошибка Bybit/БД не
-    // должна ронять движок — try/catch внутри writeWalletSnapshot вызывающей стороной не нужен,
-    // достаточно .catch() на промис планировщика (тот же приём, что reconcileTimer/equityTimer выше).
     walletSnapshotTimer = setInterval(() => {
-      writeWalletSnapshot(db, rest).catch((err) => console.error('[engine] writeWalletSnapshot (планировщик):', err))
+      for (const runtime of runtimes) {
+        writeWalletSnapshot(db, runtime.rest, walletSnapshotChannelId(runtime)).catch((err) =>
+          console.error(`[engine] writeWalletSnapshot (планировщик, ${runtime.fingerprint}):`, err),
+        )
+      }
     }, WALLET_SNAPSHOT_INTERVAL_MS)
   }
 
@@ -511,7 +541,7 @@ async function main(): Promise<void> {
     if (equityTimer) clearInterval(equityTimer)
     if (walletSnapshotTimer) clearInterval(walletSnapshotTimer)
     tickersFeed.stop()
-    privateWs?.stop()
+    for (const runtime of registry?.all() ?? []) runtime.privateWs.stop()
     const closeListener = listenClient ? listenClient.end().catch(() => {}) : Promise.resolve()
     closeListener
       .then(() => db.destroy())

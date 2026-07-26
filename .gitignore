@@ -35,3 +35,6 @@ var/
 
 # Рабочие файлы subagent-driven-development
 .superpowers/
+
+# Локальные оверрайды compose на конкретном сервере (адреса, порты, пути этого хоста).
+docker-compose.override.yml

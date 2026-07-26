@@ -22,7 +22,7 @@ import { Decimal } from 'decimal.js'
 import { sql, type Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 import type { ClosedPnl } from '../rest-client.js'
-import { chunkWindows, resolveSyncFrom, writeCursor } from './cursor.js'
+import { chunkWindows, cursorKey, resolveSyncFrom, writeCursor } from './cursor.js'
 
 export interface ClosedPnlBackfillRest {
   getClosedPnl(params: { startTime?: number; endTime?: number }): Promise<ClosedPnl[]>
@@ -41,8 +41,10 @@ export async function backfillClosedPnl(
   rest: ClosedPnlBackfillRest,
   nowMs: number,
   oldestLiveTradeMs?: number | null,
+  /** Аккаунт, чью историю догоняем: курсор у каждого свой (см. cursor.ts::cursorKey). */
+  accountFingerprint?: string,
 ): Promise<BackfillClosedPnlResult> {
-  const { from, truncated } = await resolveSyncFrom(db, 'sync:closed_pnl', nowMs, oldestLiveTradeMs)
+  const { from, truncated } = await resolveSyncFrom(db, cursorKey('sync:closed_pnl', accountFingerprint), nowMs, oldestLiveTradeMs)
   const windows = chunkWindows(from, nowMs)
 
   const result: BackfillClosedPnlResult = { fetched: 0, patched: 0, affectedTradeIds: [], truncated }
@@ -58,7 +60,7 @@ export async function backfillClosedPnl(
       for (const id of patched.tradeIds) affected.add(id)
     }
 
-    await writeCursor(db, 'sync:closed_pnl', window.end)
+    await writeCursor(db, cursorKey('sync:closed_pnl', accountFingerprint), window.end)
   }
 
   result.affectedTradeIds = [...affected]

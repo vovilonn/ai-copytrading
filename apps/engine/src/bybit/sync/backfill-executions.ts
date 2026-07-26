@@ -13,7 +13,7 @@ import { sql, type Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 import type { Execution, Order } from '../rest-client.js'
 import { attributeExecution, type AttributionKind } from './attribute.js'
-import { chunkWindows, resolveSyncFrom, writeCursor, type SyncWindow } from './cursor.js'
+import { chunkWindows, cursorKey, resolveSyncFrom, writeCursor, type SyncWindow } from './cursor.js'
 
 export interface ExecutionsBackfillRest {
   getExecutions(params: { startTime?: number; endTime?: number }): Promise<Execution[]>
@@ -44,8 +44,10 @@ export async function backfillExecutions(
   rest: ExecutionsBackfillRest,
   nowMs: number,
   oldestLiveTradeMs?: number | null,
+  /** Аккаунт, чью историю догоняем: курсор у каждого свой (см. cursor.ts::cursorKey). */
+  accountFingerprint?: string,
 ): Promise<BackfillExecutionsResult> {
-  const { from, truncated } = await resolveSyncFrom(db, 'sync:executions', nowMs, oldestLiveTradeMs)
+  const { from, truncated } = await resolveSyncFrom(db, cursorKey('sync:executions', accountFingerprint), nowMs, oldestLiveTradeMs)
   const windows = chunkWindows(from, nowMs)
 
   const result: BackfillExecutionsResult = {
@@ -86,7 +88,7 @@ export async function backfillExecutions(
 
     // Курсор двигаем ТОЛЬКО после полностью потреблённого окна: крэш посреди догона просто заставит
     // перечитать окно заново, а дубликаты бесплатны (UNIQUE bybit_exec_id).
-    await writeCursor(db, 'sync:executions', window.end)
+    await writeCursor(db, cursorKey('sync:executions', accountFingerprint), window.end)
   }
 
   result.affectedTradeIds = [...affected]
