@@ -29,7 +29,7 @@ const USAGE = `
   session [--print]               завести постеру ОТДЕЛЬНУЮ сессию Telegram (E2E_TG_SESSION)
   doctor                          проверка готовности стека
   reset [--no-flatten]            чистый лист (биржа + БД + курсор)
-        [--trade-size 150] [--max-notional 300] [--max-leverage 10]
+        [--trade-size 30] [--max-notional 300] [--max-leverage 10]
   list [--tag <тег>]              список сценариев
   run [--only id1,id2] [--tag t]  прогон сценариев
       [--repeat N]                прогнать выбранное N раз подряд (ловля «плавающих» дефектов)

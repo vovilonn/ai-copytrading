@@ -260,7 +260,10 @@ export function ChannelSettings({ channel }: { channel: ChannelDto }) {
         />
       </SettingsRow>
 
-      <SettingsRow title="Trade size" description="Fixed notional used for every trade copied from this channel.">
+      <SettingsRow
+        title="Trade size"
+        description="Margin per trade — the amount actually taken from your balance. Position size = this × leverage. Used when the signal names no risk %."
+      >
         <div className="flex h-[34px] flex-none items-center overflow-hidden rounded-[7px] border border-white/[.12] bg-white/[.04]">
           <span className="pl-[11px] pr-[3px] text-[13px] text-muted-1">$</span>
           <Input

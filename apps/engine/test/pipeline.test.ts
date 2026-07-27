@@ -367,9 +367,10 @@ describe('pipeline — channel_settings.enabled (Important #2)', () => {
 describe('pipeline — TP-лесенка без нулевых долей (Minor #4)', () => {
   it('total=2, qtyStep=1, 3 цели -> НИ ОДНОГО tp-ордера с qty=0, весь объём в последней цели', async () => {
     const channelId = nextChannelId++
-    // qtyStep='1' (грубый шаг) + tradeSize='100' + entry=50 -> notional=100, qty=floor_to(1,2)=2.
-    // 2/3 < 1 -> первые две доли splitQtyEvenly обнулились бы без фильтра buildTpTargets.
-    await seedChannel({ channelId, symbol: 'EEEUSDT', tradeSize: '100', qtyStep: '1' })
+    // Плечо зажато в 1, поэтому позиция равна марже: trade_size=100 -> notional=100, entry=50 ->
+    // qty=floor_to(1,2)=2. Тесту важен ровно qty=2: 2/3 < 1, и первые две доли splitQtyEvenly
+    // обнулились бы без фильтра buildTpTargets.
+    await seedChannel({ channelId, symbol: 'EEEUSDT', tradeSize: '100', qtyStep: '1', maxLeverage: '1' })
     const text = '#EEE/USDT 📈LONG\n\nДиапазон входа: 50 - 50$\nTP: 60$ - 65$ - 70$\nSL: 45$'
     const message = await insertMessage(channelId, 1, text)
     await processMessage(db, message, deps)
@@ -763,10 +764,10 @@ describe('pipeline — вход по рынку и лимиткой (свобо�
     expect(action.status).toBe('executed')
 
     // Стопа в сигнале нет → риск-формула неприменима (её знаменатель — стоп-дистанция). Размер
-    // берётся фиксированным trade_size: 150 / цена 100 = 1.5. Именно поэтому trade_size обязан быть
-    // не меньше `шаг_объёма × цена`, иначе объём округлится в ноль (у BTC шаг 0.001 → минимум ~65).
+    // берётся из trade_size, а это МАРЖА: 150 маржи × плечо 10 = позиция 1500, при цене 100 это
+    // qty=15. Из депозита при этом уходит ровно 150 — та цифра, что стоит в настройке канала.
     const entry = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).where('purpose', '=', 'entry').executeTakeFirstOrThrow()
-    expect(new Decimal(entry.qty!).toString()).toBe('1.5')
+    expect(new Decimal(entry.qty!).toString()).toBe('15')
   })
 
   it('лимитный вход «зайду от 76.3» -> ордер limit по названной цене, гейт слиппеджа НЕ применяется', async () => {

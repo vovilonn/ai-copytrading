@@ -80,7 +80,9 @@ it('GET /channels возвращает оба засеянных канала', 
   const ch1 = channels.find((c) => c.key === CHANNEL_1_KEY)!
   expect(ch1.id).toBe(CHANNEL_1_ID)
   expect(ch1.winRate).toBe('—')
-  expect(ch1.tradeSize).toBe('$500')
+  // Дефолт — 50: это МАРЖА на сделку (реальные деньги с баланса), а не размер позиции.
+  // Позиция получается умножением на плечо (см. risk/sizing.ts).
+  expect(ch1.tradeSize).toBe('$50')
   expect(ch1.maxLeverage).toBe('10x')
   expect(ch1.messageCount).toBe(5)
   expect(ch1.actionCount).toBe(0)

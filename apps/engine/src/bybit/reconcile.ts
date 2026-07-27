@@ -341,9 +341,19 @@ export async function reconcileOnStart(
     }
 
     // --- Шаг Б: LIVE-сделки 'open'/'partially_closed' без позиции на бирже -> закрыть. ---
+    //
+    // ⚠️ ОТЛОЖЕННЫЙ ВХОД — НЕ «сделка без позиции». Живой инцидент прода 27.07.2026: канал дал
+    // лимитку «1910 limit long ETH», движок выставил ордер, а через 10 минут этот шаг закрыл сделку
+    // (позиции-то на бирже ещё нет — лимитка не исполнилась) и снял владение символом. Сама лимитка
+    // при этом осталась висеть на бирже с TTL 7 суток: исполнись она — на счёте открылась бы
+    // позиция, которой в журнале соответствует ЗАКРЫТАЯ сделка, то есть бот не поставил бы ей стоп
+    // и не реагировал бы на команды канала. Поэтому сделку с ЖИВЫМ ордером входа на бирже не
+    // трогаем — её судьбу решает либо исполнение, либо TTL-свип, либо явная отмена каналом.
+    const tradeIdsWithLiveEntry = await tradesWithLiveEntryOrders(trx, openOrders)
     for (const t of localLiveTrades) {
       if (!OPEN_STATUSES.has(t.status)) continue
       if (positionSymbols.has(t.symbol)) continue // уже обработана в шаге А (синк или ambiguous)
+      if (tradeIdsWithLiveEntry.has(t.id)) continue
       // F2: свежая сделка (opened_at в момент снапшота T0 или позже, с допуском на лаг биржи/
       // рассинхрон часов) могла ещё не попасть в снапшот getPositions — НЕ закрываем её без
       // close-ордера по устаревшему снапшоту (иначе осиротим только что открытую живую позицию).
@@ -502,6 +512,29 @@ interface Attribution {
  * сквозная через рестарт (у самой позиции orderLinkId нет, это агрегат). Более одного РАЗНОГО
  * trade_id среди найденных ордеров — неоднозначность, не угадываем (возвращаем null).
  */
+/**
+ * Сделки, у которых на бирже ЖИВ ордер входа (entry/add). Такая сделка ещё не «потеряла позицию» —
+ * она её просто не открыла: лимитка ждёт своей цены. Закрывать её нельзя (см. шаг Б).
+ *
+ * reduceOnly-ордера (tp/sl/close) сюда НЕ считаются: они защищают уже открытую позицию, и их
+ * наличие при отсутствии позиции — как раз признак осиротевшего остатка (его чинит шаг В).
+ */
+async function tradesWithLiveEntryOrders(trx: Kysely<DB>, openOrders: readonly Order[]): Promise<Set<string>> {
+  const liveLinkIds = openOrders
+    .filter((o) => o.orderLinkId.startsWith(LIVE_ORDER_LINK_PREFIX) && !o.reduceOnly)
+    .map((o) => o.orderLinkId)
+  if (liveLinkIds.length === 0) return new Set()
+
+  const rows = await trx
+    .selectFrom('orders')
+    .select('trade_id')
+    .where('order_link_id', 'in', liveLinkIds)
+    .where('purpose', 'in', ['entry', 'add'])
+    .where('trade_id', 'is not', null)
+    .execute()
+  return new Set(rows.map((r) => r.trade_id as string))
+}
+
 async function attributeBySymbolOrders(trx: Kysely<DB>, symbol: string, openOrders: readonly Order[]): Promise<Attribution | null> {
   const candidateLinkIds = openOrders.filter((o) => o.symbol === symbol && o.orderLinkId.startsWith(LIVE_ORDER_LINK_PREFIX)).map((o) => o.orderLinkId)
   if (candidateLinkIds.length === 0) return null

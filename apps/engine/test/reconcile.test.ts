@@ -646,6 +646,81 @@ describe('reconcileOnStart — M1 (Minor адверсариального рев
 // снапшот не застал -> без recency-гейта шаг Б закрыл бы её без close-ордера (осиротив живую позицию),
 // а шаг Г снял бы её защитный reduceOnly. Гейт (tradeOpenedAfterSnapshot, ТА ЖЕ CREATED_TIME_TOLERANCE_MS,
 // что и createdTime-защита шага А) пропускает свежие сделки и продолжает закрывать/чистить устаревшие.
+// Живой инцидент прода 27.07.2026 (TR-1047, ETHUSDT): канал дал отложенный вход «1910 limit long»,
+// движок выставил лимитку, а периодическая сверка через 10 минут закрыла сделку — позиции-то на
+// бирже нет, лимитка не исполнилась. Ордер при этом остался жить на бирже (TTL 7 суток): исполнись
+// он — на счёте открылась бы позиция, которой в журнале соответствует ЗАКРЫТАЯ сделка, без стопа и
+// без реакции на команды канала.
+describe('reconcileOnStart — отложенный вход не закрывается сверкой', () => {
+  it('живая лимитка входа на бирже -> сделка НЕ закрывается, хотя позиции ещё нет', async () => {
+    const seeded = await seedTrade({
+      symbol: 'PENDINGUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      openedAt: new Date(Date.now() - 30 * 60_000), // заведомо старше recency-гейта
+    })
+
+    // На бирже: позиции нет, но ордер входа висит (именно тот, что выставил движок).
+    const { rest } = makeRest(
+      [],
+      [makeOrder({ symbol: 'PENDINGUSDT', orderLinkId: seeded.orderLinkId, orderType: 'Limit', price: '1910' })],
+    )
+
+    const result = await reconcileOnStart(db, rest)
+
+    expect(result.closed).toBe(0)
+    const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
+    expect(trade.status).toBe('open')
+    expect(trade.closed_at).toBeNull()
+    // Владение символом тоже сохраняется: иначе будущий филл некому будет атрибутировать.
+    const ownership = await db
+      .selectFrom('symbol_ownership')
+      .selectAll()
+      .where('symbol', '=', 'PENDINGUSDT')
+      .where('released_at', 'is', null)
+      .execute()
+    expect(ownership).toHaveLength(1)
+  })
+
+  it('лимитки на бирже больше нет (отменена/исполнена и позиция закрыта) -> сделка закрывается как раньше', async () => {
+    const seeded = await seedTrade({
+      symbol: 'GONEUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      openedAt: new Date(Date.now() - 30 * 60_000),
+    })
+
+    const result = await reconcileOnStart(db, makeRest([]).rest)
+
+    expect(result.closed).toBe(1)
+    const trade = await db.selectFrom('trades').selectAll().where('id', '=', seeded.tradeId).executeTakeFirstOrThrow()
+    expect(trade.status).toBe('closed')
+  })
+
+  it('reduceOnly-остаток (tp/sl) живой позиции не считается «входом» — сделка без позиции закрывается', async () => {
+    const seeded = await seedTrade({
+      symbol: 'TPONLYUSDT',
+      side: 'long',
+      live: true,
+      status: 'open',
+      openedAt: new Date(Date.now() - 30 * 60_000),
+    })
+
+    // На бирже висит только защитный reduceOnly-ордер — позиции нет. Это осиротевший остаток,
+    // а не отложенный вход: сделку закрываем (а сам ордер снимет шаг В).
+    const { rest } = makeRest(
+      [],
+      [makeOrder({ symbol: 'TPONLYUSDT', orderLinkId: `${seeded.orderLinkId}-tp`, reduceOnly: true, orderType: 'Limit' })],
+    )
+
+    const result = await reconcileOnStart(db, rest)
+
+    expect(result.closed).toBe(1)
+  })
+})
+
 describe('reconcileOnStart — F2/F8 (адверсариальное ревью): recency-гейт против устаревшего снапшота', () => {
   it('F2: свежая LIVE-сделка (opened_at ~ сейчас) без позиции на бирже -> НЕ закрывается (снапшот T0 мог её не застать)', async () => {
     const fresh = await seedTrade({ symbol: 'FRESHUSDT', side: 'long', live: true, status: 'open', openedAt: new Date() })

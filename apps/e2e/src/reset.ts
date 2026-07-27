@@ -42,8 +42,10 @@ export interface ResetReport {
 
 export const DEFAULT_TEST_PROFILE: TestProfile = {
   enabled: true,
-  // trade_size — фолбэк-нотионал для входов без риска в сигнале («с текущих»), см. sizing.ts.
-  tradeSize: '150',
+  // trade_size — МАРЖА на сделку (фолбэк для входов без риска в сигнале, «с текущих»), см.
+  // sizing.ts: размер позиции = маржа × плечо. 30 × 10 = 300 — ровно потолок ниже, поэтому
+  // прогон предсказуемо открывает позиции на 300 USDT независимо от плеча конкретного сигнала.
+  tradeSize: '30',
   maxLeverage: '10',
   // Потолок экспозиции на символ: без него «риск 2%» на equity ~50k demo даёт ~20 000 USDT.
   maxSymbolNotional: '300',
