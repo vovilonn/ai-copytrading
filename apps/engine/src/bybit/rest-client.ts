@@ -822,6 +822,46 @@ export class BybitRestClient {
   }
 
   /**
+   * `POST /v5/order/amend` — правка ЕЩЁ НЕ ИСПОЛНЕННОГО ордера по `orderLinkId`: объём, цена,
+   * прикреплённый стоп. Ключевое свойство: биржа сохраняет и `orderId`, и `orderLinkId`, поэтому
+   * связь ордера с нашей сделкой не рвётся — в отличие от «отменить и поставить заново», где
+   * появился бы новый orderLinkId и будущий филл пришлось бы атрибутировать заново.
+   *
+   * Нужен операционной правке отложенного входа (`pnpm order:amend`): поставить руками отдельный
+   * ордер на бирже нельзя — его исполнение придёт как «мимо наших ордеров» и уведёт сделку в
+   * manual_override (private-ws.ts).
+   *
+   * Ордера, которого уже нет (исполнился/отменён), — тот же идемпотентный исход, что и у
+   * `cancelOrder`: правка бессмысленна, но это не ошибка вызывающего.
+   */
+  async amendOrder(params: {
+    symbol: string
+    orderLinkId: string
+    qty?: string
+    price?: string
+    stopLoss?: string
+  }): Promise<{ ok: true; idempotent?: boolean }> {
+    try {
+      await this.signedPost('/v5/order/amend', {
+        category: 'linear',
+        symbol: params.symbol,
+        orderLinkId: params.orderLinkId,
+        // undefined-поля JSON.stringify отбрасывает целиком (тот же приём, что в createOrder):
+        // не переданный параметр остаётся у ордера прежним.
+        qty: params.qty,
+        price: params.price,
+        stopLoss: params.stopLoss,
+      })
+      return { ok: true }
+    } catch (err) {
+      if (err instanceof BybitApiError && err.retCode === ORDER_NOT_EXISTS_RETCODE) {
+        return { ok: true, idempotent: true }
+      }
+      throw err
+    }
+  }
+
+  /**
    * `POST /v5/order/cancel` (research §9) — по `orderLinkId`. Important I1 адверсариального
    * ревью: ордер, которого уже нет на бирже (исполнен раньше, чем дошла отмена; WS пропустил
    * филл; либо это в принципе не биржевой ордер — trading-stop SL, см. bybit.adapter.ts::

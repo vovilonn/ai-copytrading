@@ -21,6 +21,7 @@
     "cleanup:dryrun": "node --env-file-if-exists=.env scripts/cleanup-dryrun-positions.mjs",
   "channel:keys": "node --env-file-if-exists=.env scripts/channel-keys.mjs",
   "journal:reset": "node --env-file-if-exists=.env scripts/reset-journal.mjs",
+  "order:amend": "node --env-file-if-exists=.env scripts/amend-entry.mjs",
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose stop postgres",
     "db:psql": "docker compose exec postgres psql -U ${POSTGRES_USER:-copytrade} -d ${POSTGRES_DB:-copytrade}",
