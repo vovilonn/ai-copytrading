@@ -102,6 +102,12 @@ const DEFAULT_MAX_ENTRY_SLIPPAGE_PCT = '0.5'
 // «скинул половину»). Если автор назвал долю («закрыл 30%»), берётся она, а не этот дефолт.
 const DEFAULT_PARTIAL_CLOSE_FRACTION = '0.5'
 
+// «Цель взята» без указанной доли и без нашего TP-ордера на бирже — закрываем треть ИСХОДНОГО
+// объёма: типичная лесенка канала состоит из трёх целей, то есть первая забирает треть позиции
+// (решение заказчика 28.07.2026). Названная автором доля важнее этого дефолта — её исполняет
+// ветка partial_close.
+const DEFAULT_TP_HIT_FRACTION = new Decimal(1).div(3)
+
 type ChannelRow = Selectable<DB['channels']>
 type ChannelSettingsRow = Selectable<DB['channel_settings']>
 
@@ -1522,18 +1528,72 @@ async function handleDelta(
         if (activeSl) await base.deps.executionPort.cancelOrder(trx, { orderLinkId: activeSl.order_link_id })
         break
       }
-      case 'tp_hit':
       case 'sl_hit':
-        // ЭТО СОБЫТИЯ, А НЕ КОМАНДЫ — и разница здесь денежная.
-        //
-        // «Первая цель взята» означает, что у АВТОРА сработал take-profit. У нас на бирже на этот
-        // случай стоит СВОЙ reduce-only TP-ордер — он исполнится САМ, по той же цене. Если вдобавок
-        // закрыть часть позиции вручную, мы закроем ВДВОЕ больше, чем следует.
-        //
-        // Именно поэтому tp_hit/sl_hit (события: «сработало») и partial_close (команда: «фиксирую
-        // руками») — РАЗНЫЕ операции лексикона, и обрабатываются они по-разному. Событие уже
-        // зафиксировано самой строкой actions, ордеров не требует.
+        // СОБЫТИЕ, А НЕ КОМАНДА. «Выбило по стопу» означает, что сработал стоп у АВТОРА; наш
+        // собственный стоп уходит на биржу АТОМАРНО со входом (bybit.adapter.ts::placeEntry) и
+        // сработает сам по своей цене. Событие уже зафиксировано строкой actions, ордеров не требует.
         break
+
+      case 'tp_hit': {
+        // «Первая цель взята» — тоже событие. Пока на бирже стоит НАШ reduce-only TP-ордер, делать
+        // нечего: он исполнится сам, по той же цене (закрыть ещё и рынком значило бы закрыть вдвое
+        // больше). Если автор в том же сообщении назвал долю («зафиксировал 50%»), её исполнит
+        // ветка partial_close — здесь не дублируем.
+        if (suppressPartialClose || intent.ops.some((o) => o.op === 'partial_close')) break
+
+        // ⚠️ А ВОТ ЕСЛИ TP-ОРДЕРА НЕТ — раньше здесь не происходило НИЧЕГО, и это стоило денег.
+        // Живой случай (TR-1048, 28.07.2026): вход был «Long btc с текущих», целей в сигнале не
+        // было, лесенку никто не ставил. Автор объявил цель — бот записал событие и промолчал,
+        // хотя закрывать объём было нечему. Решение заказчика: закрываем долю сами — названную в
+        // сообщении (её берёт partial_close выше) либо треть по умолчанию, исходя из типичной
+        // лесенки в три цели.
+        const instrument = base.instruments.get(intent.symbol)
+        if (!instrument) {
+          gateSkip = 'symbol_not_listed'
+          break
+        }
+
+        // Гейт здравого смысла: «цель взята» при позиции В УБЫТКЕ — противоречие. Так выглядит
+        // ошибка разбора («64200 первый таргет» модель приняла за достигнутую цель, хотя цена до
+        // неё не доходила). Закрыть треть в минус по ошибке дороже, чем показать оператору вопрос.
+        if (position.mark_price !== null && position.avg_price !== null) {
+          const mark = new Decimal(position.mark_price)
+          const entry = new Decimal(position.avg_price)
+          const inProfit = position.side === 'long' ? mark.gt(entry) : mark.lt(entry)
+          if (!inProfit) {
+            gateSkip = 'tp_not_reached'
+            break
+          }
+        }
+
+        // Базис — ИСХОДНЫЙ объём: лесенка из трёх целей делит на равные части именно его, поэтому
+        // «первая цель» закрывает треть позиции, а не треть остатка.
+        const basis = trade?.initial_size != null ? new Decimal(trade.initial_size) : remaining
+        const closeQty = Decimal.min(floorTo(instrument.qtyStep, basis.mul(DEFAULT_TP_HIT_FRACTION)), remaining)
+        if (closeQty.lte(0)) {
+          gateSkip = 'zero_qty'
+          break
+        }
+
+        if (closeQty.gte(remaining)) {
+          await base.deps.executionPort.closePosition(trx, { ...orderCtx, qty: remaining.toString(), seq: closeSeq++ })
+          await closeTrade(trx, { tradeId: position.trade_id })
+          base.postCommit.push({ symbol: intent.symbol, tradeId: position.trade_id })
+          remaining = new Decimal(0)
+          executedOps++
+          break
+        }
+
+        await base.deps.executionPort.closePosition(trx, { ...orderCtx, qty: closeQty.toString(), seq: closeSeq++ })
+        remaining = remaining.minus(closeQty)
+        await trx
+          .updateTable('trades')
+          .set({ status: 'partially_closed', updated_at: new Date() })
+          .where('id', '=', position.trade_id)
+          .execute()
+        executedOps++
+        break
+      }
 
       case 'partial_close': {
         // КОМАНДА: автор закрывает часть позиции руками («фиксирую половину», «закрыл 50%»).

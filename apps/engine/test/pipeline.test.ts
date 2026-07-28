@@ -5,6 +5,7 @@ import { resetTestSchema } from 'test-db'
 import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
 import { createExecutionPort, type ExecutionPort } from '../src/execution/port.js'
+import { floorTo } from '../src/risk/leverage.js'
 import { DryRunAdapter } from '../src/execution/dry-run.adapter.js'
 import { processMessage, type PipelineDeps, type PipelineMessage } from '../src/pipeline.js'
 import { createMarkPriceGetter, type MarkPriceRestClient } from '../src/main.js'
@@ -1028,6 +1029,91 @@ describe('pipeline — фиксация части: остаток, ключи �
     await processMessage(db, await insertMessage(channelId, 2, '#ATOM первая цель есть, зафиксировал 50%'), deps2)
 
     expect(calls).not.toContain('closePosition') // TP-ордер закроет объём сам
+  })
+})
+
+// «Цель взята», а своего TP-ордера на бирже нет (вход был «с текущих», целей в сигнале не было).
+// Живой случай TR-1048 (28.07.2026): бот записал событие и НЕ СДЕЛАЛ НИЧЕГО — закрывать объём было
+// нечему, а оператор ждал фиксацию части. Решение заказчика: закрываем названную долю, иначе треть
+// исходного объёма (типичная лесенка — три цели).
+describe('pipeline — tp_hit без нашего TP-ордера закрывает долю сам', () => {
+  async function openWithoutTp(channelId: number, deps: PipelineDeps) {
+    // Вход БЕЗ целей: TP-лесенка не ставится, на бирже только entry + sl.
+    const text = '#ATOM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    await processMessage(db, await insertMessage(channelId, 1, text), deps)
+  }
+
+  it('«первая цель взята» при позиции В ПЛЮСЕ -> закрывается треть исходного объёма', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT' })
+    const { port, calls } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '10000', getMarkPrice: async () => '100', aiEnabled: false }
+
+    await openWithoutTp(channelId, localDeps)
+    const before = await db.selectFrom('positions').selectAll().where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    const fullSize = new Decimal(before.size)
+    // Позиция в плюсе — иначе сработает гейт «цель не достигнута» (см. тест ниже).
+    await db.updateTable('positions').set({ mark_price: '105' }).where('channel_id', '=', channelId).execute()
+    calls.length = 0
+
+    await processMessage(db, await insertMessage(channelId, 2, '#ATOM первая цель есть'), localDeps)
+
+    expect(calls).toContain('closePosition')
+    const closeOrder = await db
+      .selectFrom('orders')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .where('purpose', '=', 'close')
+      .executeTakeFirstOrThrow()
+    // Треть ИСХОДНОГО объёма (лесенка делит на равные части именно его), с округлением к шагу.
+    const expected = floorTo('0.01', fullSize.div(3))
+    expect(new Decimal(closeOrder.qty!).toString()).toBe(expected.toString())
+
+    const trade = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    expect(trade.status).toBe('partially_closed')
+  })
+
+  it('«первая цель взята» при позиции В МИНУСЕ -> ничего не закрываем: так выглядит ошибка разбора', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT' })
+    const { port, calls } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '10000', getMarkPrice: async () => '100', aiEnabled: false }
+
+    await openWithoutTp(channelId, localDeps)
+    // Ровно ситуация TR-1048: цена НИЖЕ входа, значит цель физически не достигалась.
+    await db.updateTable('positions').set({ mark_price: '95' }).where('channel_id', '=', channelId).execute()
+    calls.length = 0
+
+    await processMessage(db, await insertMessage(channelId, 2, '#ATOM первая цель есть'), localDeps)
+
+    expect(calls).not.toContain('closePosition')
+    const action = await actionFor(channelId, 2)
+    expect(action.status).toBe('skipped')
+    expect(action.skip_reason).toBe('tp_not_reached')
+  })
+
+  it('автор назвал долю («зафиксировал 50%») -> закрывается ЕГО доля, а не треть по умолчанию', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT' })
+    const { port } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '10000', getMarkPrice: async () => '100', aiEnabled: false }
+
+    await openWithoutTp(channelId, localDeps)
+    const before = await db.selectFrom('positions').selectAll().where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    const fullSize = new Decimal(before.size)
+    await db.updateTable('positions').set({ mark_price: '105' }).where('channel_id', '=', channelId).execute()
+
+    await processMessage(db, await insertMessage(channelId, 2, '#ATOM первая цель есть, зафиксировал 50%'), localDeps)
+
+    // Ровно ОДИН закрывающий ордер — на половину: событие не добавляет к команде свою треть.
+    const closeOrders = await db
+      .selectFrom('orders')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .where('purpose', '=', 'close')
+      .execute()
+    expect(closeOrders).toHaveLength(1)
+    expect(new Decimal(closeOrders[0]!.qty!).toString()).toBe(floorTo('0.01', fullSize.div(2)).toString())
   })
 })
 

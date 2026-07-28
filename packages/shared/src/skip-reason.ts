@@ -34,6 +34,10 @@ const SKIP_REASON_LABELS: Readonly<Record<string, string>> = {
   sl_beyond_market: 'stop beyond market — position in loss',
   unsafe_leverage: 'leverage too high for a protective stop',
 
+  // «Цель взята», но позиция в убытке — так выглядит ошибка разбора («64200 первый таргет»
+  // принято за достигнутую цель). Закрывать долю в минус по такому сигналу опаснее, чем спросить.
+  tp_not_reached: 'target reported as hit, but the position is in loss',
+
   // ── Настройки и ручное управление ─────────────────────────────────────────────────────────
   copy_disabled: 'copy trading disabled for the channel',
   manual_override: 'trade under manual control',

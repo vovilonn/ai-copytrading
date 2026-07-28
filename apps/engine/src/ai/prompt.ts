@@ -27,6 +27,10 @@ ACTION TYPES:
 - modify_sl / modify_tp: change stop or targets ("Sl btc - 64300", "Следующие цели 72.7, 74", "Стоп на твх").
 - cancel_order: cancel a pending limit ("лимитка не актуальна не задели").
 - tp_hit / sl_hit: report an exchange event ("выбило по стоп-лоссу"/"выбило в бу"/"закрыло в бу"/"стоп сработал"=sl_hit; "первая цель есть"/"2🎯"/"1🎯"=tp_hit). These are events, not new orders.
+  A PRICE next to "цель/таргет" WITHOUT an achievement marker NAMES a target => modify_tp, never tp_hit.
+  "64200 первый таргет" / "первая цель 64200" / "цели 64200 и 65000" => modify_tp(targets=[...]).
+  tp_hit requires an achievement marker (🎯, "есть", "взяли", "забрали", "отработала", a result card)
+  AND is normally priceless — the author reports what already happened, not where to aim.
 
 CO-OCCURRING EVENTS: a single message often mixes a SETUP action with a HIT event on the same symbol — emit ALL of them, never collapse into one. E.g. "Стоп на твх ... Выбило в бу" => modify_sl(marker=entry_price) AND sl_hit (the stop was moved to breakeven AND then triggered). "Первая цель 71.27🎯 ... Следующие 72.7,74" => tp_hit AND modify_tp. Setting/showing pending target orders ("Первые цели"/"Следующие цели"/a screenshot of pending "Закрыть лонг" trigger orders) is modify_tp, NOT tp_hit — tp_hit is reserved for a target actually REACHED ("2🎯", a WEEX result card showing +% with Цена закрытия).
 
