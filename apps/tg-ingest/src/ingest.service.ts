@@ -39,8 +39,22 @@ const MEDIA_ROOT_REL = 'var/media'
 
 // Окно склейки альбома — см. docs/superpowers/research/telegram-ingestion.md §2.
 const ALBUM_WINDOW_MS = 600
-// Раз в 10 минут — подстраховка на случай, если реконнект прошёл незаметно для UpdateConnectionState.
-const PERIODIC_BACKFILL_MS = 10 * 60 * 1000
+// Периодический догон — ПОТОЛОК ЗАДЕРЖКИ доставки, а не «подстраховка раз в 10 минут».
+//
+// Живой инцидент 28.07.2026: соединение MTProto умерло в 13:04 и не восстановилось само; сигнал
+// канала в 13:46 доехал до БД только после ручного рестарта в 13:52, и к тому моменту цена ушла на
+// 4% — вход отбился гейтом price_slippage. Для копитрейда десятиминутная задержка = потерянный
+// сигнал, поэтому цена вопроса выше стоимости лишних getHistory: два источника раз в минуту — это
+// ~2 900 запросов в сутки, на порядок ниже лимитов Telegram (и в 6 раз меньше, чем давал баг
+// с фантомными реконнектами, см. createReconnectDetector).
+const PERIODIC_BACKFILL_MS = 60 * 1000
+
+// Сторож живости соединения. GramJS умеет «тихо умереть»: сокет закрыт, автопереподключение не
+// добралось до успеха, а UpdateConnectionState(connected) больше не приходит — то есть
+// реконнект-детектор ниже не срабатывает НИКОГДА. Раз в минуту дёргаем дешёвый серверный вызов:
+// не ответил за LIVENESS_TIMEOUT_MS — принудительно переподключаемся и догоняем историю.
+const LIVENESS_PROBE_MS = 60 * 1000
+const LIVENESS_TIMEOUT_MS = 15 * 1000
 // Размер страницы бэкфилла — см. §4: getHistory дёшев, 200 — безопасный батч.
 const BACKFILL_PAGE_SIZE = 200
 
@@ -101,6 +115,44 @@ export function withDeadline<T>(promise: Promise<T>, timeoutMs: number, label: s
     timer = setTimeout(() => reject(new Error(`${label}: превышен потолок ${timeoutMs} мс — проход отпущен`)), timeoutMs)
   })
   return Promise.race([promise, deadline]).finally(() => clearTimeout(timer)) as Promise<T>
+}
+
+export interface ProbeConnectionDeps {
+  /** Дешёвый серверный вызов под таймаутом — «жив ли канал связи». */
+  probe: () => Promise<unknown>
+  /** Принудительное переподключение. */
+  reconnect: () => Promise<unknown>
+  /** Догон истории после восстановления связи. */
+  backfill: () => Promise<void>
+  onError: (label: string, err: unknown) => void
+}
+
+/**
+ * Сторож живости соединения: проба -> при отказе принудительный реконнект и догон истории.
+ *
+ * Почему нельзя полагаться на реконнект-детектор ниже: он слушает UpdateConnectionState, а тот
+ * приходит, только когда GramJS САМ заметил разрыв и восстановился. Инцидент 28.07.2026 — ровно
+ * случай, когда этого не произошло: сокет закрылся в 13:04, событий больше не было, воркер молча
+ * перестал получать сообщения на 48 минут, и сигнал канала протух (вход отбился price_slippage).
+ *
+ * Ошибки наружу не бросаются: следующий тик повторит. Падение здесь ничего не чинит — рестарт
+ * контейнера начал бы с того же бэкфилла, потеряв буфер альбомов.
+ */
+export async function probeConnection(deps: ProbeConnectionDeps): Promise<void> {
+  try {
+    await deps.probe()
+    return
+  } catch (err) {
+    console.error(`[tg-ingest] сторож: соединение не отвечает (${String(err)}) — переподключаюсь`)
+  }
+
+  try {
+    await deps.reconnect()
+    console.warn('[tg-ingest] сторож: соединение восстановлено, догоняем бэкфиллом')
+    await deps.backfill()
+  } catch (err) {
+    deps.onError('сторож: переподключение', err)
+  }
 }
 
 /** Снимок сообщения для колонки messages.raw — только скалярные поля, без циклических ссылок
@@ -177,6 +229,9 @@ export class IngestService {
    */
   private readonly sources: readonly ChannelSource[] = resolveChannelSources(process.env)
   private backfillTimer: NodeJS.Timeout | null = null
+  private livenessTimer: NodeJS.Timeout | null = null
+  /** Счётчик проходов бэкфилла — по нему разрежается тяжёлый ремонт медиа. */
+  private backfillTicks = 0
   /** Идущий проход backfillAll (single-flight), либо null. */
   private backfillInFlight: Promise<void> | null = null
 
@@ -329,9 +384,32 @@ export class IngestService {
 
     this.backfillTimer = setInterval(() => {
       this.backfillAll()
-        .then(() => this.repairMissingMedia())
+        // Ремонт медиа — тяжёлый проход, ему минутный ритм не нужен: гоняем раз в 10 циклов.
+        .then(() => (this.backfillTicks++ % 10 === 0 ? this.repairMissingMedia() : undefined))
         .catch((err) => this.logError('backfillAll/repairMissingMedia (periodic)', err))
     }, PERIODIC_BACKFILL_MS)
+
+    this.livenessTimer = setInterval(() => {
+      void this.ensureConnected()
+    }, LIVENESS_PROBE_MS)
+  }
+
+  /**
+   * Сторож живости: дешёвый серверный вызов под таймаутом. Не ответил — соединение считается
+   * мёртвым, переподключаемся принудительно и догоняем историю.
+   *
+   * Почему нельзя полагаться на реконнект-детектор: он слушает UpdateConnectionState, а тот
+   * приходит только когда GramJS САМ заметил разрыв и восстановился. Инцидент 28.07.2026 — ровно
+   * случай, когда этого не произошло: сокет закрылся, событий больше не было, воркер молча
+   * перестал получать сообщения на 48 минут.
+   */
+  private async ensureConnected(): Promise<void> {
+    await probeConnection({
+      probe: () => withDeadline(this.client.invoke(new Api.updates.GetState()), LIVENESS_TIMEOUT_MS, 'updates.GetState'),
+      reconnect: () => withDeadline(this.client.connect(), LIVENESS_TIMEOUT_MS, 'client.connect'),
+      backfill: () => this.backfillAll(),
+      onError: (label, err) => this.logError(label, err),
+    })
   }
 
   /** Graceful shutdown: додиспатчить недособранные альбомы, снять таймеры, закрыть соединение. */
@@ -339,6 +417,10 @@ export class IngestService {
     if (this.backfillTimer) {
       clearInterval(this.backfillTimer)
       this.backfillTimer = null
+    }
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer)
+      this.livenessTimer = null
     }
     this.albumBuffer.drain()
     await Promise.allSettled([...this.inFlight])
