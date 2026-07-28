@@ -102,11 +102,13 @@ const DEFAULT_MAX_ENTRY_SLIPPAGE_PCT = '0.5'
 // «скинул половину»). Если автор назвал долю («закрыл 30%»), берётся она, а не этот дефолт.
 const DEFAULT_PARTIAL_CLOSE_FRACTION = '0.5'
 
-// «Цель взята» без указанной доли и без нашего TP-ордера на бирже — закрываем треть ИСХОДНОГО
-// объёма: типичная лесенка канала состоит из трёх целей, то есть первая забирает треть позиции
-// (решение заказчика 28.07.2026). Названная автором доля важнее этого дефолта — её исполняет
-// ветка partial_close.
-const DEFAULT_TP_HIT_FRACTION = new Decimal(1).div(3)
+// Типичная лесенка канала — три цели. Отсюда и доля одной ступени: «первый тейк» забирает треть
+// позиции (решение заказчика 28.07.2026). Число целей, названное автором, важнее этого дефолта.
+const LADDER_SLOTS = 3
+
+// «Цель взята» без указанной доли и без нашего TP-ордера на бирже — закрываем ступень лесенки от
+// ИСХОДНОГО объёма. Названная автором доля важнее — её исполняет ветка partial_close.
+const DEFAULT_TP_HIT_FRACTION = new Decimal(1).div(LADDER_SLOTS)
 
 type ChannelRow = Selectable<DB['channels']>
 type ChannelSettingsRow = Selectable<DB['channel_settings']>
@@ -969,6 +971,51 @@ function buildTpTargets(
 }
 
 /**
+ * Доли TP-лесенки для op `tp_set` — то есть для целей, которые автор называет УЖЕ ПОСЛЕ входа.
+ *
+ * Отличие от лесенки входа (buildTpTargets выше) принципиальное и денежное. На входе автор
+ * перечисляет ВЕСЬ набор целей разом, и делить между ними весь объём правильно. А в сообщении
+ * «Первый тейк по эфиру - 1943» цель названа ОДНА из подразумеваемых трёх — прежний код делил
+ * объём «поровну на одну цель» и ставил тейк на ВСЮ позицию (живой случай 28.07.2026: XRP получил
+ * тейк на 188.6 из 188.6 вместо трети).
+ *
+ * Размер ступени: доля, названная автором для этой цели → иначе 1/N, где N — названное автором
+ * число целей либо `max(целей в сообщении, LADDER_SLOTS)`. То есть три названные разом цели
+ * по-прежнему делят объём поровну, а одна названная — забирает треть.
+ *
+ * Базис — ИСХОДНЫЙ объём сделки (ступени лесенки считаются от него, а не от остатка), но сумма
+ * ступеней ограничена реальным остатком: нельзя выставить на продажу больше, чем есть.
+ */
+function buildLadderTargets(params: {
+  basis: Decimal
+  remaining: Decimal
+  targets: ReadonlyArray<{ price: Decimal; index?: number; fraction?: number }>
+  ladderTotal?: number
+  qtyStep: string
+}): { price: string; qty: string; index: number }[] {
+  const n = params.targets.length
+  if (n === 0 || params.remaining.lte(0)) return []
+
+  const slots = params.ladderTotal !== undefined && params.ladderTotal > 0 ? params.ladderTotal : Math.max(n, LADDER_SLOTS)
+
+  let left = params.remaining
+  const built: { price: string; qty: string; index: number }[] = []
+  for (const [i, target] of params.targets.entries()) {
+    // Делим базис на число ступеней, а НЕ умножаем на долю 1/N: 1/3 в Decimal — это 0.333…3, и
+    // три такие ступени не сложились бы обратно в объём (3 × 0.33…3 = 0.99…9 → потеря шага).
+    const stepQty = target.fraction !== undefined ? params.basis.mul(target.fraction) : params.basis.div(slots)
+    // Ступень не может превысить остаток — и следующая ступень считает уже от того, что осталось.
+    const qty = Decimal.min(floorTo(params.qtyStep, stepQty), left)
+    if (qty.lte(0)) continue // ступень меньше шага объёма — молча пропускаем эту цель
+    built.push({ price: target.price.toString(), qty: qty.toString(), index: target.index ?? i })
+    left = left.minus(qty)
+  }
+  // Здесь НЕТ фолбэка «весь объём в последнюю цель» (он есть у лесенки входа): для названной
+  // ступени это означало бы ровно тот дефект, который мы чиним — тейк на всю позицию.
+  return built
+}
+
+/**
  * Нормализованное описание ЛЮБОГО открытия позиции — общий вход для трёх типов сигналов:
  *
  *   entry_signal  «#SOL/USDT LONG, вход 76.3-76.5, TP 80, SL 72»  → всё есть в сигнале
@@ -1451,6 +1498,9 @@ async function handleDelta(
   // Порядковый номер закрывающего ордера: два closePosition в одном сообщении иначе получат
   // ОДИН orderLinkId, Bybit отвергнет дубликат и сообщение зациклится (см. ClosePositionParams.seq).
   let closeSeq = 0
+  // Порядковый номер лесенки внутри одного action: два tp_set в одном сообщении иначе получат
+  // одинаковые orderLinkId, Bybit отвергнет дубликат (110072) и сообщение зациклится.
+  let tpSeq = 0
 
   // ДВОЙНОЕ ЗАКРЫТИЕ. «Первая цель взята» означает, что НАШ reduce-only TP-ордер исполнится САМ.
   // Если в том же сообщении автор добавляет «зафиксировал 50%» — это ОПИСАНИЕ того же самого
@@ -1650,12 +1700,26 @@ async function handleDelta(
         executedOps++
         break
       }
-      case 'tp_set':
-        // modify_tp (Ф2, AI-канал: "Следующие цели 72.7, 74") — полная замена TP-лесенки.
-        // Примитивы по отдельности (не весь `position`) — trade_id уже сужен до string выше
-        // (гейт no_open_position), а structural-check целого объекта эту сузку не видит.
-        await handleTpSet(trx, base, orderCtx, intent.symbol, position.trade_id, position.size, position.mark_price, op.targets)
+      case 'tp_set': {
+        // modify_tp (Ф2, AI-канал: "Следующие цели 72.7, 74"). Ступени считаются от ИСХОДНОГО
+        // объёма сделки, но ограничены остатком — иначе после фиксации части в этом же сообщении
+        // («первая цель взята… следующая цель 1960») лесенка выставила бы больше, чем есть.
+        if (remaining.lte(0)) break // выше по циклу позицию уже закрыли целиком — вешать нечего
+        const skip = await handleTpSet(trx, base, orderCtx, {
+          symbol: intent.symbol,
+          tradeId: position.trade_id,
+          side: position.side,
+          basis: trade?.initial_size != null ? new Decimal(trade.initial_size) : remaining,
+          remaining,
+          markPrice: position.mark_price,
+          targets: op.targets,
+          ...(op.ladderTotal !== undefined ? { ladderTotal: op.ladderTotal } : {}),
+          tpSeq: tpSeq++,
+        })
+        if (skip !== null) gateSkip = skip
+        else executedOps++
         break
+      }
       case 'cancel_pending': {
         // Отмена ЕЩЁ НЕ исполненного pending-ордера (лимитный вход/добор) — НЕ путать с
         // sl_cancel выше (тот снимает уже выставленный стоп-лосс). Ищем последний незакрытый
@@ -1736,42 +1800,85 @@ async function handleTpSet(
   trx: Kysely<DB>,
   base: IntentBase,
   orderCtx: OrderContext,
-  symbol: string,
-  tradeId: string,
-  size: string,
-  markPriceRaw: string | null,
-  targets: ReadonlyArray<{ value?: number; marker?: 'current_price' }>,
-): Promise<void> {
-  const markPrice = markPriceRaw !== null ? new Decimal(markPriceRaw) : null
-  const prices: Decimal[] = []
-  for (const target of targets) {
-    if (target.value !== undefined) {
-      prices.push(new Decimal(target.value))
-    } else if (target.marker === 'current_price' && markPrice !== null) {
-      prices.push(markPrice)
-    }
+  params: {
+    symbol: string
+    tradeId: string
+    side: Side
+    /** Исходный объём сделки — от него считаются ступени лесенки. */
+    basis: Decimal
+    /** Сколько объёма реально осталось: суммарно лесенка не может его превысить. */
+    remaining: Decimal
+    markPrice: string | null
+    targets: ReadonlyArray<{ value?: number; marker?: 'current_price'; index?: number; fraction?: number }>
+    /** Число целей в лесенке, названное автором. */
+    ladderTotal?: number
+    /** Порядковый номер лесенки внутри одного action (уникальность orderLinkId). */
+    tpSeq: number
+  },
+): Promise<string | null> {
+  const markPrice = params.markPrice !== null ? new Decimal(params.markPrice) : null
+  const resolved: { price: Decimal; index?: number; fraction?: number }[] = []
+  for (const target of params.targets) {
+    const price = target.value !== undefined ? new Decimal(target.value) : target.marker === 'current_price' && markPrice !== null ? markPrice : null
+    if (price === null) continue
+    resolved.push({
+      price,
+      ...(target.index !== undefined ? { index: target.index } : {}),
+      ...(target.fraction !== undefined ? { fraction: target.fraction } : {}),
+    })
   }
-  if (prices.length !== targets.length || prices.length === 0) {
-    console.warn(`[pipeline] modify_tp: не все цели резолвились (current_price без mark_price?), symbol=${symbol} — лесенка не обновлена`)
-    return
+  if (resolved.length !== params.targets.length || resolved.length === 0) {
+    console.warn(`[pipeline] modify_tp: не все цели резолвились (current_price без mark_price?), symbol=${params.symbol} — лесенка не обновлена`)
+    return null
   }
 
-  const instrument = base.instruments.get(symbol)
-  if (!instrument) return // символ вне листинга — не должно происходить (позиция уже открыта на нём)
+  const instrument = base.instruments.get(params.symbol)
+  if (!instrument) return 'symbol_not_listed'
 
-  const activeTps = await trx
+  // ГЕЙТ ЦЕНЫ, зеркальный стоповому (stopLossReachable): reduce-only лимитка ПО ТУ СТОРОНУ рынка
+  // исполнится немедленно — то есть «поставить тейк» тихо превратилось бы в закрытие по рынку
+  // прямо сейчас. Для лонга цель обязана быть ВЫШЕ рынка, для шорта — ниже.
+  const liveMark = base.deps.getMarkPrice ? await base.deps.getMarkPrice(params.symbol) : null
+  const guardMark = liveMark !== null ? new Decimal(liveMark) : null
+  const reachable = guardMark === null ? resolved : resolved.filter((t) => (params.side === 'long' ? t.price.gt(guardMark) : t.price.lt(guardMark)))
+  if (reachable.length === 0) {
+    console.warn(
+      `[pipeline] ${params.symbol}: все цели ${resolved.map((t) => t.price.toString()).join(', ')} по ту сторону рынка ` +
+        `(${guardMark?.toString() ?? '—'}, ${params.side}) — лесенка не тронута`,
+    )
+    return 'tp_beyond_market'
+  }
+
+  const tpTargets = buildLadderTargets({
+    basis: params.basis,
+    remaining: params.remaining,
+    targets: reachable,
+    ...(params.ladderTotal !== undefined ? { ladderTotal: params.ladderTotal } : {}),
+    qtyStep: instrument.qtyStep,
+  })
+  // Пусто — все ступени меньше шага объёма. Старую лесенку в этом случае НЕ трогаем: снять
+  // существующий выход и не поставить новый — худший из возможных исходов.
+  if (tpTargets.length === 0) return 'zero_qty'
+
+  // Отмена старых целей — ТОЛЬКО после того, как новая лесенка посчиталась непустой. Если автор
+  // назвал ступени по номерам, заменяем ровно эти ступени: иначе следующее сообщение («вторая
+  // цель 1960») снесло бы правильно выставленную первую.
+  const replacedIndexes = new Set(reachable.map((t) => t.index).filter((i): i is number => i !== undefined))
+  const partialReplace = replacedIndexes.size === reachable.length && replacedIndexes.size > 0
+  let activeTps = await trx
     .selectFrom('orders')
-    .select('order_link_id')
-    .where('trade_id', '=', tradeId)
+    .select(['order_link_id', 'tp_index'])
+    .where('trade_id', '=', params.tradeId)
     .where('purpose', '=', 'tp')
     .where('status', 'in', ['created', 'pending_submit', 'submitted'])
     .execute()
+  if (partialReplace) {
+    activeTps = activeTps.filter((o) => o.tp_index !== null && replacedIndexes.has(o.tp_index))
+  }
   for (const activeTp of activeTps) {
     await base.deps.executionPort.cancelOrder(trx, { orderLinkId: activeTp.order_link_id })
   }
 
-  const tpTargets = buildTpTargets(new Decimal(size), prices.map((p) => p.toNumber()), instrument.qtyStep)
-  if (tpTargets.length > 0) {
-    await base.deps.executionPort.placeTpLadder(trx, { ...orderCtx, tps: tpTargets })
-  }
+  await base.deps.executionPort.placeTpLadder(trx, { ...orderCtx, tps: tpTargets, tpSeq: params.tpSeq })
+  return null
 }

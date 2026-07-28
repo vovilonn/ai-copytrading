@@ -82,6 +82,15 @@ export interface TpTarget {
 
 export interface PlaceTpLadderParams extends OrderContext {
   tps: readonly TpTarget[]
+  /**
+   * Порядковый номер ЛЕСЕНКИ внутри одного action (идёт в orderLinkId вместе с индексом цели).
+   *
+   * Без него два `tp_set` в одном сообщении («первая цель 1943… и следующая 1960») дают ОДИН
+   * ключ на цель с тем же индексом: Bybit отвергнет дубликат (110072), транзакция откатится и
+   * сообщение будет переигрываться каждые 5 секунд. Ту же роль у закрытий играет
+   * `ClosePositionParams.seq`. 0 (и отсутствие поля) сохраняет прежний формат ключа.
+   */
+  tpSeq?: number
 }
 
 export interface SetStopLossParams extends OrderContext {

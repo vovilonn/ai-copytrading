@@ -50,7 +50,12 @@ export interface StopLossSpec {
 
 export interface TakeProfitSpec {
   value?: number | null
+  /** Порядковый номер цели у автора: «первый тейк» -> 1. По нему пайплайн отличает «одна цель из
+   *  лесенки» от «единственная цель на весь объём» и заменяет ровно эту ступень, а не всю лесенку. */
   index?: number | null
+  /** Доля позиции на эту цель, ТОЛЬКО если автор назвал её явно («на первой фикс 30%»). Считать
+   *  долю из размера лесенки модель не должна — это арифметика, её делает пайплайн. */
+  fraction?: number | null
   marker?: 'none' | 'current_price'
 }
 
@@ -76,6 +81,9 @@ export interface ExtractSignalAction {
   entry?: EntrySpec
   stop_loss?: StopLossSpec
   take_profits?: TakeProfitSpec[]
+  /** Сколько целей в лесенке ВСЕГО, если автор это сказал («три цели», «две цели»). null — не
+   *  сказал: размер лесенки подставит пайплайн. */
+  tp_ladder_total?: number | null
   tp_index?: number | null
   close_amount?: CloseAmountSpec
   price?: ActionPriceSpec
@@ -173,10 +181,12 @@ export const EXTRACT_SIGNAL_TOOL = {
                 properties: {
                   value: { type: ['number', 'null'] },
                   index: { type: ['integer', 'null'] },
+                  fraction: { type: ['number', 'null'] },
                   marker: { type: 'string', enum: ['none', 'current_price'] },
                 },
               },
             },
+            tp_ladder_total: { type: ['integer', 'null'] },
             tp_index: { type: ['integer', 'null'] },
             close_amount: {
               type: 'object',

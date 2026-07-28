@@ -226,7 +226,7 @@ function mapActionToDeltaOp(action: ExtractSignalAction): DeltaOp | null {
     case 'modify_sl':
       return mapStopLoss(action.stop_loss)
     case 'modify_tp':
-      return mapTakeProfits(action.take_profits)
+      return mapTakeProfits(action.take_profits, action.tp_ladder_total)
     case 'cancel_order':
       return { op: 'cancel_pending' }
     case 'tp_hit':
@@ -286,17 +286,25 @@ function mapStopLoss(sl: StopLossSpec | undefined): DeltaOp | null {
 
 /** take_profits[] → tp_set (research §3, "Следующие цели 72.7, 74"): каждая цель — число ИЛИ
  *  символьный маркер current_price (НЕ переводим в число здесь же). */
-function mapTakeProfits(tps: TakeProfitSpec[] | undefined): DeltaOp | null {
+function mapTakeProfits(tps: TakeProfitSpec[] | undefined, ladderTotal?: number | null): DeltaOp | null {
   if (tps === undefined || tps.length === 0) return null
 
+  type Target = { value?: number; marker?: 'current_price'; index?: number; fraction?: number }
   const targets = tps
-    .map((tp) => {
-      if (tp.marker === 'current_price') return { marker: 'current_price' as const }
-      if (tp.value !== undefined && tp.value !== null) return { value: tp.value }
+    .map((tp): Target | null => {
+      // index/fraction переносим на ЛЮБУЮ форму цели: по ним пайплайн считает долю позиции и
+      // заменяет ровно эту ступень лесенки. Раньше они молча терялись, и одна названная цель
+      // забирала весь объём (живой случай 28.07.2026).
+      const extra: Target = {
+        ...(typeof tp.index === 'number' ? { index: tp.index } : {}),
+        ...(typeof tp.fraction === 'number' ? { fraction: tp.fraction } : {}),
+      }
+      if (tp.marker === 'current_price') return { marker: 'current_price', ...extra }
+      if (tp.value !== undefined && tp.value !== null) return { value: tp.value, ...extra }
       return null
     })
-    .filter((t): t is { value: number } | { marker: 'current_price' } => t !== null)
+    .filter((t): t is Target => t !== null)
 
   if (targets.length === 0) return null
-  return { op: 'tp_set', targets }
+  return { op: 'tp_set', ...(typeof ladderTotal === 'number' ? { ladderTotal } : {}), targets }
 }

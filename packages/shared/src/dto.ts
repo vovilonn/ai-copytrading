@@ -52,6 +52,12 @@ export interface MessageActionDto {
   tradeRef: string | null // '#TR-xxxx' или null, если сигнал пропущен (Skipped)
   skipReason: string | null
   icon: string // lucide-имя (спека §12, packages/shared/src/action-meta.ts)
+  /**
+   * Что действие реально отправило на биржу («tp 1943, sl 1910»). Одно действие несёт несколько
+   * операций, а подпись строится по его типу: сообщение «стопы в безубыток + первый тейк 1943»
+   * выглядело как один только перенос стопа (живой случай 28.07.2026).
+   */
+  placedOrders?: string | null
 }
 
 /**

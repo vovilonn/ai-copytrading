@@ -101,7 +101,16 @@ export type DeltaOp =
   | { op: 'sl_cancel' }
   // Новые цели TP (modify_tp) — каждая цель либо число, либо символьный маркер 'current_price'
   // (LLM не считает арифметику, research §3/§10) — value/marker взаимоисключающие, оба опциональны.
-  | { op: 'tp_set'; targets: Array<{ value?: number; marker?: 'current_price' }> }
+  // Цели TP-лесенки. `index` — порядковый номер цели у автора («первый тейк» -> 1), `fraction` —
+  // явно названная доля позиции на эту цель («на первой фикс 30%»). `ladderTotal` — сколько целей
+  // в лесенке всего, если автор это сказал; иначе размер лесенки берёт пайплайн (три цели —
+  // типичная лесенка канала). Без этих полей одна названная цель забирала ВЕСЬ объём: «первый
+  // тейк по эфиру 1943» ставил тейк на всю позицию вместо трети (живой случай 28.07.2026).
+  | {
+      op: 'tp_set'
+      ladderTotal?: number
+      targets: Array<{ value?: number; marker?: 'current_price'; index?: number; fraction?: number }>
+    }
   // cancel_order (extract_signal.actions[].type) — отмена ЕЩЁ НЕ исполненного pending-ордера
   // (лимитный вход/добор), НЕ путать с sl_cancel (снятие уже выставленного стоп-лосса).
   | { op: 'cancel_pending' }

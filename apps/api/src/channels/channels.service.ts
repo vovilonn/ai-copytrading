@@ -229,7 +229,22 @@ export class ChannelsService {
     const actionRows = await this.database.db
       .selectFrom('actions as a')
       .leftJoin('trades as t', 't.id', 'a.trade_id')
-      .select(['a.message_id as message_id', 'a.action_index as action_index', 'a.type as type', 'a.side as side', 'a.pair as pair', 'a.skip_reason as skip_reason', 't.human_ref as human_ref'])
+      .select([
+        'a.message_id as message_id',
+        'a.action_index as action_index',
+        'a.type as type',
+        'a.side as side',
+        'a.pair as pair',
+        'a.skip_reason as skip_reason',
+        't.human_ref as human_ref',
+        // Цены реально выставленных ордеров этого действия — см. MessageActionDto.placedOrders.
+        sql<string | null>`(
+          SELECT string_agg(DISTINCT o.purpose || ' ' || trim(trailing '.' from trim(trailing '0' from o.price::text)), ', ')
+            FROM orders o
+           WHERE o.action_id = a.id AND o.purpose IN ('tp','sl') AND o.price IS NOT NULL
+             AND o.status <> 'cancelled'
+        )`.as('placed_orders'),
+      ])
       .where(
         'a.message_id',
         'in',
@@ -247,6 +262,7 @@ export class ChannelsService {
         tradeRef: row.human_ref ? `#${row.human_ref}` : null,
         skipReason: row.skip_reason,
         icon: actionIcon(row.type, row.side),
+        placedOrders: row.placed_orders,
       }
       const list = actionsByMessage.get(row.message_id) ?? []
       list.push(dto)

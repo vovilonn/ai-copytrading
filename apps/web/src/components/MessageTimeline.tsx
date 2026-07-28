@@ -138,7 +138,7 @@ function ActionRow({ action, onTradeClick }: { action: MessageActionDto; onTrade
     <div className="flex flex-wrap items-center gap-[10px]" data-testid="timeline-action-row">
       <Icon size={15} color={color} className="flex-none" />
       <span className="text-[12.5px] font-semibold tracking-[.02em]" style={{ color }}>
-        {actionSummary(action.type, null)}
+        {actionSummary(action.type, null, action.placedOrders)}
       </span>
       {action.pair ? <span className="font-mono text-[12.5px] leading-none text-muted-2">{action.pair}</span> : null}
       {action.skipReason ? (

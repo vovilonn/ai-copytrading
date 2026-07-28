@@ -569,6 +569,118 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
     expect(prices).toEqual(['62000', '63000'])
   })
 
+  // Живой случай прода 28.07.2026 (сообщение 221530, «Первый тейк по эфиру - 1943 / По Xrp - 1.08»):
+  // названа ОДНА цель из подразумеваемых трёх, а тейк встал на ВЕСЬ объём позиции (XRP получил
+  // ордер на 188.6 из 188.6). Ступень лесенки обязана считаться от исходного объёма, а не «поровну
+  // на одну цель».
+  describe('лесенка целей: названная ступень забирает долю, а не весь объём', () => {
+    async function seedForLadder(qty: string, entryPrice = '60000') {
+      await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+      await seedInstrument(db, 'BTCUSDT')
+      return seedOpenPosition(db, { channelId: CH2_ID, channelOrd: CH2_ORD, symbol: 'BTCUSDT', side: 'long', entryPrice, qty })
+    }
+
+    function tpResponse(take_profits: Array<Record<string, unknown>>, extra: Record<string, unknown> = {}) {
+      return toolUseResponse(
+        baseOutput({
+          message_type: 'modify_tp',
+          confidence: 0.9,
+          actions: [{ type: 'modify_tp', symbol: 'BTCUSDT', side: 'long', take_profits, evidence_source: 'text', ...extra }],
+        }),
+      )
+    }
+
+    async function tpOrdersOf(tradeId: string) {
+      return db
+        .selectFrom('orders')
+        .selectAll()
+        .where('trade_id', '=', tradeId)
+        .where('purpose', '=', 'tp')
+        .where('status', '=', 'submitted')
+        .orderBy('created_at', 'asc')
+        .execute()
+    }
+
+    it('ОДНА названная цель -> тейк на ТРЕТЬ позиции, а не на весь объём', async () => {
+      const { tradeId } = await seedForLadder('3')
+      mock.queue.push(tpResponse([{ value: 62000, index: 1 }]))
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Первый тейк 62000' }), deps)
+
+      const tps = await tpOrdersOf(tradeId)
+      expect(tps).toHaveLength(1)
+      expect(new Decimal(tps[0]!.qty ?? '0').toString()).toBe('1') // треть от 3, а не 3
+    })
+
+    it('доля, названная автором, важнее дефолтной трети', async () => {
+      const { tradeId } = await seedForLadder('10')
+      mock.queue.push(tpResponse([{ value: 62000, index: 1, fraction: 0.3 }]))
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'На первой цели 62000 фикс 30%' }), deps)
+
+      const tps = await tpOrdersOf(tradeId)
+      expect(new Decimal(tps[0]!.qty ?? '0').toString()).toBe('3')
+    })
+
+    it('автор назвал размер лесенки (две цели) -> ступень равна половине', async () => {
+      const { tradeId } = await seedForLadder('10')
+      mock.queue.push(tpResponse([{ value: 62000, index: 1 }], { tp_ladder_total: 2 }))
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Следующие цели 62000' }), deps)
+
+      const tps = await tpOrdersOf(tradeId)
+      expect(new Decimal(tps[0]!.qty ?? '0').toString()).toBe('5')
+    })
+
+    it('три цели разом -> прежнее поведение: объём делится поровну', async () => {
+      const { tradeId } = await seedForLadder('3')
+      mock.queue.push(tpResponse([{ value: 62000 }, { value: 63000 }, { value: 64000 }]))
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Следующие цели 62000, 63000, 64000' }), deps)
+
+      const tps = await tpOrdersOf(tradeId)
+      expect(tps).toHaveLength(3)
+      expect(tps.map((o) => new Decimal(o.qty ?? '0').toString())).toEqual(['1', '1', '1'])
+    })
+
+    it('вторая цель следующим сообщением НЕ сносит уже выставленную первую', async () => {
+      const { tradeId } = await seedForLadder('3')
+      mock.queue.push(tpResponse([{ value: 62000, index: 1 }]))
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Первый тейк 62000' }), deps)
+
+      mock.queue.push(tpResponse([{ value: 63000, index: 2 }]))
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Второй тейк 63000' }), deps)
+
+      const tps = await tpOrdersOf(tradeId)
+      expect(tps.map((o) => new Decimal(o.price ?? '0').toString()).sort()).toEqual(['62000', '63000'])
+    })
+
+    it('цель по ТУ СТОРОНУ рынка не ставится: reduce-only лимитка исполнилась бы мгновенно', async () => {
+      const { tradeId } = await seedForLadder('3')
+      mock.queue.push(tpResponse([{ value: 59000, index: 1 }])) // ниже рынка для лонга
+      const depsWithMark: PipelineDeps = { ...deps, getMarkPrice: async () => '60000' }
+
+      const message = await insertMessage(db, { channelId: CH2_ID, text: 'Первый тейк 59000' })
+      await processMessage(db, message, depsWithMark)
+
+      expect(await tpOrdersOf(tradeId)).toHaveLength(0)
+      const actions = await actionsFor(db, message.id)
+      expect(actions[0]?.skip_reason).toBe('tp_beyond_market')
+    })
+
+    it('ступень меньше шага объёма -> лесенка не ставится и СТАРЫЕ цели не снимаются', async () => {
+      const { tradeId } = await seedForLadder('0.001') // треть = 0.00033 < шага 0.001
+      mock.queue.push(tpResponse([{ value: 62000, index: 1 }]))
+
+      const message = await insertMessage(db, { channelId: CH2_ID, text: 'Первый тейк 62000' })
+      await processMessage(db, message, deps)
+
+      expect(await tpOrdersOf(tradeId)).toHaveLength(0)
+      const actions = await actionsFor(db, message.id)
+      expect(actions[0]?.skip_reason).toBe('zero_qty')
+    })
+  })
+
   it('cancel_order (cancel_pending): отменяет висящий pending add-ордер сделки', async () => {
     await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
     await seedInstrument(db, 'BTCUSDT')

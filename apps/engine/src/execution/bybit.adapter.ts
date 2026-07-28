@@ -5,7 +5,7 @@ import type { Network, OrderPurpose, Side } from 'shared/domain.js'
 import type { BybitRestClient } from '../bybit/rest-client.js'
 import { getInstrument } from '../instruments.js'
 import { floorTo } from '../risk/leverage.js'
-import { orderLinkId } from './order-link-id.js'
+import { orderLinkId, tpLegIndex } from './order-link-id.js'
 import type {
   CancelOrderParams,
   ClosePositionParams,
@@ -145,7 +145,7 @@ export class BybitAdapter implements ExecutionPort {
     // Последовательно (не Promise.all) — тот же приём, что DryRunAdapter: общий tx, независимые
     // orderLinkId на цель, ладдер обычно 2-5 целей, не тысяча.
     for (const tp of params.tps) {
-      const linkId = buildLinkId(params, 'tp', tp.index)
+      const linkId = buildLinkId(params, 'tp', tpLegIndex(params.tpSeq, tp.index))
       // floor к qtyStep — защитный повтор округления (pipeline.ts уже делит total на доли и
       // округляет, последняя добивает остаток; здесь — idempotent no-op в норме, страховка на
       // случай будущего вызывающего кода, который этого не сделал).

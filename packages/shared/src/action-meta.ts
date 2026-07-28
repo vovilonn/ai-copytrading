@@ -60,8 +60,16 @@ export function actionIconColor(type: ActionType, side: Side | null): string {
 
 /** Summary-строка таблицы Actions (design: `a.title + pctSuffix`). pct — строка NUMERIC(6,3)
  *  вида '50.000', суффикс печатается без незначащих нулей ("· 50%"), а не "· 50.000%". */
-export function actionSummary(type: ActionType, pct: string | null): string {
+/**
+ * Подпись действия для оператора.
+ *
+ * `placedOrders` — краткая сводка ордеров, которые это действие реально отправило на биржу
+ * («tp 1943, sl 1910»). Одно действие несёт НЕСКОЛЬКО операций, а его тип выбирается по
+ * приоритету: сообщение «стопы в безубыток + первый тейк 1943» показывалось как «Stop-loss
+ * updated», и было не понять, выставлен ли тейк (живой случай 28.07.2026).
+ */
+export function actionSummary(type: ActionType, pct: string | null, placedOrders?: string | null): string {
   const title = ACTION_META[type].title
-  if (pct === null) return title
-  return `${title} · ${String(Number(pct))}%`
+  const withPct = pct === null ? title : `${title} · ${String(Number(pct))}%`
+  return placedOrders ? `${withPct} · ${placedOrders}` : withPct
 }

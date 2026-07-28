@@ -79,6 +79,16 @@ export class ActionsService {
         'c.title as channel_title',
         'c.key as channel_key',
         't.human_ref as human_ref',
+        // Что действие РЕАЛЬНО отправило на биржу. Одно действие несёт несколько операций
+        // (напр. «стоп в безубыток» + «первый тейк 1943»), а его тип выбирается по приоритету —
+        // и подпись показывала только стоп. Оператор делал вывод, что тейк не выставлен, хотя
+        // ордер стоял (живой случай 28.07.2026). Подтягиваем цены выставленных TP/SL.
+        sql<string | null>`(
+          SELECT string_agg(DISTINCT o.purpose || ' ' || trim(trailing '.' from trim(trailing '0' from o.price::text)), ', ')
+            FROM orders o
+           WHERE o.action_id = a.id AND o.purpose IN ('tp','sl') AND o.price IS NOT NULL
+             AND o.status <> 'cancelled'
+        )`.as('placed_orders'),
       ])
 
     if (filter.channel && filter.channel !== 'all') {
@@ -124,7 +134,7 @@ export class ActionsService {
         side: row.side,
         short: ACTION_META[row.type].short,
         pair: row.pair,
-        summary: actionSummary(row.type, row.pct),
+        summary: actionSummary(row.type, row.pct, row.placed_orders),
         tradeRef: row.human_ref ? `#${row.human_ref}` : null,
         channelId: row.channel_id,
         channelName: row.channel_title ?? row.channel_key,

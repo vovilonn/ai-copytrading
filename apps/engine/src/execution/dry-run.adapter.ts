@@ -3,7 +3,7 @@ import { sql, type Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 import type { OrderPurpose, Side } from 'shared/domain.js'
 import { releaseSymbol } from '../state/trades.js'
-import { orderLinkId } from './order-link-id.js'
+import { orderLinkId, tpLegIndex } from './order-link-id.js'
 import type {
   CancelOrderParams,
   ClosePositionParams,
@@ -144,7 +144,7 @@ export class DryRunAdapter implements ExecutionPort {
     // но общий tx делает параллельные insert'ы избыточным риском без выигрыша в скорости —
     // ладдер обычно 2-5 целей, не тысяча.
     for (const tp of params.tps) {
-      const linkId = buildLinkId(params, 'tp', tp.index)
+      const linkId = buildLinkId(params, 'tp', tpLegIndex(params.tpSeq, tp.index))
 
       const inserted = await tx
         .insertInto('orders')
