@@ -363,3 +363,50 @@ describe('ch2.adapter — цена стопа берётся у маркера, 
     expect(sl('цели 75000 76000 стоп 74600 по битку')).toEqual({ op: 'sl_set', price: 74600 })
   })
 })
+
+// «Ещё один Лонг битка с текущих» (живой случай прода 29.07.2026, сообщение 221534). Разбор отдал
+// новый market_entry, символ был занят открытой сделкой, и прямое указание автора долить позицию
+// ушло в skip(symbol_busy). Отличать добор от ПОВТОРЁННОГО сигнала обязательно: дубль по занятому
+// символу skip'ается намеренно (иначе позиция удвоилась бы), а «ещё один» — это команда долить.
+describe('ch2.adapter — «ещё один» по занятому символу это ДОБОР, а не новый вход', () => {
+  function ctxWith(text: string, open: string[]): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 1, text, date: '2026-07-29T20:04:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(
+        open.map((symbol) => [symbol, { tradeId: 't-1', side: 'long' as const, openedByChannel: '1962583820' }]),
+      ),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('позиция по символу ОТКРЫТА -> add, а не market_entry', () => {
+    const result = parseCh2(ctxWith('Ещё один Лонг битка с текущих', ['BTCUSDT']))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toHaveLength(1)
+    expect(result.intents[0]).toMatchObject({ kind: 'add', symbol: 'BTCUSDT', side: 'long' })
+  })
+
+  it('позиции по символу НЕТ -> обычный вход (автор мог закрыть прошлую сделку раньше)', () => {
+    const result = parseCh2(ctxWith('Ещё один Лонг битка с текущих', []))
+
+    expect(result.intents[0]).toMatchObject({ kind: 'market_entry', symbol: 'BTCUSDT', side: 'long' })
+  })
+
+  it('ПОВТОРЁННЫЙ сигнал без слова «ещё» по занятому символу -> остаётся market_entry (дубль обязан скипаться)', () => {
+    const result = parseCh2(ctxWith('Лонг битка с текущих', ['BTCUSDT']))
+
+    expect(result.intents[0]).toMatchObject({ kind: 'market_entry', symbol: 'BTCUSDT' })
+  })
+
+  it('«добираю»/«усредняю» по занятому символу -> тоже add', () => {
+    for (const text of ['Добираю битка с текущих', 'Усредняю лонг битка с текущих']) {
+      const result = parseCh2(ctxWith(text, ['BTCUSDT']))
+      expect(result.intents[0], text).toMatchObject({ kind: 'add', symbol: 'BTCUSDT' })
+    }
+  })
+})

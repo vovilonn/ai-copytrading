@@ -22,7 +22,7 @@ CORE RULE — NEVER DO ARITHMETIC. Emit symbolic markers for any value that must
 
 ACTION TYPES:
 - open: brand-new position (new symbol/side). Includes structured cards, "Limit long Xrp - 1.118", "Sol long с текущих", "Перезахожу в Лонги Sol Eth btc" (one open per symbol).
-- add: добор/доливка into an EXISTING position ("+ limit long btc 60000", "58100 extra limit long btc", "буду доливаться", "ставлю лимитку на 61000").
+- add: добор/доливка into an EXISTING position ("+ limit long btc 60000", "58100 extra limit long btc", "буду доливаться", "ставлю лимитку на 61000"). "Ещё один лонг битка с текущих" / "добираю" / "усредняю" on a symbol that is ALREADY in the open-positions list is add — NOT a second open (a plain repeated signal without «ещё/добираю» stays open and is rejected as a duplicate downstream).
 - close: partial or full fix ("первая цель, зафиксировал 50%", "закрываю остаток", "Фикс половину", "Закрываю все Лонги").
 - modify_sl / modify_tp: change stop or targets ("Sl btc - 64300", "Следующие цели 72.7, 74", "Стоп на твх").
 - cancel_order: cancel a pending limit ("лимитка не актуальна не задели").

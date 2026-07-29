@@ -223,18 +223,39 @@ function tryLimitEntry(text: string, ctx: ParseContext): ParsedResult | null {
 
 const MARKET_ENTRY_GATE_RE = /с текущих|relong|перезах|повторный лонг|пробую с/i
 
+/**
+ * «ЕЩЁ ОДИН» — это ДОБОР, а не новый вход.
+ *
+ * Живой случай прода 29.07.2026: «Ещё один Лонг битка с текущих» разобрался как новый
+ * `market_entry`, символ был занят открытой сделкой, и вход ушёл в skip(symbol_busy) — то есть
+ * прямое указание автора долить позицию бот проигнорировал.
+ *
+ * Отличать добор от повторного сигнала обязательно: просто повторённый сигнал по занятому символу
+ * (дубль пересылки) skip'ается намеренно — иначе позиция удваивалась бы на пустом месте (см.
+ * e2e-сценарий ch1-busy). Разделяет их именно формулировка «ещё/добираю/доливаю/усредняю» плюс
+ * факт открытой позиции по этому символу.
+ */
+const ADD_INTENT_RE = /(?:ещ[её]\s+(?:один|одну|раз)|добир|добор|долив|доли[влью]|добавля|усредн)/i
+
 function tryMarketEntry(text: string, ctx: ParseContext): ParsedResult | null {
   if (!MARKET_ENTRY_GATE_RE.test(text)) return null
 
   const side = extractSide(text)
   const intents: ParsedIntent[] = []
-  if (side !== null) {
-    // syms = ВСЕ коины в тексте (research §2 C): "Перезахожу в Лонги Sol Eth btc" -> [SOL,ETH,BTC].
-    for (const coin of extractCoins(text)) {
-      const symbol = ctx.resolveSymbol(coin)
-      if (symbol === null || !ctx.isListed(symbol)) continue
-      intents.push({ kind: 'market_entry', symbol, side })
+  const wantsAdd = ADD_INTENT_RE.test(text)
+  // syms = ВСЕ коины в тексте (research §2 C): "Перезахожу в Лонги Sol Eth btc" -> [SOL,ETH,BTC].
+  for (const coin of extractCoins(text)) {
+    const symbol = ctx.resolveSymbol(coin)
+    if (symbol === null || !ctx.isListed(symbol)) continue
+    const open = ctx.openPositions.get(symbol)
+    // Добор — только когда позиция по символу РЕАЛЬНО открыта. Иначе «ещё один лонг» по свободному
+    // символу — обычный вход (автор мог закрыть прошлую сделку раньше). Сторону для добора можно не
+    // называть («Добираю битка с текущих») — она известна из самой позиции.
+    if (wantsAdd && open !== undefined) {
+      intents.push({ kind: 'add', symbol, side: side ?? open.side })
+      continue
     }
+    if (side !== null) intents.push({ kind: 'market_entry', symbol, side })
   }
 
   if (intents.length === 0) {
