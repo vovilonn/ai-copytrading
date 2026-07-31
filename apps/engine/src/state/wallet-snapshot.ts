@@ -52,8 +52,12 @@ export async function writeWalletSnapshot(
     )
     return
   }
-  // available_balance тоже NOT NULL: если totalAvailableBalance пуст, а totalEquity нет — берём
-  // непустой totalEquity, чтобы и в эту колонку не попала пустая строка.
+  // available_balance тоже NOT NULL: если доступный остаток неизвестен, кладём equity, чтобы в
+  // колонку не попала пустая строка. Это ЗАМЕТНО в UI («Available» = «Total equity»), и именно так
+  // выглядел баг до 31.07.2026: Bybit отдаёт totalAvailableBalance пустым на UNIFIED-аккаунте, а
+  // фолбэк молча показывал полный депозит доступным. Теперь остаток считает сам rest-client
+  // (resolveAvailableBalance), и сюда пустая строка приходит, только если биржа не дала вообще
+  // ничего — тогда это по-прежнему честнее, чем выдумать число.
   const availableBalance = balance.totalAvailableBalance !== '' ? balance.totalAvailableBalance : totalEquity
 
   await db

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, vi } from 'vitest'
 import { createHmac } from 'node:crypto'
-import { BybitApiError, BybitRestClient, MAX_PAGINATION_PAGES, TokenBucket, signPayload } from '../src/bybit/rest-client.js'
+import { BybitApiError, BybitRestClient, MAX_PAGINATION_PAGES, resolveAvailableBalance, TokenBucket, signPayload } from '../src/bybit/rest-client.js'
 import { ServerClock } from '../src/bybit/server-time.js'
 
 // Тесты Bybit REST-клиента (Ф3, задача 1). Группы:
@@ -657,5 +657,48 @@ describe('BybitRestClient — идемпотентные/ошибочные retC
       global.fetch = originalFetch
       vi.useRealTimers()
     }
+  })
+})
+
+// Живой ответ прода 31.07.2026: на UNIFIED-аккаунте с кросс-маржой Bybit отдаёт
+// totalAvailableBalance ПУСТОЙ строкой (вместе со всеми верхнеуровневыми total*Margin), а реальные
+// цифры кладёт в разрез монеты. Из-за пустого поля админка показывала «Available» равным полному
+// депозиту, хотя $36 уже заняты маржой.
+describe('resolveAvailableBalance — доступный остаток, когда биржа его не прислала', () => {
+  const usdt = {
+    coin: 'USDT',
+    walletBalance: '278.71085633',
+    usdValue: '283.05144717',
+    availableToWithdraw: '',
+    equity: '283.28345633',
+    totalPositionIM: '36.63134143',
+    totalOrderIM: '0',
+  }
+
+  it('биржа прислала значение -> берём его как есть, ничего не пересчитываем', () => {
+    expect(resolveAvailableBalance('123.45', [usdt])).toBe('123.45')
+  })
+
+  it('пустая строка -> считаем сами: собственные средства минус занятая маржа', () => {
+    // 283.28345633 − 36.63134143 − 0
+    expect(resolveAvailableBalance('', [usdt])).toBe('246.6521149')
+  })
+
+  it('маржа под выставленными ордерами тоже вычитается', () => {
+    expect(resolveAvailableBalance('', [{ ...usdt, totalOrderIM: '10' }])).toBe('236.6521149')
+  })
+
+  it('перегруз маржой -> ноль, а не отрицательный остаток', () => {
+    expect(resolveAvailableBalance('', [{ ...usdt, totalPositionIM: '500' }])).toBe('0')
+  })
+
+  it('нет данных по монете -> пустая строка: врать числом нельзя, пусть решает вызывающий', () => {
+    expect(resolveAvailableBalance('', [])).toBe('')
+    expect(resolveAvailableBalance('', [{ ...usdt, equity: '' }])).toBe('')
+  })
+
+  it('settle-монета выбирается по USDT, а не по первой в списке', () => {
+    const btc = { coin: 'BTC', walletBalance: '0.5', usdValue: '30000', availableToWithdraw: '', equity: '0.5', totalPositionIM: '0' }
+    expect(resolveAvailableBalance('', [btc, usdt])).toBe('246.6521149')
   })
 })

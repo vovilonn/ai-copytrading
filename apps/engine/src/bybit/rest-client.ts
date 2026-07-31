@@ -10,6 +10,7 @@
 // вызывающий метод, не общий транспортный слой.
 
 import { createHmac } from 'node:crypto'
+import { Decimal } from 'decimal.js'
 import { createBybitServerClock, type ServerClock } from './server-time.js'
 import type { Network } from 'shared/domain.js'
 
@@ -218,12 +219,48 @@ export interface WalletCoinBalance {
   walletBalance: string
   usdValue: string
   availableToWithdraw: string
+  /** Начальная маржа под ОТКРЫТЫМИ позициями монеты. Есть даже когда верхнеуровневые
+   *  `total*Margin` пусты — из неё считается доступный остаток (см. getWalletBalance). */
+  totalPositionIM?: string
+  /** Начальная маржа под ВЫСТАВЛЕННЫМИ, но не исполненными ордерами. */
+  totalOrderIM?: string
+  equity?: string
 }
 
 export interface WalletBalance {
   totalEquity: string
   totalAvailableBalance: string
   coins: WalletCoinBalance[]
+}
+
+/**
+ * Доступный остаток счёта.
+ *
+ * Bybit на UNIFIED-аккаунте с кросс-маржой отдаёт `totalAvailableBalance` ПУСТОЙ строкой — вместе
+ * со всеми верхнеуровневыми `total*Margin`. Живой ответ прода 31.07.2026:
+ *   totalEquity "283.05", totalAvailableBalance "", totalInitialMargin "", totalMarginBalance ""
+ *   coin[USDT]: equity "283.28", totalPositionIM "36.63", totalOrderIM "0", availableToWithdraw ""
+ * Из-за пустого поля вся цепочка вниз (pickNonEmptyEquity) подставляла вместо остатка ПОЛНЫЙ
+ * депозит, и в админке «Available» совпадал с «Total equity», хотя $36 уже заняты под маржу.
+ *
+ * Считаем сами по формуле самой биржи: доступно = собственные средства − начальная маржа позиций
+ * и выставленных ордеров. Данные для этого лежат в разрезе монеты, и они непустые.
+ * Если и там пусто — возвращаем пустую строку: пусть решает вызывающий, врать числом нельзя.
+ */
+export function resolveAvailableBalance(reported: string, coins: readonly WalletCoinBalance[]): string {
+  if (reported !== '') return reported
+
+  const settle = coins.find((c) => c.coin === 'USDT') ?? coins[0]
+  if (!settle) return ''
+
+  const equity = settle.equity !== undefined && settle.equity !== '' ? new Decimal(settle.equity) : null
+  if (equity === null) return ''
+
+  const positionIm = settle.totalPositionIM !== undefined && settle.totalPositionIM !== '' ? new Decimal(settle.totalPositionIM) : new Decimal(0)
+  const orderIm = settle.totalOrderIM !== undefined && settle.totalOrderIM !== '' ? new Decimal(settle.totalOrderIM) : new Decimal(0)
+
+  // Ниже нуля доступного остатка не бывает: при перегрузе маржой биржа сама показывает 0.
+  return Decimal.max(0, equity.minus(positionIm).minus(orderIm)).toString()
 }
 
 /** `GET /v5/position/list` (research §1/§14) — поля, нужные сайзингу/реконсиляции/UI. */
@@ -657,7 +694,11 @@ export class BybitRestClient {
     }>('/v5/account/wallet-balance', { accountType: 'UNIFIED' })
     const account = result.list[0]
     if (!account) throw new Error('getWalletBalance: Bybit вернул пустой list для accountType=UNIFIED')
-    return { totalEquity: account.totalEquity, totalAvailableBalance: account.totalAvailableBalance, coins: account.coin }
+    return {
+      totalEquity: account.totalEquity,
+      totalAvailableBalance: resolveAvailableBalance(account.totalAvailableBalance, account.coin),
+      coins: account.coin,
+    }
   }
 
   /** `GET /v5/position/list category=linear` — `settleCoin=USDT`, если `symbol` не задан (research §14).
