@@ -123,3 +123,24 @@ it('maxLeverage сверх диапазона колонки NUMERIC(6,2) -> 400
 it('неизвестный канал -> 404', async () => {
   await agent.patch('/api/channels/999999/settings').send({ enabled: true }).expect(404)
 })
+
+// Тумблер «всегда торговать фиксированной суммой» (миграция 009): без него размер сделки выводится
+// из риска, указанного автором в сообщении, и скачет от сигнала к сигналу.
+it('forceTradeSize: по умолчанию выключен, PATCH включает и GET отдаёт то же значение', async () => {
+  const before = await agent.get(`/api/channels/${CHANNEL_1_ID}`).expect(200)
+  expect((before.body as ChannelDto).forceTradeSize).toBe(false)
+
+  const res = await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ forceTradeSize: true }).expect(200)
+  expect((res.body as ChannelSettingsDto).forceTradeSize).toBe(true)
+
+  const after = await agent.get(`/api/channels/${CHANNEL_1_ID}`).expect(200)
+  expect((after.body as ChannelDto).forceTradeSize).toBe(true)
+
+  // Выключается обратно тем же способом — тумблер, а не одностороннее переключение.
+  const off = await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ forceTradeSize: false }).expect(200)
+  expect((off.body as ChannelSettingsDto).forceTradeSize).toBe(false)
+})
+
+it('forceTradeSize не булево -> 400, а не тихая запись мусора', async () => {
+  await agent.patch(`/api/channels/${CHANNEL_1_ID}/settings`).send({ forceTradeSize: 'yes' }).expect(400)
+})

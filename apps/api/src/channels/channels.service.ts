@@ -23,6 +23,7 @@ interface ChannelRow {
   max_leverage: string
   default_leverage: string | null
   cross_margin: boolean
+  force_trade_size: boolean
   action_count: number
   active_positions: number
   message_count: number
@@ -35,7 +36,7 @@ interface ChannelRow {
 // их сырым SQL, а не Kysely-билдером, одним запросом с коррелированными подзапросами (не N+1).
 const CHANNEL_COLUMNS = `
   c.id, c.key, c.title, c.handle, c.status,
-  cs.enabled, cs.trade_size, cs.max_leverage, cs.default_leverage, cs.cross_margin,
+  cs.enabled, cs.trade_size, cs.max_leverage, cs.default_leverage, cs.cross_margin, cs.force_trade_size,
   (SELECT count(*) FROM actions   a WHERE a.channel_id = c.id)                 AS action_count,
   (SELECT count(*) FROM positions p WHERE p.channel_id = c.id AND p.size <> 0) AS active_positions,
   (SELECT count(*) FROM messages  m WHERE m.channel_id = c.id)                 AS message_count
@@ -90,6 +91,7 @@ function toChannelDto(row: ChannelRow, winRate: string): ChannelDto {
     maxLeverage: `${formatNumeric(row.max_leverage)}x`,
     defaultLeverage: row.default_leverage !== null ? `${formatNumeric(row.default_leverage)}x` : null,
     crossMargin: row.cross_margin,
+    forceTradeSize: row.force_trade_size,
   }
 }
 

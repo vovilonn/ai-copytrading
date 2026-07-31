@@ -1231,7 +1231,12 @@ async function handleOpen(
     // дистанция НАШЕГО защитного стопа, то есть артефакт нашего выбора плеча, а не намерение
     // автора: «риск 2%» превратился бы в размер, зависящий от настройки канала. Тогда сайзим
     // фиксированным trade_size — предсказуемо и не выдумывает за автора (решение заказчика).
-    ...(intent.riskPct !== undefined && intent.signalSl !== undefined ? { riskPct: intent.riskPct.toString() } : {}),
+    //
+    // Тумблер `force_trade_size` (миграция 009) отменяет риск-формулу совсем: оператор сказал
+    // «торгуй всегда ровно на мою сумму», и размер сделки перестаёт скакать от сигнала к сигналу.
+    ...(!base.settings.force_trade_size && intent.riskPct !== undefined && intent.signalSl !== undefined
+      ? { riskPct: intent.riskPct.toString() }
+      : {}),
     equity: base.deps.equity,
     tradeSize: base.settings.trade_size,
     entry: entryPrice.toString(),

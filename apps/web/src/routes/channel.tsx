@@ -100,6 +100,7 @@ interface SettingsFormState {
   maxLeverage: string
   defaultLeverage: string // '' — не задано (плейсхолдер "—", null на бэке)
   crossMargin: boolean
+  forceTradeSize: boolean
 }
 
 function toFormState(channel: ChannelDto): SettingsFormState {
@@ -109,6 +110,7 @@ function toFormState(channel: ChannelDto): SettingsFormState {
     maxLeverage: stripLeverage(channel.maxLeverage),
     defaultLeverage: channel.defaultLeverage ? stripLeverage(channel.defaultLeverage) : '',
     crossMargin: channel.crossMargin,
+    forceTradeSize: channel.forceTradeSize,
   }
 }
 
@@ -118,6 +120,7 @@ interface SettingsPatchBody {
   maxLeverage: string
   defaultLeverage: string | null
   crossMargin: boolean
+  forceTradeSize: boolean
 }
 
 // Тот же вид форматирования денег/плеча, что и бэкенд (apps/api/src/channels/channels.service.ts,
@@ -135,6 +138,7 @@ function applyOptimistic(channel: ChannelDto, body: SettingsPatchBody): ChannelD
     maxLeverage: `${normalizeNumber(body.maxLeverage)}x`,
     defaultLeverage: body.defaultLeverage !== null ? `${normalizeNumber(body.defaultLeverage)}x` : null,
     crossMargin: body.crossMargin,
+    forceTradeSize: body.forceTradeSize,
   }
 }
 
@@ -146,6 +150,7 @@ function mergeSettings(channel: ChannelDto, settings: ChannelSettingsDto): Chann
     maxLeverage: settings.maxLeverage,
     defaultLeverage: settings.defaultLeverage,
     crossMargin: settings.crossMargin,
+    forceTradeSize: settings.forceTradeSize,
   }
 }
 
@@ -244,6 +249,7 @@ export function ChannelSettings({ channel }: { channel: ChannelDto }) {
       maxLeverage: form.maxLeverage,
       defaultLeverage: form.defaultLeverage.trim() === '' ? null : form.defaultLeverage,
       crossMargin: form.crossMargin,
+      forceTradeSize: form.forceTradeSize,
     })
   }
 
@@ -308,6 +314,17 @@ export function ChannelSettings({ channel }: { channel: ChannelDto }) {
           />
           <span className="pl-[2px] pr-[11px] text-[13px] text-muted-1">x</span>
         </div>
+      </SettingsRow>
+
+      <SettingsRow
+        title="Always use trade size"
+        description="If on, this fixed amount is used for every trade — even when the signal names a risk %. If off, a signal with «Риск: 1%» sizes the position from that risk and the stop distance instead."
+      >
+        <Switch
+          aria-label="Always use trade size"
+          checked={form.forceTradeSize}
+          onCheckedChange={(checked) => setForm((f) => ({ ...f, forceTradeSize: checked }))}
+        />
       </SettingsRow>
 
       <SettingsRow

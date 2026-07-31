@@ -15,6 +15,7 @@ export interface UpdateChannelSettingsInput {
   maxLeverage?: string
   defaultLeverage?: string | null
   crossMargin?: boolean
+  forceTradeSize?: boolean
 }
 
 interface ChannelSettingsRow {
@@ -24,6 +25,7 @@ interface ChannelSettingsRow {
   max_leverage: string
   default_leverage: string | null
   cross_margin: boolean
+  force_trade_size: boolean
 }
 
 function toChannelSettingsDto(row: ChannelSettingsRow): ChannelSettingsDto {
@@ -34,6 +36,7 @@ function toChannelSettingsDto(row: ChannelSettingsRow): ChannelSettingsDto {
     maxLeverage: `${formatNumeric(row.max_leverage)}x`,
     defaultLeverage: row.default_leverage !== null ? `${formatNumeric(row.default_leverage)}x` : null,
     crossMargin: row.cross_margin,
+    forceTradeSize: row.force_trade_size,
   }
 }
 
@@ -85,6 +88,9 @@ function assertValid(input: UpdateChannelSettingsInput): void {
   if (input.crossMargin !== undefined && typeof input.crossMargin !== 'boolean') {
     throw new BadRequestException('crossMargin must be a boolean')
   }
+  if (input.forceTradeSize !== undefined && typeof input.forceTradeSize !== 'boolean') {
+    throw new BadRequestException('forceTradeSize must be a boolean')
+  }
 }
 
 @Injectable()
@@ -102,6 +108,7 @@ export class ChannelSettingsService {
     if (input.maxLeverage !== undefined) patch.max_leverage = input.maxLeverage
     if (input.defaultLeverage !== undefined) patch.default_leverage = input.defaultLeverage
     if (input.crossMargin !== undefined) patch.cross_margin = input.crossMargin
+    if (input.forceTradeSize !== undefined) patch.force_trade_size = input.forceTradeSize
 
     const updated = await this.database.db
       .updateTable('channel_settings')

@@ -19,6 +19,9 @@ export const DEFAULT_CHANNEL_SETTINGS = {
   add_sizing_mode: 'trade_size',
   max_symbol_notional: null,
   mirror_manual_fraction: false,
+  // false — риск из сигнала («Риск: 1%») главнее фиксированной суммы, как было всегда.
+  // true — «торгуй всегда ровно на trade_size», риск из сообщения игнорируется (миграция 009).
+  force_trade_size: false,
   limit_ttl_sec: 604_800,
 } as const
 

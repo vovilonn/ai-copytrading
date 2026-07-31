@@ -29,6 +29,7 @@ const CHANNEL: ChannelDto = {
   maxLeverage: '10x',
   defaultLeverage: null,
   crossMargin: true,
+  forceTradeSize: false,
 }
 
 function renderSettings(queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
@@ -84,6 +85,7 @@ describe('ChannelSettings (Settings-таб канала)', () => {
       maxLeverage: '10x',
       defaultLeverage: null,
       crossMargin: true,
+  forceTradeSize: false,
     }
     vi.mocked(apiFetch).mockResolvedValueOnce(settingsResponse)
 
@@ -101,6 +103,7 @@ describe('ChannelSettings (Settings-таб канала)', () => {
       maxLeverage: '10',
       defaultLeverage: null,
       crossMargin: true,
+  forceTradeSize: false,
     })
 
     expect(await screen.findByText('Saved')).toBeInTheDocument()
@@ -114,6 +117,7 @@ describe('ChannelSettings (Settings-таб канала)', () => {
       maxLeverage: '10x',
       defaultLeverage: null,
       crossMargin: true,
+  forceTradeSize: false,
     }
     vi.mocked(apiFetch).mockResolvedValueOnce(settingsResponse)
 

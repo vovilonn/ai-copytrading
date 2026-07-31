@@ -65,6 +65,8 @@ interface SeedOpts {
   maxLeverage?: string
   /** Водяной знак истории канала: сообщения с tg_message_id <= него движок не разбирает. */
   processFromMessageId?: number
+  /** Фиксированная сумма сделки важнее риска из сигнала (миграция 009). */
+  forceTradeSize?: boolean
 }
 
 async function seedChannel(opts: SeedOpts): Promise<void> {
@@ -105,6 +107,7 @@ async function seedChannel(opts: SeedOpts): Promise<void> {
       add_sizing_mode: 'trade_size',
       mirror_manual_fraction: false,
       limit_ttl_sec: 604_800,
+      force_trade_size: opts.forceTradeSize ?? false,
       updated_at: now,
     })
     .execute()
@@ -1175,5 +1178,67 @@ describe('pipeline — история канала не разбирается (
 
     const action = await actionFor(channelId, 1)
     expect(action.status).toBe('executed')
+  })
+})
+
+// Тумблер «всегда торговать фиксированной суммой» (миграция 009). Без него размер сделки скачет от
+// сигнала к сигналу: указанный автором риск делится на дистанцию стопа, и при тесном стопе позиция
+// выходит кратно больше задуманной. Оператор хочет режим «торгуй ровно на мою сумму».
+describe('pipeline — force_trade_size: фиксированная сумма важнее риска из сигнала', () => {
+  // Сигнал с риском 2% и стопом в 10% от входа: риск-формула даст notional = (0.02*10000)/0.1 = 2000.
+  // Фиксированная сумма при плече 10 даёт 500*10 = 5000, ограниченные потолком equity*lev.
+  const SIGNAL = '#ATOM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 2%'
+
+  async function entryQty(channelId: number): Promise<string> {
+    const order = await db
+      .selectFrom('orders')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .where('purpose', '=', 'entry')
+      .executeTakeFirstOrThrow()
+    return new Decimal(order.qty!).toString()
+  }
+
+  /** Маржа сделки = размер позиции / плечо. Плечо считается от дистанции стопа, поэтому сверять
+   *  надо именно маржу: она и есть «сумма, которую оператор вписал в настройку». */
+  async function entryMargin(channelId: number): Promise<Decimal> {
+    const trade = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    const qty = new Decimal(await entryQty(channelId))
+    return qty.mul(trade.avg_entry ?? '0').div(trade.leverage ?? '1')
+  }
+
+  it('тумблер ВЫКЛЮЧЕН -> размер выводится из риска сигнала (прежнее поведение)', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT', tradeSize: '50', maxLeverage: '10' })
+    const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', aiEnabled: false }
+
+    await processMessage(db, await insertMessage(channelId, 1, SIGNAL), localDeps)
+
+    // (2% × 10000) / 0.1 = 2000 нотионала при цене 100 -> 20 монет.
+    expect(await entryQty(channelId)).toBe('20')
+  })
+
+  it('тумблер ВКЛЮЧЁН -> риск из сигнала игнорируется, берётся trade_size × плечо', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT', tradeSize: '50', maxLeverage: '10', forceTradeSize: true })
+    const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', aiEnabled: false }
+
+    await processMessage(db, await insertMessage(channelId, 1, SIGNAL), localDeps)
+
+    // Из депозита уходит ровно заявленная сумма — с точностью до округления объёма к шагу лота.
+    const margin = await entryMargin(channelId)
+    expect(margin.minus(50).abs().lt(1)).toBe(true)
+    // И это ЗАМЕТНО меньше того, что дала бы риск-формула (20 монет) — иначе тест ничего не доказывал.
+    expect(new Decimal(await entryQty(channelId)).lt(20)).toBe(true)
+  })
+
+  it('тумблер ВКЛЮЧЁН, но риска в сигнале нет -> поведение не меняется (та же фиксированная сумма)', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT', tradeSize: '50', maxLeverage: '10', forceTradeSize: true })
+    const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', aiEnabled: false }
+
+    await processMessage(db, await insertMessage(channelId, 1, '#ATOM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$'), localDeps)
+
+    expect((await entryMargin(channelId)).minus(50).abs().lt(1)).toBe(true)
   })
 })

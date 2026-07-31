@@ -33,6 +33,7 @@ const CHANNELS: ChannelDto[] = [
     maxLeverage: '10x',
     defaultLeverage: null,
     crossMargin: true,
+  forceTradeSize: false,
   },
   {
     id: 2,
@@ -50,6 +51,7 @@ const CHANNELS: ChannelDto[] = [
     maxLeverage: '3x',
     defaultLeverage: '5x',
     crossMargin: false,
+  forceTradeSize: false,
   },
 ]
 

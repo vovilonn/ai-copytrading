@@ -131,6 +131,12 @@ export interface DB {
     add_sizing_mode: string
     max_symbol_notional: string | null
     mirror_manual_fraction: boolean
+    /**
+     * true — размер сделки ВСЕГДА берётся из `trade_size`, даже если в сигнале указан риск в
+     * процентах (иначе объём выводится из риска и стоп-дистанции, см. risk/sizing.ts).
+     * `Generated`, потому что у колонки есть DEFAULT false (миграция 009).
+     */
+    force_trade_size: Generated<boolean>
     limit_ttl_sec: number
     updated_at: Date
   }

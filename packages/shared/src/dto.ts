@@ -23,6 +23,8 @@ export interface ChannelDto {
   // maxLeverage сигнала как есть). Settings-таб (design/project/Admin.dc.html:280-289).
   defaultLeverage: string | null
   crossMargin: boolean
+  /** true — размер сделки всегда берётся из tradeSize, даже если в сигнале указан риск (миграция 009). */
+  forceTradeSize: boolean
 }
 
 // Задача "редактируемые настройки канала" (Ф4): ответ PATCH /api/channels/:id/settings
@@ -37,6 +39,8 @@ export interface ChannelSettingsDto {
   maxLeverage: string
   defaultLeverage: string | null
   crossMargin: boolean
+  /** true — размер сделки всегда берётся из tradeSize, даже если в сигнале указан риск в процентах. */
+  forceTradeSize: boolean
 }
 
 // Задача 8: теперь actions пайплайна (задача 7) реально заполняют это поле — реализация в
