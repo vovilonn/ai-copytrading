@@ -347,6 +347,38 @@ describe('ch1.adapter — доля/отрицание/полное закрыт�
     expect(ops('#DUSK — Фиксируюсь по текущим полностью')).toEqual([{ op: 'close_remainder' }])
   })
 
+  // Живой случай прода 31.07.2026: «#ARB – остаток позиции фиксирую по текущим» закрыл ПОЛОВИНУ
+  // вместо всего остатка — прежний шаблон требовал глагол сразу после слова «остаток», а здесь
+  // между ними стоит «позиции».
+  it('«остаток позиции фиксирую» -> close_remainder, а не половина', () => {
+    expect(ops('#ARB – остаток позиции фиксирую по текущим. Актив не реагирует на снижение биткоина.')).toEqual([
+      { op: 'close_remainder' },
+    ])
+  })
+
+  it('другие формулировки остатка тоже закрывают полностью', () => {
+    for (const text of [
+      '#ARB — остаток закрываю',
+      '#ARB — фиксирую остаток по рынку',
+      '#ARB — остаток позиции снимаю',
+      '#ARB — зафиксировал остаток',
+    ]) {
+      expect(ops(text), text).toContainEqual({ op: 'close_remainder' })
+      expect(ops(text).some((o) => o.op === 'partial_close'), text).toBe(false)
+    }
+  })
+
+  it('«зафиксировал 50%. Остаток тяну дальше» -> частичная фиксация, остаток НЕ закрывается', () => {
+    const result = ops('#ARB — зафиксировал 50% позиции. Остаток тяну дальше.')
+
+    expect(result).toContainEqual({ op: 'partial_close', fraction: 0.5 })
+    expect(result.some((o) => o.op === 'close_remainder')).toBe(false)
+  })
+
+  it('«остаток закрою по 1.2» — это план на будущее, а не команда закрыть сейчас', () => {
+    expect(ops('#ARB — остаток закрою по 1.2').some((o) => o.op === 'close_remainder')).toBe(false)
+  })
+
   it('явная доля «25% фиксирую» -> fraction=0.25', () => {
     expect(ops('#CLO — Пробит хай, 25% фиксирую')).toContainEqual({ op: 'partial_close', fraction: 0.25 })
   })
