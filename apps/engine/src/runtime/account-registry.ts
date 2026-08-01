@@ -40,6 +40,12 @@ export interface AccountRuntime {
   privateWs: BybitPrivateWs
   /** Обновляется таймером main.ts; в dry_run — фиксированная заглушка. */
   equity: string
+  /**
+   * СВОБОДНАЯ маржа аккаунта — потолок для нового ордера. Депозит почти весь может быть занят
+   * открытыми позициями: сайзинг от `equity` отправлял ордера, которые биржа отвергала кодом
+   * 110007 (живой случай 01.08.2026). Обновляется тем же таймером, что и equity.
+   */
+  availableBalance: string
 }
 
 /** Канал, чьи ключи не удалось применить: его сообщения не обрабатываются, остальные каналы живут. */
@@ -70,7 +76,7 @@ export interface BuildRegistryOptions {
   /** Подмена в тестах: по умолчанию — реальные ключи канала с фолбэком на env. */
   loadKeys?: (db: Kysely<DB>, channelId: number | null) => Promise<ChannelKeys>
   /** Подмена в тестах: сборка клиентов аккаунта. */
-  createRuntime?: (params: CreateRuntimeParams) => Omit<AccountRuntime, 'channelIds' | 'equity'>
+  createRuntime?: (params: CreateRuntimeParams) => Omit<AccountRuntime, 'channelIds' | 'equity' | 'availableBalance'>
   log?: Pick<Console, 'log' | 'warn' | 'error'>
 }
 
@@ -84,7 +90,7 @@ export interface CreateRuntimeParams {
   channelIds: number[]
 }
 
-function defaultCreateRuntime(params: CreateRuntimeParams): Omit<AccountRuntime, 'channelIds' | 'equity'> {
+function defaultCreateRuntime(params: CreateRuntimeParams): Omit<AccountRuntime, 'channelIds' | 'equity' | 'availableBalance'> {
   const rest = new BybitRestClient({ apiKey: params.keys.apiKey, apiSecret: params.keys.apiSecret, network: params.network })
   const privateWs = new BybitPrivateWs({
     apiKey: params.keys.apiKey,
@@ -157,6 +163,7 @@ export async function buildAccountRegistry(options: BuildRegistryOptions): Promi
       }),
       channelIds: group.channelIds,
       equity: options.initialEquity,
+      availableBalance: options.initialEquity,
     }
     runtimes.push(runtime)
     for (const channelId of group.channelIds) byChannel.set(channelId, runtime)

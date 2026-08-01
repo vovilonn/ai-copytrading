@@ -17,11 +17,17 @@ export interface ComputeSizeParams {
   minNotional: Numeric
   /** Потолок совокупной экспозиции на символ (R10), опционален. */
   maxSymbolNotional?: Numeric
+  /**
+   * СВОБОДНАЯ маржа счёта. Не путать с `equity`: депозит включает деньги, уже занятые под
+   * открытые позиции, а новый ордер биржа проверяет именно по свободному остатку.
+   * Не задан — потолок по свободной марже не применяется (бэктест/dry-run).
+   */
+  availableBalance?: Numeric
   qtyStep: Numeric
 }
 
 export type ComputeSizeOk = { notional: Decimal; qty: Decimal }
-export type ComputeSizeSkip = { skip: 'below_min_notional' | 'zero_qty' }
+export type ComputeSizeSkip = { skip: 'below_min_notional' | 'zero_qty' | 'insufficient_margin' }
 export type ComputeSizeResult = ComputeSizeOk | ComputeSizeSkip
 
 /**
@@ -29,7 +35,7 @@ export type ComputeSizeResult = ComputeSizeOk | ComputeSizeSkip
  *   d = |entry - sl| / entry
  *   есть riskPct и sl  →  notional = (riskPct/100 * equity) / d
  *   нет riskPct        →  notional = tradeSize * lev                        (фолбэк)
- *   notional = min(notional, equity * lev, maxSymbolNotional?)              (жёсткий потолок)
+ *   notional = min(notional, equity * lev, available * lev?, maxSymbolNotional?)  (жёсткий потолок)
  *   qty = floor_to(qtyStep, notional / entry)
  *   если notional < minNotional → skip('below_min_notional')
  *   если qty === 0              → skip('zero_qty')
@@ -68,9 +74,22 @@ export function computeSize(params: ComputeSizeParams): ComputeSizeResult {
   if (params.maxSymbolNotional !== undefined) {
     caps.push(new Decimal(params.maxSymbolNotional))
   }
+
+  // ⚠️ ПОТОЛОК ПО СВОБОДНОЙ МАРЖЕ. Депозит — это НЕ то, чем можно открыть новую позицию: почти
+  // весь он может быть уже занят под текущие. Живой случай прода 01.08.2026: депозит $251, пять
+  // открытых позиций держат $190, свободно $9 — а сайзинг считал потолок от $251 и отправил ордер
+  // на $500. Биржа отвергла его кодом 110007, сообщение ушло в needs_review, сделки не случилось.
+  // Лучше войти меньшим объёмом, чем не войти вовсе.
+  if (params.availableBalance !== undefined) {
+    caps.push(new Decimal(params.availableBalance).mul(lev))
+  }
   notional = Decimal.min(notional, ...caps)
 
   if (notional.lt(minNotional)) {
+    // Разделяем причины: «свободной маржи не хватает даже на минимальный ордер» — это состояние
+    // счёта, а не свойство сигнала, и оператору важно видеть разницу.
+    const marginCap = params.availableBalance !== undefined ? new Decimal(params.availableBalance).mul(lev) : null
+    if (marginCap !== null && marginCap.lt(minNotional)) return { skip: 'insufficient_margin' }
     return { skip: 'below_min_notional' }
   }
 

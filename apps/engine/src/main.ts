@@ -383,6 +383,7 @@ async function main(): Promise<void> {
       executionPort: runtime.executionPort,
       network: config.bybitNetwork,
       equity: runtime.equity,
+      availableBalance: runtime.availableBalance,
       getMarkPrice: createMarkPriceGetter(runtime.rest),
       maxEntrySlippagePct: MAX_ENTRY_SLIPPAGE_PCT,
     }
@@ -514,6 +515,14 @@ async function main(): Promise<void> {
             runtime.equity = value.toString()
           })
           .catch((err) => console.error(`[engine] рефреш equity ${runtime.fingerprint}:`, err))
+        // Свободная маржа — отдельным полем: именно её проверяет биржа при новом ордере, и она
+        // может быть в разы меньше депозита (см. AccountRuntime.availableBalance).
+        runtime.rest
+          .getWalletBalance()
+          .then((balance) => {
+            if (balance.totalAvailableBalance !== '') runtime.availableBalance = balance.totalAvailableBalance
+          })
+          .catch((err) => console.error(`[engine] рефреш свободной маржи ${runtime.fingerprint}:`, err))
       }
     }, EQUITY_REFRESH_INTERVAL_MS)
 

@@ -189,3 +189,57 @@ describe('property: computeSize — округление и потолок (P2, 
     )
   })
 })
+
+// Потолок по СВОБОДНОЙ марже. Живой случай прода 01.08.2026: депозит $251, пять открытых позиций
+// держат $190, свободно $9 — а сайзинг считал потолок от депозита и отправил ордер на $500. Биржа
+// отвергла его кодом 110007, сообщение ушло в needs_review, сделки не случилось.
+describe('computeSize — свободная маржа как потолок', () => {
+  const base = { entry: '50', sl: '45', lev: '10', minNotional: '5', qtyStep: '0.01' } as const
+
+  it('свободной маржи меньше депозита -> позиция считается от НЕЁ, а не от депозита', () => {
+    const r = computeSize({ ...base, equity: '250', availableBalance: '9', tradeSize: '50' })
+
+    expect('skip' in r).toBe(false)
+    if ('skip' in r) return
+    expect(r.notional.toString()).toBe('90') // 9 свободной маржи × плечо 10, а не 50 × 10
+    expect(r.notional.div(10).toString()).toBe('9')
+  })
+
+  it('риск-ветка тоже ограничена свободной маржой', () => {
+    // (2% × 250) / 0.1 = 50 нотионала — но свободной маржи только 2, значит потолок 20.
+    const r = computeSize({ ...base, riskPct: '2', equity: '250', availableBalance: '2', tradeSize: '999' })
+
+    expect('skip' in r).toBe(false)
+    if ('skip' in r) return
+    expect(r.notional.toString()).toBe('20')
+  })
+
+  it('свободной маржи не хватает даже на минимальный ордер -> отдельная причина insufficient_margin', () => {
+    // 0.4 × 10 = 4 < minNotional 5.
+    expect(computeSize({ ...base, equity: '250', availableBalance: '0.4', tradeSize: '50' })).toEqual({
+      skip: 'insufficient_margin',
+    })
+  })
+
+  it('свободной маржи хватает, а сумма сделки мала -> прежняя причина below_min_notional', () => {
+    expect(computeSize({ ...base, equity: '250', availableBalance: '100', tradeSize: '0.4' })).toEqual({
+      skip: 'below_min_notional',
+    })
+  })
+
+  it('свободная маржа не задана (бэктест/dry-run) -> потолок не применяется, поведение прежнее', () => {
+    const r = computeSize({ ...base, equity: '250', tradeSize: '50' })
+
+    expect('skip' in r).toBe(false)
+    if ('skip' in r) return
+    expect(r.notional.toString()).toBe('500')
+  })
+
+  it('свободной маржи больше нужного -> ограничивает заявленная сумма, а не потолок', () => {
+    const r = computeSize({ ...base, equity: '250', availableBalance: '200', tradeSize: '20' })
+
+    expect('skip' in r).toBe(false)
+    if ('skip' in r) return
+    expect(r.notional.toString()).toBe('200')
+  })
+})

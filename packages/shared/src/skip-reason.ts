@@ -38,6 +38,10 @@ const SKIP_REASON_LABELS: Readonly<Record<string, string>> = {
   // принято за достигнутую цель). Закрывать долю в минус по такому сигналу опаснее, чем спросить.
   tp_not_reached: 'target reported as hit, but the position is in loss',
 
+  // Свободной маржи на счёте не хватает даже на минимальный ордер: депозит занят открытыми
+  // позициями. Не свойство сигнала, а состояние счёта — оператору надо освободить маржу.
+  insufficient_margin: 'not enough free margin — the deposit is tied up in open positions',
+
   // ── Настройки и ручное управление ─────────────────────────────────────────────────────────
   copy_disabled: 'copy trading disabled for the channel',
   manual_override: 'trade under manual control',

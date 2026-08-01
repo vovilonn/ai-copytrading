@@ -66,6 +66,12 @@ export interface PipelineDeps {
    */
   equity: string
   /**
+   * СВОБОДНАЯ маржа аккаунта — потолок размера нового ордера. Не задана (бэктест/dry-run) —
+   * потолок не применяется. Отличие от `equity` денежное: депозит включает деньги, уже занятые
+   * под открытые позиции, а новый ордер биржа проверяет по свободному остатку.
+   */
+  availableBalance?: string
+  /**
    * Important I2 адверсариального ревью (p3-core-fix-report.md): живой mark price символа —
    * гейт staleness/slippage перед market-входом (см. DEFAULT_MAX_ENTRY_SLIPPAGE_PCT/
    * handleEntrySignal ниже). `undefined` в dry_run (main.ts не подключает сеть в этом режиме —
@@ -1238,6 +1244,7 @@ async function handleOpen(
       ? { riskPct: intent.riskPct.toString() }
       : {}),
     equity: base.deps.equity,
+    ...(base.deps.availableBalance !== undefined ? { availableBalance: base.deps.availableBalance } : {}),
     tradeSize: base.settings.trade_size,
     entry: entryPrice.toString(),
     sl: sl.toString(),
@@ -1395,6 +1402,7 @@ async function handleAdd(
 
   const sizeResult = computeSize({
     equity: base.deps.equity,
+    ...(base.deps.availableBalance !== undefined ? { availableBalance: base.deps.availableBalance } : {}),
     tradeSize: base.settings.trade_size, // add_sizing_mode='trade_size'
     entry: entryPrice.toString(),
     sl: position.avg_price ?? entryPrice.toString(), // sl не участвует в фолбэк-ветке (нет riskPct)
