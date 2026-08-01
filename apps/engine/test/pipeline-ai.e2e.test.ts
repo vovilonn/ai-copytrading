@@ -681,6 +681,111 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
     })
   })
 
+  // Доливка не трогала цели: они оставались выставлены на прежний объём, и после добора позиция
+  // выходила по лесенке лишь частично, а остаток держался до стопа. Живые случаи ARB/INJ/MMT
+  // (30-31.07.2026): лесенка покрывала 7-14% позиции.
+  describe('добор пересчитывает TP-лесенку под новый объём', () => {
+    async function seedWithLadder(qty: string) {
+      await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+      await seedInstrument(db, 'BTCUSDT')
+      const seeded = await seedOpenPosition(db, { channelId: CH2_ID, channelOrd: CH2_ORD, symbol: 'BTCUSDT', side: 'long', entryPrice: '60000', qty })
+      // Лесенка из трёх целей на ВЕСЬ объём — то, что ставит вход по структурному сигналу.
+      mock.queue.push(
+        toolUseResponse(
+          baseOutput({
+            message_type: 'modify_tp',
+            confidence: 0.9,
+            actions: [{ type: 'modify_tp', symbol: 'BTCUSDT', side: 'long',
+                        take_profits: [{ value: 62000 }, { value: 63000 }, { value: 64000 }], evidence_source: 'text' }],
+          }),
+        ),
+      )
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Следующие цели 62000, 63000, 64000' }), deps)
+      return seeded
+    }
+
+    async function liveTps(tradeId: string) {
+      return db
+        .selectFrom('orders')
+        .selectAll()
+        .where('trade_id', '=', tradeId)
+        .where('purpose', '=', 'tp')
+        .where('status', '=', 'submitted')
+        .orderBy('price', 'asc')
+        .execute()
+    }
+
+    function addResponse(price?: number) {
+      return toolUseResponse(
+        baseOutput({
+          message_type: 'add_to_position',
+          confidence: 0.9,
+          actions: [{ type: 'add', symbol: 'BTCUSDT', side: 'long', evidence_source: 'text',
+                      ...(price !== undefined ? { entry: { mode: 'price' as const, price }, order_type: 'limit' as const } : {}) }],
+        }),
+      )
+    }
+
+    it('рыночный добор -> цели пересчитаны пропорционально, цены прежние', async () => {
+      const { tradeId } = await seedWithLadder('3')
+      const before = await liveTps(tradeId)
+      expect(before.map((o) => new Decimal(o.qty ?? '0').toString())).toEqual(['1', '1', '1'])
+
+      mock.queue.push(addResponse())
+      // deps с ценой: рыночный добор без getMarkPrice уходит в skip(mark_price_unavailable).
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Добираю битка с текущих' }), {
+        ...deps,
+        getMarkPrice: async () => '60000',
+      })
+
+      const addOrder = await db
+        .selectFrom('orders').selectAll().where('trade_id', '=', tradeId).where('purpose', '=', 'add')
+        .executeTakeFirstOrThrow()
+      const added = new Decimal(addOrder.qty ?? '0')
+      expect(added.gt(0)).toBe(true)
+
+      const after = await liveTps(tradeId)
+      expect(after).toHaveLength(3)
+      // Цены не изменились — доливка не переписывает цели автора, только их объём.
+      expect(after.map((o) => new Decimal(o.price ?? '0').toString())).toEqual(['62000', '63000', '64000'])
+      // Каждая ступень выросла в той же пропорции, что и позиция: было 1 из 3, стало (3+added)/3.
+      const expectedShare = new Decimal(3).plus(added).div(3).toDecimalPlaces(2, Decimal.ROUND_DOWN)
+      for (const tp of after) {
+        expect(new Decimal(tp.qty ?? '0').toString()).toBe(expectedShare.toString())
+      }
+      // Суммарно лесенка снова покрывает всю позицию (с точностью до шага объёма).
+      const covered = after.reduce((sum, o) => sum.plus(o.qty ?? '0'), new Decimal(0))
+      expect(covered.minus(new Decimal(3).plus(added)).abs().lte('0.03')).toBe(true)
+    })
+
+    it('целей не было -> добор их не выдумывает', async () => {
+      await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+      await seedInstrument(db, 'BTCUSDT')
+      const { tradeId } = await seedOpenPosition(db, { channelId: CH2_ID, channelOrd: CH2_ORD, symbol: 'BTCUSDT', side: 'long', entryPrice: '60000', qty: '3' })
+
+      mock.queue.push(addResponse())
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Добираю битка с текущих' }), {
+        ...deps,
+        getMarkPrice: async () => '60000',
+      })
+
+      expect(await liveTps(tradeId)).toHaveLength(0)
+    })
+
+    it('ЛИМИТНЫЙ добор -> лесенка не трогается: позиция ещё не выросла', async () => {
+      const { tradeId } = await seedWithLadder('3')
+
+      mock.queue.push(addResponse(58000))
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Добираю битка от 58000' }), {
+        ...deps,
+        getMarkPrice: async () => '60000',
+      })
+
+      const after = await liveTps(tradeId)
+      expect(after.map((o) => new Decimal(o.qty ?? '0').toString())).toEqual(['1', '1', '1'])
+    })
+  })
+
   it('cancel_order (cancel_pending): отменяет висящий pending add-ордер сделки', async () => {
     await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
     await seedInstrument(db, 'BTCUSDT')

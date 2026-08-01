@@ -1437,7 +1437,73 @@ async function handleAdd(
     // stopLoss НЕ передаём: он уже стоит на позиции и охватывает весь объём, включая долитый.
   })
 
+  // Стоп после доливки прикрывает всю позицию сам (он висит на ПОЗИЦИИ), а вот цели — нет: они
+  // выставлены отдельными reduce-only ордерами на прежний объём. Без пересчёта позиция после
+  // добора выходит по целям лишь частично, а остаток держится до стопа — не то, чего ждёт
+  // оператор (живые случаи ARB/INJ/MMT 30-31.07.2026: лесенка покрывала 7-14% позиции).
+  //
+  // Только для РЫНОЧНОГО добора: лимитка ещё не исполнилась, позиция не выросла, и reduce-only
+  // ордера на больший объём были бы обещанием закрыть то, чего нет.
+  if (orderType === 'market') {
+    await rebalanceTpLadder(trx, base, orderCtx, {
+      tradeId: trade.id,
+      oldSize: new Decimal(position.size),
+      addedQty: sizeResult.qty,
+      qtyStep: instrument.qtyStep,
+    })
+  }
+
   return {}
+}
+
+/**
+ * Подтягивает уже стоящую TP-лесенку под новый объём позиции: каждая ступень сохраняет свою ДОЛЮ
+ * покрытия, цены не меняются. Лесенка покрывала весь объём — покроет и новый; покрывала треть —
+ * останется третью.
+ *
+ * Ничего не делает, если целей нет вовсе (вход был без них) — выдумывать цели за автора не наша
+ * задача, это работа сигнала.
+ */
+async function rebalanceTpLadder(
+  trx: Kysely<DB>,
+  base: IntentBase,
+  orderCtx: OrderContext,
+  params: { tradeId: string; oldSize: Decimal; addedQty: Decimal; qtyStep: string },
+): Promise<void> {
+  if (params.oldSize.lte(0) || params.addedQty.lte(0)) return
+
+  const liveTps = await trx
+    .selectFrom('orders')
+    .select(['order_link_id', 'price', 'qty', 'tp_index'])
+    .where('trade_id', '=', params.tradeId)
+    .where('purpose', '=', 'tp')
+    .where('status', 'in', ['created', 'pending_submit', 'submitted'])
+    .orderBy('tp_index', 'asc')
+    .execute()
+  if (liveTps.length === 0) return
+
+  const ratio = params.oldSize.plus(params.addedQty).div(params.oldSize)
+  const scaled: { price: string; qty: string; index: number }[] = []
+  for (const [i, tp] of liveTps.entries()) {
+    if (tp.price === null || tp.qty === null) continue
+    const qty = floorTo(params.qtyStep, new Decimal(tp.qty).mul(ratio))
+    if (qty.lte(0)) continue
+    scaled.push({ price: new Decimal(tp.price).toString(), qty: qty.toString(), index: tp.tp_index ?? i })
+  }
+  // Ни одна ступень не выросла на целый шаг объёма — трогать биржу незачем.
+  if (scaled.length === 0) return
+
+  for (const tp of liveTps) {
+    await base.deps.executionPort.cancelOrder(trx, { orderLinkId: tp.order_link_id })
+  }
+  // tpSeq=1: ключи прежней лесенки этого же действия уже заняты (доливка идёт под тем же
+  // actionIndex, если сигнал пришёл одним сообщением) — иначе Bybit отвергнет дубликат.
+  await base.deps.executionPort.placeTpLadder(trx, { ...orderCtx, tps: scaled, tpSeq: 1 })
+  console.log(
+    `[pipeline] ${orderCtx.symbol}: TP-лесенка пересчитана под новый объём ` +
+      `(${params.oldSize.toString()} -> ${params.oldSize.plus(params.addedQty).toString()}): ` +
+      scaled.map((t) => `${t.qty}@${t.price}`).join(', '),
+  )
 }
 
 async function handleDelta(
