@@ -58,6 +58,20 @@ export async function saveMessage(
               text: input.text,
               edited_ts: editedTs,
               edit_count: eb('messages.edit_count', '+', 1),
+              // Медиа могло появиться ИМЕННО правкой (автор добавил скрин к тексту) — без этих
+              // двух полей сообщение навсегда оставалось бы «без картинки», и AI-ветка со зрением
+              // к нему не применялась бы.
+              has_media: input.hasMedia ?? false,
+              media_kind: input.mediaKind ?? null,
+              // ⚠️ ПЕРЕРАЗБОР. Правка меняет ИНСТРУКЦИЮ, а не только текст в UI: живой случай
+              // 02.08.2026 — автор дописал строкой «Первый тейк по битку 63950», и тейк не был
+              // выставлен, потому что сообщение осталось в терминальном статусе и движок к нему
+              // не вернулся. Возвращаем в очередь; повторное исполнение уже сделанного не грозит —
+              // processIntent пропускает действия, которые по этому сообщению уже есть
+              // (pipeline.ts, дедуп по типу и символу).
+              status: 'received' as const,
+              status_reason: null,
+              method: null,
             }))
             // Условие на само действие DO UPDATE (не WHERE после него) — стандартный приём
             // Postgres "conditional upsert": если ни text, ни edited_ts фактически не
@@ -414,6 +428,25 @@ export async function advanceCursor(
     .set({ last_seen_message_id: sql<number>`GREATEST(last_seen_message_id, ${tgMessageId})` })
     .where('id', '=', channelId)
     .execute()
+}
+
+/**
+ * Отметки последней правки для указанных сообщений канала: `tg_message_id -> edited_ts`.
+ * Сообщения, которых в БД нет, в результат не попадают — по ним догону правок делать нечего.
+ */
+export async function findEditedTs(
+  db: Kysely<DB>,
+  channelId: number,
+  tgMessageIds: readonly number[],
+): Promise<Map<number, Date | null>> {
+  if (tgMessageIds.length === 0) return new Map()
+  const rows = await db
+    .selectFrom('messages')
+    .select(['tg_message_id', 'edited_ts'])
+    .where('channel_id', '=', channelId)
+    .where('tg_message_id', 'in', [...tgMessageIds])
+    .execute()
+  return new Map(rows.map((r) => [r.tg_message_id, r.edited_ts]))
 }
 
 export async function getCursor(db: Kysely<DB>, channelId: number): Promise<number> {

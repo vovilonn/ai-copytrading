@@ -9,6 +9,7 @@ import {
   saveMessageWithEvent,
   saveAlbumWithEvent,
   advanceCursor,
+  findEditedTs,
   getCursor,
   seedChannelRow,
   type AlbumMemberInput,
@@ -427,5 +428,62 @@ describe('seedChannelRow — водяной знак истории', () => {
 
     await seedChannelRow(db, { ...base, id, ord: 79, key: `k-${id}`, processFromMessageId: 2200 })
     expect(await watermarkOf(id)).toBe(2200)
+  })
+})
+
+// Правка сообщения меняет ИНСТРУКЦИЮ, а не только текст в интерфейсе. Живой случай 02.08.2026:
+// автор дописал строкой «Первый тейк по битку 63950» и приложил скрин — тейк не был выставлен,
+// потому что сообщение осталось в терминальном статусе и движок к нему не вернулся.
+describe('saveMessage — правка возвращает сообщение в очередь разбора', () => {
+  const base = { channelId: 1, tgMessageId: 4242, msgTs: new Date('2026-08-02T20:14:15Z'), raw: {} }
+
+  it('правка обновляет текст, медиа-флаги и возвращает status=received', async () => {
+    await saveMessage(db, { ...base, text: 'Стоп в бу' })
+    await db.updateTable('messages').set({ status: 'executed', method: 'auto' }).where('tg_message_id', '=', base.tgMessageId).execute()
+
+    const result = await saveMessage(db, {
+      ...base,
+      text: 'Стоп в бу\nПервый тейк по битку 63950',
+      hasMedia: true,
+      mediaKind: 'MessageMediaPhoto',
+      editedTs: new Date('2026-08-02T20:14:40Z'),
+    })
+
+    expect(result.updated).toBe(true)
+    const row = await db.selectFrom('messages').selectAll().where('tg_message_id', '=', base.tgMessageId).executeTakeFirstOrThrow()
+    expect(row.text).toContain('63950')
+    expect(row.status).toBe('received') // движок разберёт заново
+    expect(row.status_reason).toBeNull()
+    expect(row.method).toBeNull()
+    expect(row.has_media).toBe(true) // фото пришло именно правкой
+    expect(row.media_kind).toBe('MessageMediaPhoto')
+    expect(row.edit_count).toBe(1)
+  })
+
+  it('повторная доставка ТОЙ ЖЕ правки ничего не трогает — статус не сбрасывается вхолостую', async () => {
+    const tgMessageId = 4243
+    const editedTs = new Date('2026-08-02T20:14:40Z')
+    await saveMessage(db, { ...base, tgMessageId, text: 'финальный текст', editedTs })
+    await db.updateTable('messages').set({ status: 'executed' }).where('tg_message_id', '=', tgMessageId).execute()
+
+    const again = await saveMessage(db, { ...base, tgMessageId, text: 'финальный текст', editedTs })
+
+    expect(again.updated).toBe(false)
+    const row = await db.selectFrom('messages').selectAll().where('tg_message_id', '=', tgMessageId).executeTakeFirstOrThrow()
+    expect(row.status).toBe('executed') // разобранное не переигрывается на ровном месте
+  })
+})
+
+describe('findEditedTs — что уже известно о правках', () => {
+  it('отдаёт отметку правки по id и молчит про сообщения, которых в БД нет', async () => {
+    const edited = new Date('2026-08-02T20:14:40Z')
+    await saveMessage(db, { channelId: 1, tgMessageId: 5001, text: 'a', msgTs: new Date(), raw: {} })
+    await saveMessage(db, { channelId: 1, tgMessageId: 5002, text: 'b', msgTs: new Date(), raw: {}, editedTs: edited })
+
+    const map = await findEditedTs(db, 1, [5001, 5002, 9999])
+
+    expect(map.get(5001)).toBeNull() // сообщение есть, правок не было
+    expect(map.get(5002)?.getTime()).toBe(edited.getTime())
+    expect(map.has(9999)).toBe(false) // сообщения нет — догонять нечего
   })
 })

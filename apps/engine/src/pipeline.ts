@@ -686,15 +686,29 @@ async function processIntent(
   intent: ParsedIntent,
   method: 'auto' | 'ai',
 ): Promise<boolean> {
+  const info = classifyIntent(intent)
+
+  // ИДЕМПОТЕНТНОСТЬ ПО СМЫСЛУ, А НЕ ПО ПОРЯДКУ. Раньше ключом был (сообщение, индекс действия),
+  // и этого хватало, пока сообщение разбиралось ровно один раз. Но правка сообщения возвращает
+  // его в очередь (repository.ts::saveMessage), а разбор изменённого текста может дать другое
+  // число интентов и другой их порядок — по индексу мы бы либо пропустили НОВУЮ инструкцию
+  // (её слот занят), либо исполнили повторно УЖЕ сделанную (она уехала на другой индекс).
+  //
+  // Поэтому ключ — (сообщение, тип действия, символ): «поставить стоп по BTC» из этого сообщения
+  // исполняется один раз, сколько бы раз его ни переразбирали, а дописанная строкой новая
+  // инструкция («первый тейк по битку») видится как новая и исполняется.
   const existing = await trx
     .selectFrom('actions')
     .select('id')
     .where('message_id', '=', base.message.id)
-    .where('action_index', '=', actionIndex)
+    .where((eb) =>
+      eb.or([
+        eb('action_index', '=', actionIndex),
+        eb.and([eb('type', '=', info.type), info.symbol === null ? eb('symbol', 'is', null) : eb('symbol', '=', info.symbol)]),
+      ]),
+    )
     .executeTakeFirst()
   if (existing) return false
-
-  const info = classifyIntent(intent)
   const inserted = await trx
     .insertInto('actions')
     .values({

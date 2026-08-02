@@ -18,6 +18,7 @@ import { pickMedia, type DownloadHint } from './media.js'
 import {
   saveAlbumWithEvent,
   advanceCursor,
+  findEditedTs,
   getCursor,
   seedChannelRow,
   type AlbumMemberInput,
@@ -57,6 +58,11 @@ const LIVENESS_PROBE_MS = 60 * 1000
 const LIVENESS_TIMEOUT_MS = 15 * 1000
 // Размер страницы бэкфилла — см. §4: getHistory дёшев, 200 — безопасный батч.
 const BACKFILL_PAGE_SIZE = 200
+
+// Сколько последних сообщений канала перечитывать на предмет ПРАВОК (см. catchUpEdits). Автор
+// правит только что отправленное — сутками позже к сообщению не возвращаются; 30 покрывает
+// суточный поток обоих каналов с запасом, а стоит один getMessages в минуту.
+const EDIT_RECHECK_LIMIT = 30
 
 type ResolvedEntity = Api.User | Api.Chat | Api.Channel | Api.TypeUser | Api.TypeChat
 
@@ -521,6 +527,47 @@ export class IngestService {
       if (lastId <= cursor) break // защита от зацикливания, если сервер вернул тот же хвост
       cursor = lastId
       if (batch.length < BACKFILL_PAGE_SIZE) break // страница не полная — дошли до текущего момента
+    }
+
+    await this.catchUpEdits(source, resolvedSource.entity)
+  }
+
+  /**
+   * Догон ПРАВОК уже сохранённых сообщений.
+   *
+   * Бэкфилл выше их не видит принципиально: он читает строго новее курсора, а правка не меняет id
+   * сообщения. Единственным путём оставался realtime-апдейт — а он теряется при любом разрыве
+   * связи. Живой случай 02.08.2026: автор дописал строкой «Первый тейк по битку 63950» и приложил
+   * скрин; правка не доехала (`edited_ts` в БД остался пустым), тейк не был выставлен.
+   *
+   * Берём последние сообщения канала и сравниваем их `editDate` с сохранённым: изменившиеся
+   * прогоняем обычным путём (склейка альбома -> скачивание медиа -> saveMessage), остальные не
+   * трогаем вовсе — ни сети на медиа, ни записи в БД.
+   */
+  private async catchUpEdits(source: ChannelSource, entity: ResolvedEntity): Promise<void> {
+    const recent = await this.withFloodRetry(`догон правок ${source.key}`, () =>
+      this.client.getMessages(entity, {
+        limit: EDIT_RECHECK_LIMIT,
+        ...(source.topicId != null ? { replyTo: source.topicId } : {}),
+      }),
+    )
+    if (recent.length === 0) return
+
+    const saved = await findEditedTs(
+      this.db,
+      Number(source.channelId),
+      recent.map((m) => m.id),
+    )
+
+    for (const msg of recent) {
+      if (!msg.editDate) continue // сообщение никогда не правили — сравнивать нечего
+      // Сообщения нет в БД (ещё не доехало) — его подхватит обычный бэкфилл, не дублируем работу.
+      if (!saved.has(msg.id)) continue
+      const known = saved.get(msg.id) ?? null
+      const edited = new Date(msg.editDate * 1000)
+      if (known !== null && known.getTime() === edited.getTime()) continue // эту правку уже видели
+      console.warn(`[tg-ingest] догон правки: ${source.key}#${msg.id} (правка ${edited.toISOString()})`)
+      this.enqueue(msg)
     }
   }
 

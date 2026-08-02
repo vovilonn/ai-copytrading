@@ -1242,3 +1242,64 @@ describe('pipeline — force_trade_size: фиксированная сумма �
     expect((await entryMargin(channelId)).minus(50).abs().lt(1)).toBe(true)
   })
 })
+
+// Правка сообщения возвращает его в очередь разбора (tg-ingest), и движок разбирает текст заново.
+// Уже исполненные инструкции повторяться не должны, а дописанная строкой новая — обязана
+// исполниться. Живой случай 02.08.2026: автор дописал «Первый тейк по битку 63950».
+describe('pipeline — переразбор правки не дублирует уже сделанное', () => {
+  it('повторный разбор того же текста не создаёт вторых действий и вторых ордеров', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT' })
+    const { port, calls } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '10000', getMarkPrice: async () => '100', aiEnabled: false }
+
+    const text = '#ATOM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+    const callsAfterFirst = [...calls]
+
+    // Правка: движок получает то же сообщение снова (status вернули в received).
+    await db.updateTable('messages').set({ status: 'received' }).where('id', '=', message.id).execute()
+    await processMessage(db, message, localDeps)
+
+    expect(calls).toEqual(callsAfterFirst) // на биржу второй раз не ходили
+    const actions = await db.selectFrom('actions').selectAll().where('channel_id', '=', channelId).execute()
+    expect(actions).toHaveLength(1)
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades).toHaveLength(1)
+  })
+
+  it('дописанная инструкция по ДРУГОМУ символу исполняется, уже сделанная по первому — нет', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT' })
+    await db
+      .insertInto('instruments')
+      .values({
+        symbol: 'BBBUSDT', network: 'testnet', base_coin: 'BBB', status: 'Trading',
+        qty_step: '0.01', min_qty: '0.01', tick_size: '0.0001', min_notional: '5',
+        max_leverage: '50', leverage_step: '0.01', mmr: '0.005', refreshed_at: new Date(),
+      })
+      .execute()
+    const { port } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '10000', getMarkPrice: async () => '100', aiEnabled: false }
+
+    // Формат «Менеджмент» — единственный, где ОДНО сообщение несёт инструкции по нескольким
+    // символам (ch1.adapter.ts, R2). Позиций нет, поэтому действия уйдут в skip — но строки
+    // actions создаются, а тест проверяет именно их дедупликацию.
+    const first = 'Менеджмент позиций\n#ATOM - стоп в б/у'
+    const message = await insertMessage(channelId, 1, first)
+    await processMessage(db, message, localDeps)
+
+    // Автор дописал строку про второй символ.
+    const edited = `${first}\n#BBB - стоп в б/у`
+    await db.updateTable('messages').set({ status: 'received', text: edited }).where('id', '=', message.id).execute()
+    await processMessage(db, { ...message, text: edited }, localDeps)
+
+    const actions = await db.selectFrom('actions').selectAll().where('channel_id', '=', channelId).execute()
+    const symbols = actions.map((a) => a.symbol)
+    expect(symbols).toContain('ATOMUSDT')
+    expect(symbols).toContain('BBBUSDT')
+    // По первому символу ровно одно действие — переразбор дубля не создал.
+    expect(symbols.filter((sym) => sym === 'ATOMUSDT')).toHaveLength(1)
+  })
+})
