@@ -279,9 +279,16 @@ describe('ch2.adapter — точечные проверки (task-3-brief.md)', 
     expect(result.route).toBe('noise')
   })
 
-  it('221452 "По битку следующие цели 63700, 64600" (AMEND) → route ai', () => {
+  // Раньше это сообщение уходило в модель: шаблон не умел разбирать строку с целями, и маршрут
+  // был единственным способом её не потерять. С правилом «цель + тикер + цена» (02.08.2026)
+  // шаблон даёт ровно тот же tp_set, что вернула бы модель, — мгновенно и бесплатно. Маршрут
+  // изменился осознанно; проверяем теперь не его, а сам разбор.
+  it('221452 "По битку следующие цели 63700, 64600" (AMEND) → tp_set обеими целями, без вызова модели', () => {
     const { result } = byId(221452)
-    expect(result.route).toBe('ai')
+    expect(result.route).toBe('execute')
+    const delta = result.intents.find((i): i is Extract<ParsedIntent, { kind: 'delta' }> => i.kind === 'delta')
+    expect(delta?.symbol).toBe('BTCUSDT')
+    expect(delta?.ops[0]).toMatchObject({ op: 'tp_set', targets: [{ value: 63700 }, { value: 64600 }] })
   })
 
   it('221393 "С текущих беру" (гейт market_entry сработал, символа в тексте нет) → route ai, не execute с пустыми intents', () => {
@@ -408,5 +415,55 @@ describe('ch2.adapter — «ещё один» по занятому символ
       const result = parseCh2(ctxWith(text, ['BTCUSDT']))
       expect(result.intents[0], text).toMatchObject({ kind: 'add', symbol: 'BTCUSDT' })
     }
+  })
+})
+
+// Живой случай 02.08.2026: сообщение из трёх строк — закрытие Соланы, стоп по битку и первый тейк
+// по битку. Правило D смотрело ТОЛЬКО на строки со стопом, поэтому давало один интент, а две
+// другие инструкции молча пропадали: маршрут оставался детерминированным, и модель к ним не
+// вызывалась. Тейк по битку не был выставлен вовсе.
+describe('ch2.adapter — построчные инструкции: стоп, цель и выход в одном сообщении', () => {
+  function ctxFor(text: string): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 1, text, date: '2026-08-02T20:14:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+  const deltas = (text: string) =>
+    parseCh2(ctxFor(text)).intents.filter((i): i is Extract<ParsedIntent, { kind: 'delta' }> => i.kind === 'delta')
+
+  it('все три строки дают свою инструкцию по своему символу', () => {
+    const result = deltas('Около бу закрываю Солану\nПо битку ставлю стоп в бу на 63000\nПервый тейк по битку 63950')
+
+    expect(result).toHaveLength(3)
+    expect(result[0]).toMatchObject({ symbol: 'SOLUSDT', ops: [{ op: 'close_remainder' }] })
+    expect(result[1]?.symbol).toBe('BTCUSDT')
+    expect(result[1]?.ops[0]?.op).toBe('sl_breakeven')
+    expect(result[2]).toMatchObject({ symbol: 'BTCUSDT', ops: [{ op: 'tp_set', targets: [{ value: 63950, index: 1 }] }] })
+  })
+
+  it('порядковое слово даёт номер ступени лесенки — по нему закроется доля, а не весь объём', () => {
+    expect(deltas('Второй тейк по битку 63950')[0]?.ops[0]).toMatchObject({ op: 'tp_set', targets: [{ value: 63950, index: 2 }] })
+    // Без порядкового слова номер неизвестен — пайплайн сам решит размер ступени.
+    expect(deltas('Цель по битку 63950')[0]?.ops[0]).toMatchObject({ op: 'tp_set', targets: [{ value: 63950 }] })
+  })
+
+  it('строка со стопом забирает своё число, даже если рядом слово «цель»', () => {
+    const result = deltas('По битку стоп 63000, дальше цели обновлю')
+
+    expect(result[0]?.ops[0]).toMatchObject({ op: 'sl_set', price: 63000 })
+  })
+
+  it('«не закрываю» не превращается в выход из позиции', () => {
+    expect(deltas('Солану пока не закрываю, держим')).toHaveLength(0)
+  })
+
+  it('«фиксирую 50% по солане» -> частичная фиксация с долей автора', () => {
+    expect(deltas('Фиксирую 50% по солане')[0]?.ops[0]).toMatchObject({ op: 'partial_close', fraction: 0.5 })
   })
 })

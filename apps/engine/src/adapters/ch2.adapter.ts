@@ -281,6 +281,47 @@ const PERCENT_NUM_RE = /\d+(?:[.,]\d+)?\s*%/g
  * цена стопа (research §7 E3: "Sol Sl на твх … Следующие цели 75, 76.5" — price должен
  * остаться null, а не 75). Возвращает null, если в строке нет ни be-маркера, ни числа.
  */
+// Строка про ЦЕЛЬ с ценой: «Первый тейк по битку 63950», «цель по эфиру 1943». Порядковое слово
+// даёт номер ступени лесенки — по нему пайплайн понимает, что названа ОДНА цель из нескольких, и
+// закрывает долю, а не весь объём.
+const TP_GATE_RE = /тейк|цел[ьи]|таргет/i
+const TP_ORDINAL_RE = /(перв|втор|трет|четв[её]рт|пят)[а-яё]*/i
+const TP_ORDINALS = ['перв', 'втор', 'трет', 'четв', 'пят'] as const
+
+// Строка про выход из позиции: «Около бу закрываю Солану», «остаток по эфиру фиксирую».
+// Отрицание («не закрываю») сюда не должно попадать — его отсекает SUGGESTION/negation-гейт ниже.
+const CLOSE_GATE_RE = /закрыва(ю|ем)|закрою|фиксир[а-яё]*|остат[а-яё]*/i
+// Граница слова через (?<![\p{L}\p{N}]) с флагом u, а НЕ \b: в JS \b опирается на ASCII-\w, и
+// перед кириллической «н» после пробела он не срабатывает вовсе — отрицание молча не ловилось.
+const CLOSE_NEGATION_RE = /(?<![\p{L}\p{N}])не\s+(?:буду\s+)?(закрыва|фиксир|выхо)/iu
+
+/** Номер названной ступени: «Первый тейк» -> 1. Нет порядкового слова — номер неизвестен. */
+function tpIndexOf(line: string): number | undefined {
+  const m = TP_ORDINAL_RE.exec(line)
+  if (m === null) return undefined
+  const stem = m[1]!.slice(0, 4).toLowerCase()
+  const index = TP_ORDINALS.findIndex((o) => stem.startsWith(o.slice(0, 4)))
+  return index >= 0 ? index + 1 : undefined
+}
+
+/** Цель из строки: цена + (если названа) номер ступени. */
+function extractTpOpFromLine(line: string): DeltaOp | null {
+  if (!TP_GATE_RE.test(line)) return null
+  const numbers = parseNumbers(line.replace(PERCENT_NUM_RE, (m) => ' '.repeat(m.length)))
+  if (numbers.length === 0) return null
+  const index = tpIndexOf(line)
+  return { op: 'tp_set', targets: numbers.map((value) => ({ value, ...(index !== undefined ? { index } : {}) })) }
+}
+
+/** Выход из позиции: «закрываю Солану» — весь остаток; «фиксирую» без доли решает пайплайн. */
+function extractCloseOpFromLine(line: string): DeltaOp | null {
+  if (!CLOSE_GATE_RE.test(line) || CLOSE_NEGATION_RE.test(line)) return null
+  // «остаток … фиксирую» и «закрываю» — полный выход; «фиксирую 50%» — доля, её отдаём как есть.
+  const pct = /(\d{1,3})\s*%/.exec(line)
+  if (pct !== null) return { op: 'partial_close', fraction: Number(pct[1]) / 100 }
+  return { op: 'close_remainder' }
+}
+
 function extractSlOpFromLine(line: string): DeltaOp | null {
   if (BE_MARKER_RE.test(line)) return { op: 'sl_breakeven' }
 
@@ -303,10 +344,15 @@ function extractSlOpFromLine(line: string): DeltaOp | null {
 }
 
 function tryDeltaSl(text: string, ctx: ParseContext): ParsedResult | null {
-  if (!SL_GATE_RE.test(text) || SUGGESTION_MARKER_RE.test(text)) return null
+  // Правило разбирает ПОСТРОЧНЫЕ инструкции с тикером: стоп, цель, выход. Раньше гейт был только
+  // на стоп — и сообщение «Около бу закрываю Солану / По битку ставлю стоп в бу / Первый тейк по
+  // битку 63950» давало ОДИН интент (стоп), а остальные две строки молча пропадали: маршрут при
+  // этом оставался детерминированным, и модель к ним не вызывалась (живой случай 02.08.2026).
+  const LINE_GATE_RE = new RegExp(`${SL_GATE_RE.source}|${TP_GATE_RE.source}|${CLOSE_GATE_RE.source}`, 'i')
+  if (!LINE_GATE_RE.test(text) || SUGGESTION_MARKER_RE.test(text)) return null
 
   const lines = text.split('\n')
-  const gateLines = lines.filter((line) => SL_GATE_RE.test(line))
+  const gateLines = lines.filter((line) => LINE_GATE_RE.test(line))
   const intents: ParsedIntent[] = []
 
   // Прямое извлечение: символ БЕРЁМ ТОЛЬКО со строки, где стоит sl/стоп (research §7 вывод —
@@ -317,7 +363,9 @@ function tryDeltaSl(text: string, ctx: ParseContext): ParsedResult | null {
     if (coin === undefined) continue
     const symbol = ctx.resolveSymbol(coin)
     if (symbol === null || !ctx.isListed(symbol)) continue
-    const op = extractSlOpFromLine(line)
+    // Порядок важен: строка «стоп в бу» может содержать и число цели — стоп забирает её первым
+    // (см. extractSlOpFromLine), а цель без стоп-маркера уходит в TP-ветку.
+    const op = extractSlOpFromLine(line) ?? extractTpOpFromLine(line) ?? extractCloseOpFromLine(line)
     if (op === null) continue
     intents.push({ kind: 'delta', symbol, ops: [op] })
   }
