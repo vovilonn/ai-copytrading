@@ -42,13 +42,20 @@ const MEDIA_ROOT_REL = 'var/media'
 const ALBUM_WINDOW_MS = 600
 // Периодический догон — ПОТОЛОК ЗАДЕРЖКИ доставки, а не «подстраховка раз в 10 минут».
 //
+// 15 секунд, а не минута: замер прода 03.08.2026 показал, что realtime доставляет лишь ЧАСТЬ
+// апдейтов (2-3 с), а остальные сообщения приезжали за 15-53 с — то есть их подбирал именно этот
+// таймер, и его период был главным слагаемым задержки. Корневая причина realtime описана у
+// handleChannelTooLong ниже; пока она на стороне GramJS, короткий период — прямой способ снизить
+// потолок. Цена: два getMessages раз в 15 с ~= 11 500 запросов в сутки на канал — Telegram это
+// позволяет (лимиты getHistory считаются десятками в секунду), а сигналы приходят вовремя.
+//
 // Живой инцидент 28.07.2026: соединение MTProto умерло в 13:04 и не восстановилось само; сигнал
 // канала в 13:46 доехал до БД только после ручного рестарта в 13:52, и к тому моменту цена ушла на
 // 4% — вход отбился гейтом price_slippage. Для копитрейда десятиминутная задержка = потерянный
 // сигнал, поэтому цена вопроса выше стоимости лишних getHistory: два источника раз в минуту — это
 // ~2 900 запросов в сутки, на порядок ниже лимитов Telegram (и в 6 раз меньше, чем давал баг
 // с фантомными реконнектами, см. createReconnectDetector).
-const PERIODIC_BACKFILL_MS = 60 * 1000
+const PERIODIC_BACKFILL_MS = 15 * 1000
 
 // Сторож живости соединения. GramJS умеет «тихо умереть»: сокет закрыт, автопереподключение не
 // добралось до успеха, а UpdateConnectionState(connected) больше не приходит — то есть
@@ -63,6 +70,11 @@ const BACKFILL_PAGE_SIZE = 200
 // правит только что отправленное — сутками позже к сообщению не возвращаются; 30 покрывает
 // суточный поток обоих каналов с запасом, а стоит один getMessages в минуту.
 const EDIT_RECHECK_LIMIT = 30
+
+// Как часто перечитывать хвост на предмет правок. Реже, чем идёт догон сообщений: новое сообщение
+// — это сигнал, который нужен немедленно, а правка терпит минуту (до 02.08.2026 она не приезжала
+// вообще). Так короткий период догона не превращается в лишний getMessages каждые 15 секунд.
+const EDIT_RECHECK_INTERVAL_MS = 60 * 1000
 
 type ResolvedEntity = Api.User | Api.Chat | Api.Channel | Api.TypeUser | Api.TypeChat
 
@@ -235,6 +247,11 @@ export class IngestService {
    */
   private readonly sources: readonly ChannelSource[] = resolveChannelSources(process.env)
   private backfillTimer: NodeJS.Timeout | null = null
+  /** Когда в последний раз перечитывали хвост канала на предмет правок (ключ — source.key). */
+  private readonly lastEditCheckAt = new Map<string, number>()
+  private nowMs(): number {
+    return Date.now()
+  }
   private livenessTimer: NodeJS.Timeout | null = null
   /** Счётчик проходов бэкфилла — по нему разрежается тяжёлый ремонт медиа. */
   private backfillTicks = 0
@@ -377,6 +394,17 @@ export class IngestService {
       new DeletedMessage({ chats }),
     )
 
+    // «Ты пропустил апдейты этого канала, забери разницу» — Telegram присылает это вместо самих
+    // сообщений, когда состояние клиента отстало. GramJS такой апдейт НЕ обрабатывает: его
+    // client.catchUp() — пустая заглушка (`// TODO` в telegram/client/updates.js), и
+    // getChannelDifference не вызывается никогда. Из-за этого часть сообщений вообще не приходила
+    // событием и ждала периодического догона (замер прода 03.08.2026: 15-53 с вместо 2-3 с).
+    // Дёргаем догон немедленно — это ровно то, что просит сервер, только своими средствами.
+    this.client.addEventHandler(() => {
+      console.warn('[tg-ingest] Telegram сообщил о пропущенных апдейтах канала — догоняю немедленно')
+      this.backfillAll().catch((err) => this.logError('backfillAll (channel too long)', err))
+    }, new Raw({ types: [Api.UpdateChannelTooLong] }))
+
     // UpdateConnectionState не имеет chatId, поэтому фильтруется по типу, а не по chats (§5, §8).
     // Догоняем строго по ФРОНТУ разрыва — почему не по уровню, см. createReconnectDetector.
     const onConnectionState = createReconnectDetector(() => {
@@ -390,8 +418,8 @@ export class IngestService {
 
     this.backfillTimer = setInterval(() => {
       this.backfillAll()
-        // Ремонт медиа — тяжёлый проход, ему минутный ритм не нужен: гоняем раз в 10 циклов.
-        .then(() => (this.backfillTicks++ % 10 === 0 ? this.repairMissingMedia() : undefined))
+        // Ремонт медиа — тяжёлый проход, ему частый ритм не нужен: раз в ~10 минут (40 циклов).
+        .then(() => (this.backfillTicks++ % 40 === 0 ? this.repairMissingMedia() : undefined))
         .catch((err) => this.logError('backfillAll/repairMissingMedia (periodic)', err))
     }, PERIODIC_BACKFILL_MS)
 
@@ -529,7 +557,11 @@ export class IngestService {
       if (batch.length < BACKFILL_PAGE_SIZE) break // страница не полная — дошли до текущего момента
     }
 
-    await this.catchUpEdits(source, resolvedSource.entity)
+    const lastCheck = this.lastEditCheckAt.get(source.key) ?? 0
+    if (this.nowMs() - lastCheck >= EDIT_RECHECK_INTERVAL_MS) {
+      this.lastEditCheckAt.set(source.key, this.nowMs())
+      await this.catchUpEdits(source, resolvedSource.entity)
+    }
   }
 
   /**
