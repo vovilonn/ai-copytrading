@@ -314,12 +314,31 @@ function extractTpOpFromLine(line: string): DeltaOp | null {
 }
 
 /** Выход из позиции: «закрываю Солану» — весь остаток; «фиксирую» без доли решает пайплайн. */
+/** Доля, названная СЛОВОМ: «половину» -> 0.5, «треть» -> 1/3. «часть» доли не задаёт. */
+const FRACTION_WORDS: ReadonlyArray<{ re: RegExp; fraction?: number }> = [
+  { re: /половин|1\/2/i, fraction: 0.5 },
+  { re: /треть|1\/3/i, fraction: 1 / 3 },
+  { re: /четверт|1\/4/i, fraction: 0.25 },
+  { re: /част[ьи]/i },
+]
+
+/** Признаки, что закрывается ВСЁ, а не доля. */
+const FULL_EXIT_RE = /позици|полностью|остат[а-я]*|целиком|вс[ею]\s|весь\s/i
+
 function extractCloseOpFromLine(line: string): DeltaOp | null {
   if (!CLOSE_GATE_RE.test(line) || CLOSE_NEGATION_RE.test(line)) return null
-  // «остаток … фиксирую» и «закрываю» — полный выход; «фиксирую 50%» — доля, её отдаём как есть.
+
+  // Доля важнее всего: «фиксирую 50% позиции» — частичная фиксация, хотя слово «позиции» и есть.
   const pct = /(\d{1,3})\s*%/.exec(line)
   if (pct !== null) return { op: 'partial_close', fraction: Number(pct[1]) / 100 }
-  return { op: 'close_remainder' }
+  const word = FRACTION_WORDS.find((w) => w.re.test(line))
+  if (word) return { op: 'partial_close', ...(word.fraction !== undefined ? { fraction: word.fraction } : {}) }
+
+  // Полный выход — только когда он назван явно («закрываю Солану», «фиксирую позицию»). Голое
+  // «фиксирую» без уточнения означает частичную фиксацию (та же конвенция, что в лексиконе CH1):
+  // закрыть по нему ВСЮ позицию было бы куда дороже ошибкой, чем закрыть половину.
+  if (FULL_EXIT_RE.test(line) || /закрыва(ю|ем)|закрою/i.test(line)) return { op: 'close_remainder' }
+  return { op: 'partial_close' }
 }
 
 function extractSlOpFromLine(line: string): DeltaOp | null {

@@ -379,6 +379,25 @@ describe('ch1.adapter — доля/отрицание/полное закрыт�
     expect(ops('#ARB — остаток закрою по 1.2').some((o) => o.op === 'close_remainder')).toBe(false)
   })
 
+  // Живой случай 05.08.2026: «#INJ – фиксирую позицию около зоны входа» закрыл ПОЛОВИНУ вместо
+  // всей позиции. Шаблон полного закрытия знал только прошедшее «зафиксировал позицию».
+  it('«фиксирую позицию» -> close_remainder, а не половина', () => {
+    expect(ops('#INJ – фиксирую позицию около зоны входа.')).toEqual([{ op: 'close_remainder' }])
+  })
+
+  it('доля перед словом «позиция» оставляет фиксацию частичной', () => {
+    for (const text of ['#INJ — фиксирую 50% позиции', '#INJ — фиксирую половину позиции']) {
+      const result = ops(text)
+      expect(result.some((o) => o.op === 'close_remainder'), text).toBe(false)
+      expect(result.some((o) => o.op === 'partial_close'), text).toBe(true)
+    }
+  })
+
+  it('«фиксирую всю позицию» и «зафиксировал позицию» — оба полный выход', () => {
+    expect(ops('#INJ — фиксирую всю позицию')).toContainEqual({ op: 'close_remainder' })
+    expect(ops('#INJ — зафиксировал позицию')).toContainEqual({ op: 'close_remainder' })
+  })
+
   it('явная доля «25% фиксирую» -> fraction=0.25', () => {
     expect(ops('#CLO — Пробит хай, 25% фиксирую')).toContainEqual({ op: 'partial_close', fraction: 0.25 })
   })

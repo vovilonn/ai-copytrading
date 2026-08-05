@@ -467,3 +467,43 @@ describe('ch2.adapter — построчные инструкции: стоп, �
     expect(deltas('Фиксирую 50% по солане')[0]?.ops[0]).toMatchObject({ op: 'partial_close', fraction: 0.5 })
   })
 })
+
+// Тот же класс ошибки в свободном канале: «фиксирую половину» не должно закрывать всю позицию,
+// а «фиксирую позицию» — должно. Голое «фиксирую» без уточнения трактуем как долю: закрыть по нему
+// всё было бы дороже ошибкой, чем закрыть половину.
+describe('ch2.adapter — доля против полного выхода', () => {
+  function ctxFor(text: string): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 1, text, date: '2026-08-05T10:04:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+  const op = (text: string) => {
+    const delta = parseCh2(ctxFor(text)).intents.find((i): i is Extract<ParsedIntent, { kind: 'delta' }> => i.kind === 'delta')
+    return delta?.ops[0]
+  }
+
+  it('«фиксирую позицию по битку» -> полный выход', () => {
+    expect(op('Фиксирую позицию по битку')).toEqual({ op: 'close_remainder' })
+  })
+
+  it('доли словами и процентом -> частичная фиксация', () => {
+    expect(op('Фиксирую половину по битку')).toEqual({ op: 'partial_close', fraction: 0.5 })
+    expect(op('Фиксирую треть по битку')).toMatchObject({ op: 'partial_close' })
+    expect(op('Фиксирую 30% по битку')).toEqual({ op: 'partial_close', fraction: 0.3 })
+    expect(op('Фиксирую часть по битку')).toEqual({ op: 'partial_close' })
+  })
+
+  it('«закрываю биток» — полный выход даже без слова «позиция»', () => {
+    expect(op('Закрываю биток')).toEqual({ op: 'close_remainder' })
+  })
+
+  it('доля важнее слова «позиция»: «фиксирую 50% позиции по битку»', () => {
+    expect(op('Фиксирую 50% позиции по битку')).toEqual({ op: 'partial_close', fraction: 0.5 })
+  })
+})
