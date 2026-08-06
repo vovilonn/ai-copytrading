@@ -57,7 +57,7 @@ export class DryRunAdapter implements ExecutionPort {
     if (!inserted) {
       // Дубль orderLinkId = идемпотентный успех (research bybit-execution.md §8) — не плодим
       // второй ордер/филл/позицию, возвращаем уже существующий ордер как есть.
-      const existing = await findOrderId(tx, linkId)
+      const existing = await findOrderId(tx, linkId, { symbol: order.symbol, purpose: order.purpose })
       return { orderId: existing, orderLinkId: linkId }
     }
 
@@ -168,7 +168,7 @@ export class DryRunAdapter implements ExecutionPort {
         .returning('id')
         .executeTakeFirst()
 
-      orderIds.push(inserted ? inserted.id : await findOrderId(tx, linkId))
+      orderIds.push(inserted ? inserted.id : await findOrderId(tx, linkId, { symbol: params.symbol, purpose: 'tp' }))
     }
 
     return { orderIds }
@@ -201,7 +201,7 @@ export class DryRunAdapter implements ExecutionPort {
       .executeTakeFirst()
 
     if (!inserted) {
-      return { orderId: await findOrderId(tx, linkId) }
+      return { orderId: await findOrderId(tx, linkId, { symbol: params.symbol, purpose: 'sl' }) }
     }
 
     await tx
@@ -239,7 +239,7 @@ export class DryRunAdapter implements ExecutionPort {
       .executeTakeFirst()
 
     if (!inserted) {
-      return { orderId: await findOrderId(tx, linkId) }
+      return { orderId: await findOrderId(tx, linkId, { symbol: params.symbol, purpose: 'close' }) }
     }
 
     const position = await tx
@@ -318,8 +318,30 @@ function buildLinkId(ctx: OrderContext, purpose: OrderPurpose, legIndex: number)
   })
 }
 
-async function findOrderId(tx: Kysely<DB>, linkId: string): Promise<string> {
-  const row = await tx.selectFrom('orders').select('id').where('order_link_id', '=', linkId).executeTakeFirstOrThrow()
+/**
+ * Ордер с этим orderLinkId в журнале уже есть. В норме это ИДЕМПОТЕНТНОСТЬ: повтор того же
+ * действия (research §8 — дубль ключа на бирже, 110072, тоже считается успехом), и возвращать
+ * существующий ордер правильно.
+ *
+ * Но тот же ключ может достаться и СОВСЕМ ДРУГОМУ ордеру: ключ строится из координат
+ * (канал, сообщение, индекс действия, назначение), а индекс действия внутри сообщения способен
+ * переехать — при переразборе правленого текста или вмешательстве в журнал. Тогда «идемпотентный
+ * успех» означал бы, что сделка открыта, хотя биржа ордер отвергла, а мы вернули чужой: сделка
+ * живёт в журнале, ордера на бирже нет (живой случай 06.08.2026 — вход по ETH получил ключ
+ * SOL-ордера того же сообщения и молча "исполнился"). Совпадение символа и назначения обязательно.
+ */
+async function findOrderId(tx: Kysely<DB>, linkId: string, expected: { symbol: string; purpose: OrderPurpose }): Promise<string> {
+  const row = await tx
+    .selectFrom('orders')
+    .select(['id', 'symbol', 'purpose'])
+    .where('order_link_id', '=', linkId)
+    .executeTakeFirstOrThrow()
+  if (row.symbol !== expected.symbol || row.purpose !== expected.purpose) {
+    throw new Error(
+      `orderLinkId ${linkId} уже занят ордером ${row.purpose} ${row.symbol}, а сейчас нужен ` +
+        `${expected.purpose} ${expected.symbol} — столкновение ключей идемпотентности, ордер НЕ отправлен`,
+    )
+  }
   return row.id
 }
 

@@ -186,6 +186,33 @@ describe('DryRunAdapter.placeEntry', () => {
     expect(Number(posCount.n)).toBe(0)
   })
 
+  // Живой случай 06.08.2026: индексы действий внутри сообщения переехали (переразбор), и вход по
+  // ETH получил ключ уже существующего SOL-ордера того же сообщения. «Идемпотентный успех» вернул
+  // чужой ордер: сделка в журнале открыта, ордера на бирже нет.
+  it('тот же orderLinkId, но ДРУГОЙ символ — не идемпотентность, а столкновение ключей: явная ошибка', async () => {
+    const sol = await setupTradeContext('SOLUSDT', 'long')
+    const eth = await setupTradeContext('ETHUSDT', 'long')
+    const common = {
+      channelId: CHANNEL_ID,
+      channelOrd: CHANNEL_ORD,
+      tgMessageId: sol.tgMessageId,
+      actionIndex: 0,
+      side: 'long' as const,
+      purpose: 'entry' as const,
+      orderType: 'limit' as const,
+      qty: '10',
+      price: '100',
+      leverage: '5',
+      liqPrice: '90',
+    }
+
+    await adapter.placeEntry(db, { ...common, actionId: sol.actionId, tradeId: sol.tradeId, legId: sol.legId, symbol: 'SOLUSDT' })
+
+    await expect(
+      adapter.placeEntry(db, { ...common, actionId: eth.actionId, tradeId: eth.tradeId, legId: eth.legId, symbol: 'ETHUSDT' }),
+    ).rejects.toThrow(/столкновение ключей/)
+  })
+
   it('повторный вызов с тем же orderLinkId — идемпотентно: не плодит второй ордер и не удваивает позицию', async () => {
     const ctx = await setupTradeContext('ETHUSDT', 'long')
     const params = {
