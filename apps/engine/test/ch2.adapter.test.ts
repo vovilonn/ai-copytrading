@@ -507,3 +507,80 @@ describe('ch2.adapter — доля против полного выхода', ()
     expect(op('Фиксирую 50% позиции по битку')).toEqual({ op: 'partial_close', fraction: 0.5 })
   })
 })
+
+// Живой случай прода 06.08.2026 (msg 221563, канал AACADEMY): три строки — рыночный вход по XRP и
+// две лимитки. Правила B и C стояли в цепочке «первый матч выигрывает»: B вернул две лимитки и
+// остановил разбор, C не запускался вовсе — по XRP не появилось ни ордера, ни даже строки действия.
+describe('ch2.adapter — рыночный вход и лимитки в ОДНОМ сообщении', () => {
+  function ctxWith(text: string, open: string[] = []): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 1, text, date: '2026-08-06T08:26:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(
+        open.map((symbol) => [symbol, { tradeId: 't-1', side: 'long' as const, openedByChannel: '1962583820' }]),
+      ),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('«С текущих long Xrp» + две лимитки → ТРИ интента в порядке строк', () => {
+    const result = parseCh2(ctxWith('С текущих long Xrp\nLimit long Eth - 1895\nLimit long SOL - 73.1'))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([
+      { kind: 'market_entry', symbol: 'XRPUSDT', side: 'long' },
+      { kind: 'limit_entry', symbol: 'ETHUSDT', side: 'long', price: 1895 },
+      { kind: 'limit_entry', symbol: 'SOLUSDT', side: 'long', price: 73.1 },
+    ])
+  })
+
+  it('лимитка первой строкой, рыночный вход второй — порядок интентов совпадает с текстом', () => {
+    const result = parseCh2(ctxWith('Limit long Eth - 1895\nПерезахожу с текущих в btc long'))
+
+    expect(result.intents.map((i) => ('symbol' in i ? i.symbol : null))).toEqual(['ETHUSDT', 'BTCUSDT'])
+  })
+
+  it('рыночная строка С ЧИСЛОМ не превращается в лимитку', () => {
+    const result = parseCh2(ctxWith('С текущих long Xrp по 0.62\nLimit long Eth - 1895'))
+
+    expect(result.intents).toEqual([
+      { kind: 'market_entry', symbol: 'XRPUSDT', side: 'long' },
+      { kind: 'limit_entry', symbol: 'ETHUSDT', side: 'long', price: 1895 },
+    ])
+  })
+
+  it('символ, вошедший лимиткой, не дублируется рыночным входом', () => {
+    const result = parseCh2(ctxWith('Limit long Eth - 1895\nС текущих тоже беру eth long'))
+
+    expect(result.intents).toHaveLength(1)
+    expect(result.intents[0]).toMatchObject({ kind: 'limit_entry', symbol: 'ETHUSDT' })
+  })
+
+  it('«добираю» в рыночной строке остаётся ДОБОРОМ и рядом с лимиткой', () => {
+    const result = parseCh2(ctxWith('Добираю битка с текущих\nLimit long Eth - 1895', ['BTCUSDT']))
+
+    expect(result.intents).toEqual([
+      { kind: 'add', symbol: 'BTCUSDT', side: 'long' },
+      { kind: 'limit_entry', symbol: 'ETHUSDT', side: 'long', price: 1895 },
+    ])
+  })
+
+  it('половина сообщения не разобралась → всё сообщение уходит в AI, а не исполняется частично', () => {
+    const result = parseCh2(ctxWith('С текущих беру\nLimit long Eth - 1895'))
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('partial_entry_parse')
+    expect(result.intents).toHaveLength(0)
+  })
+
+  it('одни лимитки без рыночных фраз — прежние маршрут и уверенность (0.8)', () => {
+    const result = parseCh2(ctxWith('Limit long btc 60850 + limit long btc 60000\nLimit long doge - 0.0728'))
+
+    expect(result.route).toBe('execute')
+    expect(result.confidence).toBe(0.8)
+    expect(result.intents).toHaveLength(3)
+  })
+})

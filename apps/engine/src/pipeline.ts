@@ -5,11 +5,11 @@ import type { DB } from 'api/db/database.js'
 import type { Network, ParsedIntent, ParseContext, ParsedResult, Side } from 'shared/domain.js'
 import { getAdapter } from './adapters/registry.js'
 import { normalize } from './normalize.js'
-import { resolveSymbol } from './symbol-resolver.js'
+import { extractCoins, resolveSymbol } from './symbol-resolver.js'
 import { computeLeverage, floorTo, liqPrice } from './risk/leverage.js'
 import { leverageWithoutSl, protectiveSl } from './risk/protective-sl.js'
 import { computeSize } from './risk/sizing.js'
-import { acquireSymbol, addLeg, closeTrade, openTrade } from './state/trades.js'
+import { acquireSymbol, addLeg, closeTrade, openTrade, releaseSymbol } from './state/trades.js'
 import type { ExecutionPort, OrderContext } from './execution/port.js'
 import { listInstruments, type InstrumentMap } from './instruments.js'
 import { AI_CONFIDENCE_GATE, classifyIntent, reconcile } from './reconciler.js'
@@ -295,6 +295,7 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
 
     // decision.outcome === 'executing' — decision.method всегда 'auto' либо 'ai' (never null/'review').
     const method: 'auto' | 'ai' = decision.method === 'ai' ? 'ai' : 'auto'
+    warnUncoveredSymbols(message, decision.decided, ctx)
     const base: IntentBase = { message, channel, settings, instruments, deps, postCommit }
     // Гейт "Copy trading" сюда уже НЕ доходит: выключенный канал отсекается в самом начале
     // processMessage, до разбора и до вызова AI (см. там же — почему).
@@ -319,6 +320,37 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
 
   if (notifyNeeded) {
     await sql`SELECT pg_notify('domain_events', '')`.execute(db)
+  }
+}
+
+/**
+ * ЛУПА НА ПОТЕРЯННЫЕ ИНСТРУКЦИИ. Сообщение разобралось и что-то исполняет, но в его тексте
+ * упомянута ЕЩЁ ОДНА торгуемая монета, по которой не появилось ни одного действия — ни
+ * executed, ни skipped. Именно так пропал XRP из msg 221563 (06.08.2026): правило B вернуло две
+ * лимитки и остановило разбор, строка «С текущих long Xrp» не дала вообще ничего, и в UI не было
+ * даже следа, что бот её видел. Такой провал не находится ни по одной таблице — только глазами
+ * по тексту, поэтому он должен кричать в лог сам.
+ *
+ * Предупреждение мягкое: монета может упоминаться и справочно («биток тянет всех вниз»). Цена
+ * ложного срабатывания — строка в логе, цена пропущенного — не открытая позиция.
+ */
+function warnUncoveredSymbols(message: PipelineMessage, decided: ReadonlyArray<{ intent: ParsedIntent }>, ctx: ParseContext): void {
+  const covered = new Set(decided.map(({ intent }) => ('symbol' in intent ? intent.symbol : null)).filter((s): s is string => s !== null))
+  const uncovered = new Map<string, string>()
+  for (const line of message.text.split('\n')) {
+    if (line.trim().length === 0) continue
+    for (const coin of extractCoins(line)) {
+      const symbol = ctx.resolveSymbol(coin)
+      if (symbol === null || !ctx.isListed(symbol) || covered.has(symbol) || uncovered.has(symbol)) continue
+      uncovered.set(symbol, line.trim())
+    }
+  }
+  if (uncovered.size === 0) return
+  for (const [symbol, line] of uncovered) {
+    console.warn(
+      `[pipeline] msg ${message.tgMessageId} (канал ${message.channelId}): по ${symbol} НЕТ действий, ` +
+        `хотя монета упомянута в строке «${line}» — проверьте правила адаптера`,
+    )
   }
 }
 
@@ -650,6 +682,12 @@ interface HandlerResult {
   tradeId?: string
   side?: Side
   symbol?: string
+  /**
+   * Действие оказалось не тем, чем выглядело в тексте: «Limit long Eth 1895» по УЖЕ открытому
+   * эфиру — это доливка, а не новый вход (см. resolveBusySymbol). Тип строки actions переписываем
+   * на фактический, иначе в UI и в журнале останется 'open' у ордера с purpose='add'.
+   */
+  rewrittenType?: 'add'
 }
 
 // classifyIntent(intent) (symbol/side/type ActionType) — единственный источник этой классификации
@@ -754,9 +792,21 @@ async function processIntent(
 
   const now = new Date()
   if (result.skipReason) {
+    // Пропуск действия — единственный исход, который НИЧЕГО не делает с деньгами, и потому
+    // единственный, который легко не заметить. Пишем его в лог всегда и с координатами
+    // сообщения: разбор живых жалоб «почему бот проигнорировал сигнал» начинается именно отсюда.
+    console.warn(
+      `[pipeline] msg ${base.message.tgMessageId} (канал ${base.message.channelId}) SKIP ` +
+        `${info.type} ${info.symbol ?? '—'} ${info.side ?? ''} → ${result.skipReason}`,
+    )
     await trx
       .updateTable('actions')
-      .set({ status: 'skipped', skip_reason: result.skipReason, updated_at: now })
+      .set({
+        status: 'skipped',
+        skip_reason: result.skipReason,
+        ...(result.rewrittenType !== undefined ? { type: result.rewrittenType } : {}),
+        updated_at: now,
+      })
       .where('id', '=', actionId)
       .execute()
     await trx
@@ -780,7 +830,14 @@ async function processIntent(
   const finalSide = result.side ?? info.side
   await trx
     .updateTable('actions')
-    .set({ trade_id: result.tradeId ?? null, side: finalSide, status: 'executed', executed_at: now, updated_at: now })
+    .set({
+      trade_id: result.tradeId ?? null,
+      side: finalSide,
+      status: 'executed',
+      ...(result.rewrittenType !== undefined ? { type: result.rewrittenType } : {}),
+      executed_at: now,
+      updated_at: now,
+    })
     .where('id', '=', actionId)
     .execute()
   await trx
@@ -1121,6 +1178,120 @@ async function specFromMarketEntry(
   }
 }
 
+/**
+ * ЧТО ДЕЛАТЬ С НОВЫМ ВХОДОМ ПО ЗАНЯТОМУ СИМВОЛУ.
+ *
+ * Владение символом внутри канала (symbol_ownership) задумано как защита от ДУБЛЯ: повторно
+ * присланный тот же сигнал не должен удваивать позицию (e2e-сценарий ch1-busy). Но «занят» —
+ * это три РАЗНЫХ состояния, а обрабатывались они одинаково, через skip(symbol_busy):
+ *
+ *   1) позиция реально открыта — дубль рыночного входа, скипаем (как и раньше);
+ *   2) висит НЕИСПОЛНЕННАЯ лимитка автора, а он прислал новую цену — он ПЕРЕСТАВИЛ заявку,
+ *      скипать её значит не войти вовсе (живой случай 06.08.2026: msg 221563, «Limit long Eth
+ *      - 1895» при висящей лимитке 1823 ушёл в skip, вход по эфиру потерян);
+ *   3) сделка-«призрак»: лимитка отменена/сделка давно без ордеров и без позиции, а владение
+ *      осталось — символ был бы заблокирован для канала НАВСЕГДА.
+ *
+ * Разбираем их по РЕАЛЬНОЙ экспозиции (позиция + живые ордера), а не по строке trades.status:
+ * она ставится оптимистично в момент отправки лимитки и живой позиции ещё не означает.
+ */
+type BusyVerdict =
+  | { kind: 'skip'; reason: string }
+  | { kind: 'add' }
+  | { kind: 'takeover'; tradeId: string | null; note: string }
+
+async function resolveBusySymbol(
+  trx: Kysely<DB>,
+  base: IntentBase,
+  intent: OpenSpec,
+  tradeId: string | null,
+): Promise<BusyVerdict> {
+  // Владение без сделки — заведомый мусор (в норме недостижимо: acquireSymbol всегда пишет trade_id).
+  if (tradeId === null) return { kind: 'takeover', tradeId: null, note: 'владение без сделки' }
+
+  const trade = await trx
+    .selectFrom('trades')
+    .select(['id', 'side', 'status', 'manual_override'])
+    .where('id', '=', tradeId)
+    .executeTakeFirst()
+  if (!trade) return { kind: 'takeover', tradeId, note: 'сделка не найдена' }
+
+  // Оператор ведёт сделку руками — не вмешиваемся ни доливкой, ни отменой его ордеров.
+  if (trade.manual_override) return { kind: 'skip', reason: 'manual_override' }
+
+  // Разворот (был лонг — пришёл шорт) это НЕ вход поверх: сначала надо закрыть текущую позицию,
+  // а такого указания в сигнале нет. Отдельная причина вместо symbol_busy — чтобы в UI было
+  // видно, что это конфликт направления, а не дубль.
+  if (trade.side !== null && trade.side !== intent.side) return { kind: 'skip', reason: 'side_conflict' }
+
+  const position = await trx
+    .selectFrom('positions')
+    .select('size')
+    .where('channel_id', '=', base.message.channelId)
+    .where('symbol', '=', intent.symbol)
+    .where(sql<boolean>`size <> 0`)
+    .executeTakeFirst()
+
+  const entryOrders = await trx
+    .selectFrom('orders')
+    .select(['order_link_id', 'status', 'price'])
+    .where('trade_id', '=', tradeId)
+    .where('purpose', 'in', ['entry', 'add'])
+    .execute()
+  const live = entryOrders.filter((o) => o.status === 'created' || o.status === 'pending_submit' || o.status === 'submitted')
+  const filled = entryOrders.some((o) => o.status === 'filled' || o.status === 'partially_filled')
+
+  // Та же цена, что у уже стоящего входа — это ПЕРЕСЫЛКА/повтор того же сигнала, а не новая
+  // заявка. Единственный признак, отличающий их друг от друга, — цена.
+  const samePrice =
+    intent.orderType === 'limit' && live.some((o) => o.price !== null && new Decimal(o.price).eq(intent.entryPrice))
+  if (samePrice) return { kind: 'skip', reason: 'duplicate_entry' }
+
+  if (position !== undefined || filled) {
+    // Позиция живая. Новая ЛИМИТКА по ней — ступень лесенки входа («доливка лимиткой» в лексике
+    // автора), рыночный же повтор по-прежнему считаем дублем: отличить «войди ещё раз прямо
+    // сейчас» от пересланного старого сигнала нечем, а удвоение позиции стоит дороже пропуска.
+    if (intent.orderType === 'limit') return { kind: 'add' }
+    return { kind: 'skip', reason: 'symbol_busy' }
+  }
+
+  return live.length > 0
+    ? { kind: 'takeover', tradeId, note: `автор переставил вход: ${live.map((o) => o.price ?? '?').join(', ')} → ${intent.entryPrice.toString()}` }
+    : { kind: 'takeover', tradeId, note: 'сделка без позиции и без живых ордеров' }
+}
+
+/**
+ * Снимает остатки не состоявшейся сделки и освобождает символ: висящие ордера (неисполненный
+ * вход и его защитный стоп) отменяются на бирже, сделка помечается 'cancelled'.
+ *
+ * Статус именно 'cancelled', а не 'closed': позиции не было, результата у неё нет — в статистику
+ * канала (winRate) она входить не должна (см. closeTrade).
+ */
+async function releaseStaleTrade(trx: Kysely<DB>, base: IntentBase, tradeId: string | null, symbol: string): Promise<void> {
+  if (tradeId === null) {
+    await releaseSymbol(trx, { channelId: base.message.channelId, symbol })
+    return
+  }
+
+  const liveOrders = await trx
+    .selectFrom('orders')
+    .select(['order_link_id', 'purpose'])
+    .where('trade_id', '=', tradeId)
+    .where('status', 'in', ['created', 'pending_submit', 'submitted'])
+    .execute()
+  for (const order of liveOrders) {
+    await base.deps.executionPort.cancelOrder(trx, { orderLinkId: order.order_link_id })
+  }
+  await closeTrade(trx, { tradeId, status: 'cancelled' })
+  // closeTrade освобождает владение по trade_id; повтор по (канал, символ) — страховка на случай
+  // рассинхрона строки symbol_ownership со сделкой (иначе новый вход тут же упрётся в acquireSymbol).
+  await releaseSymbol(trx, { channelId: base.message.channelId, symbol })
+  console.log(
+    `[pipeline] ${symbol}: сделка ${tradeId} без позиции закрыта как cancelled, ` +
+      `снято ордеров: ${liveOrders.length} (${liveOrders.map((o) => o.purpose).join(', ') || '—'}), символ освобождён`,
+  )
+}
+
 async function handleOpen(
   trx: Kysely<DB>,
   base: IntentBase,
@@ -1141,12 +1312,35 @@ async function handleOpen(
   // номер human_ref на сигнал, который всё равно не исполнится.
   const busy = await trx
     .selectFrom('symbol_ownership')
-    .select('id')
+    .select(['id', 'trade_id'])
     .where('channel_id', '=', base.message.channelId)
     .where('symbol', '=', intent.symbol)
     .where('released_at', 'is', null)
     .executeTakeFirst()
-  if (busy) return { skipReason: 'symbol_busy' }
+  if (busy) {
+    const verdict = await resolveBusySymbol(trx, base, intent, busy.trade_id)
+    console.log(
+      `[pipeline] msg ${base.message.tgMessageId} ${intent.symbol}: символ занят сделкой ${busy.trade_id ?? '—'} → ${verdict.kind}` +
+        ('reason' in verdict ? ` (${verdict.reason})` : '') +
+        ('note' in verdict ? ` (${verdict.note})` : ''),
+    )
+    if (verdict.kind === 'skip') return { skipReason: verdict.reason }
+    if (verdict.kind === 'add') {
+      // Автор ставит НОВЫЙ вход по символу, где его позиция уже открыта, — это ступень добора,
+      // а не повторный сигнал. Действие переклеиваем в 'add', чтобы в UI и в журнале оно
+      // называлось тем, чем является.
+      const added = await handleAdd(trx, base, actionIndex, actionId, {
+        kind: 'add',
+        symbol: intent.symbol,
+        side: intent.side,
+        ...(intent.orderType === 'limit' ? { price: intent.entryPrice.toNumber() } : {}),
+      })
+      return { ...added, rewrittenType: 'add' }
+    }
+    // takeover: прошлый вход не состоялся (лимитка висит неисполненной либо от сделки остался
+    // один "призрак" владения) — снимаем его остатки и входим заново, уже по новой цене.
+    await releaseStaleTrade(trx, base, verdict.tradeId, intent.symbol)
+  }
 
   // Вход диапазоном без живого тикер-фида (задача 10 — Ф1 его не подключает) — берём середину
   // диапазона как цену симулированного market-филла (research: "entry для лимитки — цена

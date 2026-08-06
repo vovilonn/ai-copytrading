@@ -1303,3 +1303,120 @@ describe('pipeline — переразбор правки не дублирует
     expect(symbols.filter((sym) => sym === 'ATOMUSDT')).toHaveLength(1)
   })
 })
+
+// Живой случай прода 06.08.2026 (msg 221563, канал AACADEMY): «Limit long Eth - 1895» при висящей
+// НЕИСПОЛНЕННОЙ лимитке того же автора на 1823 ушёл в skip(symbol_busy) — вход по эфиру потерян.
+// Владение символом задумано как защита от ДУБЛЯ, но «занят» — это три разных состояния, и
+// одинаково скипать их нельзя (см. resolveBusySymbol).
+describe('pipeline — новый вход по занятому символу', () => {
+  const markAt = (price: string) => async () => price
+
+  async function seedCh2(channelId: number, symbol: string): Promise<void> {
+    await seedChannel({ channelId, symbol, adapterId: 'ch2-freeform', maxLeverage: '10', defaultLeverage: '10', qtyStep: '0.01' })
+  }
+
+  it('висит неисполненная лимитка, автор назвал НОВУЮ цену -> старая снимается, вход по новой', async () => {
+    const channelId = nextChannelId++
+    await seedCh2(channelId, 'ETHUSDT')
+    const { port, calls } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '10000', getMarkPrice: markAt('1900'), aiEnabled: false }
+
+    await processMessage(db, await insertMessage(channelId, 1, 'Limit long eth 1823'), localDeps)
+    await processMessage(db, await insertMessage(channelId, 2, 'Limit long Eth - 1895'), localDeps)
+
+    const second = await actionFor(channelId, 2)
+    expect(second.status).toBe('executed')
+    expect(second.skip_reason).toBeNull()
+
+    // Прежний вход снят с биржи вместе со своим защитным стопом, сделка помечена cancelled.
+    expect(calls.filter((c) => c === 'cancelOrder')).toHaveLength(2)
+    const orders = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).where('purpose', '=', 'entry').orderBy('created_at').execute()
+    expect(orders).toHaveLength(2)
+    expect(orders.map((o) => o.status)).toEqual(['cancelled', 'submitted'])
+    expect(orders.map((o) => new Decimal(o.price!).toString())).toEqual(['1823', '1895'])
+
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).orderBy('seq').execute()
+    expect(trades.map((t) => t.status)).toEqual(['cancelled', 'open'])
+    // Владение символом перешло к новой сделке — активная запись ровно одна.
+    const owned = await db.selectFrom('symbol_ownership').selectAll().where('channel_id', '=', channelId).where('released_at', 'is', null).execute()
+    expect(owned).toHaveLength(1)
+    expect(owned[0]?.trade_id).toBe(trades[1]?.id)
+  })
+
+  it('ТА ЖЕ цена лимитки -> дубль, вход не повторяется', async () => {
+    const channelId = nextChannelId++
+    await seedCh2(channelId, 'ETHUSDT')
+    const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', getMarkPrice: markAt('1900'), aiEnabled: false }
+
+    await processMessage(db, await insertMessage(channelId, 1, 'Limit long eth 1823'), localDeps)
+    await processMessage(db, await insertMessage(channelId, 2, 'Limit long eth 1823'), localDeps)
+
+    const second = await actionFor(channelId, 2)
+    expect(second.status).toBe('skipped')
+    expect(second.skip_reason).toBe('duplicate_entry')
+    const entries = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).where('purpose', '=', 'entry').execute()
+    expect(entries).toHaveLength(1)
+  })
+
+  it('позиция ОТКРЫТА, автор даёт лимитку -> ступень добора (add), а не skip', async () => {
+    const channelId = nextChannelId++
+    await seedCh2(channelId, 'ETHUSDT')
+    const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', getMarkPrice: markAt('1900'), aiEnabled: false }
+
+    await processMessage(db, await insertMessage(channelId, 1, 'eth long с текущих'), localDeps)
+    await processMessage(db, await insertMessage(channelId, 2, 'Limit long Eth - 1823'), localDeps)
+
+    const second = await actionFor(channelId, 2)
+    expect(second.status).toBe('executed')
+    expect(second.type).toBe('add') // действие называется тем, чем является
+    const add = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).where('purpose', '=', 'add').executeTakeFirstOrThrow()
+    expect(add.order_type).toBe('limit')
+    expect(new Decimal(add.price!).toString()).toBe('1823')
+    // Позиция осталась одна, сделка не задвоилась.
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades).toHaveLength(1)
+  })
+
+  it('позиция ОТКРЫТА, пришёл повторный РЫНОЧНЫЙ сигнал -> по-прежнему symbol_busy (защита от дубля)', async () => {
+    const channelId = nextChannelId++
+    await seedCh2(channelId, 'ETHUSDT')
+    const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', getMarkPrice: markAt('1900'), aiEnabled: false }
+
+    await processMessage(db, await insertMessage(channelId, 1, 'eth long с текущих'), localDeps)
+    await processMessage(db, await insertMessage(channelId, 2, 'eth long с текущих'), localDeps)
+
+    const second = await actionFor(channelId, 2)
+    expect(second.status).toBe('skipped')
+    expect(second.skip_reason).toBe('symbol_busy')
+  })
+
+  it('вход в ПРОТИВОПОЛОЖНУЮ сторону -> side_conflict, а не молчаливый symbol_busy', async () => {
+    const channelId = nextChannelId++
+    await seedCh2(channelId, 'ETHUSDT')
+    const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', getMarkPrice: markAt('1900'), aiEnabled: false }
+
+    await processMessage(db, await insertMessage(channelId, 1, 'eth long с текущих'), localDeps)
+    await processMessage(db, await insertMessage(channelId, 2, 'Limit short eth 2100'), localDeps)
+
+    const second = await actionFor(channelId, 2)
+    expect(second.status).toBe('skipped')
+    expect(second.skip_reason).toBe('side_conflict')
+  })
+
+  it('сделка-«призрак» (лимитка отменена, позиции нет) больше не блокирует символ навсегда', async () => {
+    const channelId = nextChannelId++
+    await seedCh2(channelId, 'ETHUSDT')
+    const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', getMarkPrice: markAt('1900'), aiEnabled: false }
+
+    await processMessage(db, await insertMessage(channelId, 1, 'Limit long eth 1823'), localDeps)
+    // Ровно состояние прода: вход отменён на бирже, а сделка и владение символом остались.
+    await db.updateTable('orders').set({ status: 'cancelled' }).where('channel_id', '=', channelId).where('purpose', '=', 'entry').execute()
+
+    await processMessage(db, await insertMessage(channelId, 2, 'eth long с текущих'), localDeps)
+
+    const second = await actionFor(channelId, 2)
+    expect(second.status).toBe('executed')
+    const position = await db.selectFrom('positions').selectAll().where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    expect(new Decimal(position.size).greaterThan(0)).toBe(true)
+  })
+})

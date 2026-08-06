@@ -7,9 +7,9 @@ import type { DeltaOp, ParseContext, ParsedIntent, ParsedResult } from 'shared/d
  * Адаптер канала CH2 (форум 1962583820, тема 173666) — свободный чат
  * (docs/superpowers/research/channel-adapters.md §2, правила A–F; .superpowers/sdd/task-3-brief.md).
  *
- * Порядок применения — первый матч выигрывает: A (structured signal) → B (limit_entry) →
- * C (market_entry) → D (delta_sl с тикером) → E/F (лексикон символ-less дельт/amend, route ai) →
- * фолбэк NOISE (аналитика без order-фразы, анонсы, медиа-only).
+ * Порядок применения — первый матч выигрывает: A (structured signal) → B+C (входы: лимитные и
+ * рыночные разбираются ВМЕСТЕ, см. tryEntries) → D (delta_sl с тикером) → E/F (лексикон
+ * символ-less дельт/amend, route ai) → фолбэк NOISE (аналитика без order-фразы, анонсы, медиа-only).
  *
  * ПОЧЕМУ у B/C/D три исхода, а не два (match/null): если СИЛЬНАЯ order-фраза (`limit`+`long/short`,
  * `с текущих`/`relong`/…, `sl`/`стоп`) в тексте нашлась, но извлечь символ/цену не удалось —
@@ -24,8 +24,7 @@ export function parseCh2(ctx: ParseContext): ParsedResult {
 
   return (
     tryStructuredSignal(text, ctx) ??
-    tryLimitEntry(text, ctx) ??
-    tryMarketEntry(text, ctx) ??
+    tryEntries(text, ctx) ??
     tryDeltaSl(text, ctx) ??
     tryAiLexicon(text) ??
     fallback(text, ctx)
@@ -183,38 +182,98 @@ function tryStructuredSignal(text: string, ctx: ParseContext): ParsedResult | nu
 }
 
 // ---------------------------------------------------------------------------
-// B. LIMIT_ENTRY (research §2 B, conf 0.8)
+// B + C. ВХОДЫ — ЛИМИТНЫЕ И РЫНОЧНЫЕ РАЗБИРАЮТСЯ ВМЕСТЕ.
+//
+// Раньше правила стояли в цепочке «первый матч выигрывает» (B ?? C), и сообщение, где автор
+// смешал оба способа входа, теряло часть строк МОЛЧА. Живой случай прода 06.08.2026 (msg 221563):
+//
+//     С текущих long Xrp        <- C (рыночный вход)  — ПРОПАЛ: правило C не запускалось вовсе
+//     Limit long Eth - 1895     <- B (лимитка)
+//     Limit long SOL - 73.1     <- B (лимитка)
+//
+// B вернул два интента и остановил цепочку — по XRP не появилось даже строки действия: ни
+// executed, ни skipped, просто ничего. Теперь по сообщению проходят ОБА сканера, а их интенты
+// складываются в порядке строк. Взаимные помехи исключены двумя правилами:
+//   1) строка, отдавшая лимитку, рыночному сканеру не показывается (иначе «с текущих» в соседней
+//      строке затянуло бы тот же символ во ВТОРОЙ вход);
+//   2) символ, уже занятый лимиткой этого сообщения, рыночный сканер пропускает.
 // ---------------------------------------------------------------------------
 
 const LIMIT_GATE_RE = /\blimit\b/i
 const DIR_WORD_GATE_RE = /\b(long|short)\b/i
 
-function tryLimitEntry(text: string, ctx: ParseContext): ParsedResult | null {
-  if (!LIMIT_GATE_RE.test(text) || !DIR_WORD_GATE_RE.test(text)) return null
+/** Интент вместе с номером строки-источника — чтобы итоговый порядок совпадал с порядком в тексте. */
+interface EntryHit {
+  line: number
+  intent: ParsedIntent
+}
 
-  // Сплит по `\n`, затем по ` + ` (несколько ордеров в одном сообщении, research §2 B):
-  // "Limit long btc 60850 + limit long btc 60000\nLimit long doge - 0.0728" -> 3 сегмента.
-  const segments = text.split('\n').flatMap((line) => line.split(' + '))
-  const intents: ParsedIntent[] = []
-  for (const segment of segments) {
-    const side = extractSide(segment)
-    const coins = extractCoins(segment)
-    const coin = coins[0]
-    const numbers = parseNumbers(segment)
-    if (side === null || coin === undefined || numbers.length === 0) continue
-    const symbol = ctx.resolveSymbol(coin)
-    if (symbol === null || !ctx.isListed(symbol)) continue
-    const price = numbers[numbers.length - 1]! // последнее число в сегменте — цена (research §2 B)
-    intents.push({ kind: 'limit_entry', symbol, side, price })
-  }
+interface EntryScan {
+  /** Гейт правила сработал: в тексте реально есть order-фраза этого вида. */
+  gated: boolean
+  hits: EntryHit[]
+  /** Строки, уже отданные под лимитки, — рыночный сканер их не смотрит. */
+  consumed: Set<number>
+  /** Сколько символов сканер намеренно пропустил как уже занятые другим правилом. */
+  suppressed: number
+}
 
-  if (intents.length === 0) {
-    // Гейт (limit+long/short) сработал, но НИ ОДИН сегмент не дал монету+цену — напр.
-    // "Limit long на ту половину которую фиксировал" (221420: ссылка на прошлую позицию без
-    // символа/цены). Реальная order-фраза без структуры → в AI, а не в noise.
+function tryEntries(text: string, ctx: ParseContext): ParsedResult | null {
+  const lines = text.split('\n')
+
+  const limit = scanLimitEntries(lines, ctx)
+  // Гасим (не удаляем!) занятые строки, чтобы номера остальных не поехали.
+  const leftover = lines.map((line, i) => (limit.consumed.has(i) ? '' : line))
+  const claimed = new Set(limit.hits.map((h) => (h.intent as { symbol: string }).symbol))
+  const market = scanMarketEntries(leftover, ctx, claimed)
+
+  if (!limit.gated && !market.gated) return null
+
+  // Один из гейтов сработал, но НИ ОДНОГО интента не дал, пока другой дал. Исполнить половину и
+  // промолчать про вторую — ровно тот дефект, из-за которого пропал XRP. Отдаём всё сообщение
+  // модели: она видит его целиком, а не по одной строке. `suppressed` — это НЕ потеря: символ
+  // уже вошёл лимиткой этого же сообщения («Limit long Eth 1895 / с текущих тоже беру eth»).
+  const halfParsed =
+    (limit.gated && limit.hits.length === 0) || (market.gated && market.hits.length === 0 && market.suppressed === 0)
+  const hits = [...limit.hits, ...market.hits].sort((a, b) => a.line - b.line)
+
+  if (hits.length === 0) {
+    // Гейт сработал, но структуры нет вовсе — напр. "Limit long на ту половину которую фиксировал"
+    // (221420: ссылка на прошлую позицию без символа/цены) или "С текущих беру" (221393, символ
+    // только в state/reply). Реальная order-фраза без структуры → в AI, а не в noise.
     return { route: 'ai', confidence: 0.4, intents: [] }
   }
-  return { route: 'execute', confidence: 0.8, intents }
+  if (halfParsed) return { route: 'ai', confidence: 0.4, intents: [], reason: 'partial_entry_parse' }
+
+  // Уверенность — по слабейшему из сработавших правил (research §2: B 0.8, C 0.7).
+  return { route: 'execute', confidence: market.hits.length > 0 ? 0.7 : 0.8, intents: hits.map((h) => h.intent) }
+}
+
+function scanLimitEntries(lines: readonly string[], ctx: ParseContext): EntryScan {
+  const scan: EntryScan = { gated: false, hits: [], consumed: new Set(), suppressed: 0 }
+  if (!LIMIT_GATE_RE.test(lines.join('\n')) || !DIR_WORD_GATE_RE.test(lines.join('\n'))) return scan
+  scan.gated = true
+
+  lines.forEach((line, index) => {
+    // Строка со СВОЕЙ рыночной фразой принадлежит правилу C, даже когда слово limit есть в
+    // соседней строке: «С текущих long Xrp по 0.62» — это вход по рынку с упомянутым уровнем,
+    // а не лимитка на 0.62.
+    if (MARKET_ENTRY_GATE_RE.test(line) && !LIMIT_GATE_RE.test(line)) return
+    // Сплит по ` + ` (несколько ордеров в одной строке, research §2 B):
+    // "Limit long btc 60850 + limit long btc 60000" -> 2 сегмента.
+    for (const segment of line.split(' + ')) {
+      const side = extractSide(segment)
+      const coin = extractCoins(segment)[0]
+      const numbers = parseNumbers(segment)
+      if (side === null || coin === undefined || numbers.length === 0) continue
+      const symbol = ctx.resolveSymbol(coin)
+      if (symbol === null || !ctx.isListed(symbol)) continue
+      const price = numbers[numbers.length - 1]! // последнее число в сегменте — цена (research §2 B)
+      scan.hits.push({ line: index, intent: { kind: 'limit_entry', symbol, side, price } })
+      scan.consumed.add(index)
+    }
+  })
+  return scan
 }
 
 // ---------------------------------------------------------------------------
@@ -237,33 +296,50 @@ const MARKET_ENTRY_GATE_RE = /с текущих|relong|перезах|повто
  */
 const ADD_INTENT_RE = /(?:ещ[её]\s+(?:один|одну|раз)|добир|добор|долив|доли[влью]|добавля|усредн)/i
 
-function tryMarketEntry(text: string, ctx: ParseContext): ParsedResult | null {
-  if (!MARKET_ENTRY_GATE_RE.test(text)) return null
+/**
+ * @param lines строки сообщения БЕЗ тех, что уже отдали лимитку (они погашены пустыми — номера
+ *   остальных при этом сохраняются).
+ * @param claimed символы, уже вошедшие лимиткой этого же сообщения: второй вход по ним не нужен.
+ */
+function scanMarketEntries(lines: readonly string[], ctx: ParseContext, claimed: ReadonlySet<string>): EntryScan {
+  const scan: EntryScan = { gated: false, hits: [], consumed: new Set(), suppressed: 0 }
+  const text = lines.join('\n')
+  if (!MARKET_ENTRY_GATE_RE.test(text)) return scan
+  scan.gated = true
 
+  // Якорь порядка — первая строка с рыночной фразой: правило C собирает коины со ВСЕГО текста
+  // («С текущих\nSol Eth btc» — фраза и монеты в разных строках), поэтому своей строки у
+  // отдельного интента нет.
+  const anchor = Math.max(
+    lines.findIndex((line) => MARKET_ENTRY_GATE_RE.test(line)),
+    0,
+  )
   const side = extractSide(text)
-  const intents: ParsedIntent[] = []
   const wantsAdd = ADD_INTENT_RE.test(text)
+  const seen = new Set<string>(claimed)
   // syms = ВСЕ коины в тексте (research §2 C): "Перезахожу в Лонги Sol Eth btc" -> [SOL,ETH,BTC].
   for (const coin of extractCoins(text)) {
     const symbol = ctx.resolveSymbol(coin)
     if (symbol === null || !ctx.isListed(symbol)) continue
+    if (seen.has(symbol)) {
+      scan.suppressed += 1
+      continue
+    }
     const open = ctx.openPositions.get(symbol)
     // Добор — только когда позиция по символу РЕАЛЬНО открыта. Иначе «ещё один лонг» по свободному
     // символу — обычный вход (автор мог закрыть прошлую сделку раньше). Сторону для добора можно не
     // называть («Добираю битка с текущих») — она известна из самой позиции.
     if (wantsAdd && open !== undefined) {
-      intents.push({ kind: 'add', symbol, side: side ?? open.side })
+      seen.add(symbol)
+      scan.hits.push({ line: anchor, intent: { kind: 'add', symbol, side: side ?? open.side } })
       continue
     }
-    if (side !== null) intents.push({ kind: 'market_entry', symbol, side })
+    if (side !== null) {
+      seen.add(symbol)
+      scan.hits.push({ line: anchor, intent: { kind: 'market_entry', symbol, side } })
+    }
   }
-
-  if (intents.length === 0) {
-    // Гейт (с текущих/relong/…) сработал, но направление или символ не определились — напр.
-    // "С текущих беру" (221393, символ только в state/reply) — реальное действие без структуры.
-    return { route: 'ai', confidence: 0.4, intents: [] }
-  }
-  return { route: 'execute', confidence: 0.7, intents }
+  return scan
 }
 
 // ---------------------------------------------------------------------------
