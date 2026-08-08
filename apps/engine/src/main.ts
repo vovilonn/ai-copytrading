@@ -54,12 +54,14 @@ const WALLET_SNAPSHOT_INTERVAL_MS = 30_000
 // dry_run-заглушка equity (см. PipelineDeps.equity в pipeline.ts — "совпадает с суммой, которой
 // реально пополнен testnet-аккаунт"); live использует реальный getEquity(rest) ниже.
 const DRY_RUN_EQUITY = '1000'
-// Important I2 адверсариального ревью (p3-core-fix-report.md): порог гейта staleness/slippage
-// перед market-входом (pipeline.ts::handleEntrySignal) — читается напрямую из process.env (не
-// через api/config/config.schema.ts — эта задача не трогает apps/api), с дефолтом '0.5' (0.5%),
-// если переменная не задана/пуста. Применяется в ОБОИХ режимах одинаково (не ветвится по
-// EXECUTION_MODE) — сам гейт в pipeline.ts уже условен на наличие deps.getMarkPrice (только live).
-const MAX_ENTRY_SLIPPAGE_PCT = process.env.MAX_ENTRY_SLIPPAGE_PCT || '0.5'
+// Порог гейта «сигнал протух» перед рыночным входом (pipeline.ts::resolveEntryPrice).
+//
+// ВЫКЛЮЧЕН ПО УМОЛЧАНИЮ (решение заказчика 08.08.2026: «постоянно прибыльные сделки теряю из-за
+// этого условия — когда немного выходим из диапазона, сделка скипается»). Прежний дефолт 0.5%
+// рубил вход, стоило рынку отойти от диапазона на полпроцента. Теперь вместо запрета — вход по
+// живой цене: плечо/размер/ликвидация считаются от той цены, по которой реально пройдёт филл.
+// Вернуть гейт: MAX_ENTRY_SLIPPAGE_PCT=0.5 (или другое число процентов) в окружении движка.
+const MAX_ENTRY_SLIPPAGE_PCT = process.env.MAX_ENTRY_SLIPPAGE_PCT ?? ''
 
 /**
  * Держит `pg_advisory_lock` (сессионный, НЕ транзакционный) на отдельном соединении на всё время

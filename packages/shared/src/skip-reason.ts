@@ -14,6 +14,9 @@ const SKIP_REASON_LABELS: Readonly<Record<string, string>> = {
   unsafe_stop: 'unsafe stop',
   invalid_sl_side: 'stop on the wrong side of entry',
   price_slippage: 'price moved away from the signal',
+  // Гейт слиппеджа выключен по умолчанию (вход идёт по живой цене) — от протухшего сигнала
+  // защищают сами цели: если рынок прошёл их все, закрываться сделке уже негде.
+  targets_passed: 'market already passed every target of the signal',
   mark_price_unavailable: 'no market price',
   zero_qty: 'zero size after rounding',
   min_notional: 'size below exchange minimum',
@@ -24,6 +27,9 @@ const SKIP_REASON_LABELS: Readonly<Record<string, string>> = {
   symbol_unknown: 'symbol not recognised',
   symbol_unresolved: 'symbol could not be resolved',
   symbol_busy: 'symbol already has an open trade',
+  // Новый вход по символу, где у канала уже есть сделка (см. pipeline.ts::resolveBusySymbol).
+  duplicate_entry: 'same entry price as the order already placed',
+  side_conflict: 'signal is opposite to the open position',
 
   // ── Состояние сделки ──────────────────────────────────────────────────────────────────────
   no_open_position: 'no open position',

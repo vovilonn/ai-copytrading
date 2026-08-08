@@ -30,7 +30,9 @@ import { KlineSource, type Candle, type KlineInterval, type KlineOracle } from '
 
 const SCHEMA = 'backtest_run'
 const DEFAULT_EQUITY = '1000'
-const DEFAULT_MAX_SLIPPAGE_PCT = '0.5'
+// Гейт слиппеджа выключен по умолчанию — как и в live (main.ts::MAX_ENTRY_SLIPPAGE_PCT). Иначе
+// бэктест показывал бы skip'ы, которых на проде не бывает. Включается флагом --slippage PCT.
+const DEFAULT_MAX_SLIPPAGE_PCT = ''
 // PnL-симуляция: горизонт удержания и интервал траектории (см. simulateOutcome).
 const DEFAULT_PNL_HORIZON_DAYS = 30
 const DEFAULT_PNL_INTERVAL: KlineInterval = '15'

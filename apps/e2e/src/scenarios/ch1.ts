@@ -95,14 +95,18 @@ export const ch1Guards: Scenario = {
   slot: 1,
   symbols: ['SOLUSDT'],
   tags: ['ch1', 'guards'],
-  note: 'Ни один шаг НЕ должен открыть позицию. Проверяются гейты pipeline.ts: price_slippage, invalid_sl_side и маршрут в AI для нерезолвящегося символа.',
+  note: 'Ни один шаг НЕ должен открыть позицию. Проверяются гейты pipeline.ts: targets_passed, invalid_sl_side и маршрут в AI для нерезолвящегося символа.',
   steps: [
     {
-      title: 'Сигнал с ценой входа далеко от рынка (устаревший)',
-      post: async (ctx) => ({ text: await entrySignal(ctx, { symbol: 'SOLUSDT', ticker: 'SOL', side: 'LONG', offsetPct: -5 }) }),
+      // Гейт слиппеджа выключен (решение заказчика 08.08.2026 — он рубил живые сделки на
+      // полупроцентном отклонении), протухший сигнал теперь ловится по ЦЕЛЯМ: вход −10% от
+      // рынка означает, что обе цели (+3% и +6% от входа) остались НИЖЕ рынка, то есть движение
+      // уже отработано и закрываться лонгу негде.
+      title: 'Сигнал, движение которого рынок уже отработал (все цели пройдены)',
+      post: async (ctx) => ({ text: await entrySignal(ctx, { symbol: 'SOLUSDT', ticker: 'SOL', side: 'LONG', offsetPct: -10 }) }),
       expect: {
         status: 'executed',
-        actions: [{ type: 'open', status: 'skipped', symbol: 'SOLUSDT', skipReason: 'price_slippage' }],
+        actions: [{ type: 'open', status: 'skipped', symbol: 'SOLUSDT', skipReason: 'targets_passed' }],
         position: { symbol: 'SOLUSDT', side: 'flat' },
         exchange: { symbol: 'SOLUSDT', position: 'flat' },
       },

@@ -85,7 +85,19 @@ export interface PipelineDeps {
    * fail-CLOSED (skip mark_price_unavailable), не fail-open.
    */
   getMarkPrice?: (symbol: string) => Promise<string | null>
-  /** Порог гейта I2, % (design: дефолт '0.5' = MAX_ENTRY_SLIPPAGE_PCT, .env.example). */
+  /**
+   * Порог отклонения рынка от цены сигнала, % — ОПЦИОНАЛЬНЫЙ гейт «сигнал протух, не входим».
+   *
+   * По умолчанию ВЫКЛЮЧЕН (поле не задано или пустая строка). Решение заказчика 08.08.2026:
+   * «постоянно прибыльные сделки теряю из-за этого условия — когда немного выходим из диапазона,
+   * сделка скипается». Порог 0.5% рубил вход, стоило рынку отойти от диапазона на полпроцента,
+   * хотя сама сделка оставалась той же (живой случай: #ZRO/USDT SHORT, рынок ушёл на 1.6%,
+   * вход пришлось доставлять руками).
+   *
+   * Вместо запрета — вход по ЖИВОЙ цене (resolveEntryPrice): раз ордер всё равно рыночный,
+   * плечо/размер/ликвидация теперь считаются от той цены, по которой реально произойдёт филл,
+   * а не от середины уже неактуального диапазона. Задать число — вернуть прежний гейт.
+   */
   maxEntrySlippagePct?: string
   /**
    * Разрешён ли поход в AI (по умолчанию да).
@@ -99,10 +111,10 @@ export interface PipelineDeps {
   aiEnabled?: boolean
 }
 
-// Important I2 (адверсариальное ревью): вход всегда market по СИГНАЛЬНОЙ цене — если реальный
-// mark отклонился от неё больше чем на этот порог (сигнал устарел/цена уже ушла), риск/сайзинг,
-// посчитанные по сигнальной цене, больше не отражают реальность — лучше skip, чем вход вслепую.
-const DEFAULT_MAX_ENTRY_SLIPPAGE_PCT = '0.5'
+// Отклонение рынка от диапазона входа, начиная с которого вход логируется отдельной строкой.
+// Не гейт — именно порог наблюдаемости: 0.5% раньше означало skip, теперь означает «зашли по
+// текущим, вот насколько рынок ушёл» (см. resolveEntryPrice).
+const ENTRY_DRIFT_LOG_PCT = '0.5'
 
 // «Фиксирую» без явной доли — это половина: самый частый смысл в сигналах («зафиксировал часть»,
 // «скинул половину»). Если автор назвал долю («закрыл 30%»), берётся она, а не этот дефолт.
@@ -1022,9 +1034,15 @@ function splitQtyEvenly(total: Decimal, n: number, qtyStep: string): Decimal[] {
  * это осознанное отклонение от "равных долей", а не баг). `total` здесь всегда > 0 — это уже
  * sizeResult.qty, гарантированно не-zero_qty (computeSize сам скипнул бы zero_qty раньше).
  */
+/**
+ * `tps` — цели ВМЕСТЕ С ИХ НОМЕРАМИ В СИГНАЛЕ, а не просто список цен. Номер уезжает в
+ * orders.tp_index и в orderLinkId, а по нему потом ищутся ступени («первая цель», «вторая»):
+ * если рынок уже прошёл первую цель и она из лесенки выпала, оставшиеся обязаны сохранить свои
+ * исходные номера (1 и 2), иначе «вторую цель» автора мы применили бы к чужой ступени.
+ */
 function buildTpTargets(
   total: Decimal,
-  tps: readonly number[],
+  tps: readonly { price: number; index: number }[],
   qtyStep: string,
 ): { price: string; qty: string; index: number }[] {
   const n = tps.length
@@ -1032,19 +1050,18 @@ function buildTpTargets(
 
   const qtys = splitQtyEvenly(total, n, qtyStep)
   const nonZero = tps
-    .map((price, index) => ({ price: price.toString(), qty: (qtys[index] ?? new Decimal(0)).toString(), index }))
+    .map((tp, position) => ({ price: tp.price.toString(), qty: (qtys[position] ?? new Decimal(0)).toString(), index: tp.index }))
     .filter((t) => !new Decimal(t.qty).isZero())
   if (nonZero.length > 0) return nonZero
 
-  const lastIndex = n - 1
-  const lastPrice = tps[lastIndex]
-  if (lastPrice === undefined) return [] // n===0 уже отсечено выше — сюда не попасть, defensive
+  const last = tps[n - 1]
+  if (last === undefined) return [] // n===0 уже отсечено выше — сюда не попасть, defensive
 
   console.warn(
     `[pipeline] TP-лесенка из ${n} целей схлопнута в один TP: qty=${total.toString()} < qtyStep=${qtyStep} · ${n} — ` +
-      `равными долями раздать нечего, весь объём уходит в последнюю цель (${lastPrice}).`,
+      `равными долями раздать нечего, весь объём уходит в последнюю цель (${last.price}).`,
   )
-  return [{ price: lastPrice.toString(), qty: total.toString(), index: lastIndex }]
+  return [{ price: last.price.toString(), qty: total.toString(), index: last.index }]
 }
 
 /**
@@ -1176,6 +1193,58 @@ async function specFromMarketEntry(
     tps: intent.tps ?? [],
     ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct } : {}),
   }
+}
+
+/**
+ * ЦЕНА ВХОДА: У РЫНОЧНОГО ОРДЕРА — ЖИВАЯ, А НЕ ИЗ СИГНАЛА.
+ *
+ * Сигнал даёт диапазон входа («Диапазон входа: 0.8458-0.8245»), и раньше от его середины
+ * считалось ВСЁ: плечо (из авторского стопа), размер, цена ликвидации, запись в журнал. При этом
+ * ордер уходил рыночный — то есть реальный филл происходил по рынку, а математика оставалась на
+ * цене, которой на рынке уже нет. Расхождение затыкал гейт: рынок отошёл больше чем на 0.5% —
+ * skip('price_slippage').
+ *
+ * Заказчик 08.08.2026: «постоянно прибыльные сделки теряю из-за этого условия — когда немного
+ * выходим из диапазона, сделка скипается. Отключи пока проверку». Гейт стал опциональным
+ * (deps.maxEntrySlippagePct — задан числом, значит включён), а цена входа берётся живая: то же
+ * самое, что делает market_entry («с текущих»), только стоп и цели остаются авторскими.
+ *
+ * Следствия, которые важнее самого отключения:
+ *  - плечо считается от РЕАЛЬНОЙ дистанции до авторского стопа (рынок ближе к стопу — плечо выше,
+ *    но убыток по стопу по-прежнему ограничен маржой сделки: trade_size · lev · d ≤ trade_size);
+ *  - если рынок ушёл ЗА стоп, вход отсекут прежние гейты invalid_sl_side/unsafe_stop;
+ *  - цели, которые рынок уже прошёл, из лесенки выбрасываются (см. handleOpen), а если пройдены
+ *    все — вход не открывается вовсе (targets_passed).
+ *
+ * `getMarkPrice` не подключён (dry_run/бэктест — там нет сети) — остаёмся на цене сигнала, как и
+ * раньше. Подключён, но вернул null (сбой похода за ценой) — fail-CLOSED: торговая система не
+ * входит вслепую, если не знает текущую цену (фикс p3-slippage-fix, найден e2e).
+ */
+async function resolveEntryPrice(base: IntentBase, intent: OpenSpec): Promise<{ entryPrice: Decimal } | { skipReason: string }> {
+  // Лимитка стоит вне рынка по определению — её цену назначил автор, подменять нечем.
+  // market_entry («с текущих») уже пришёл с живым mark (specFromMarketEntry) — второй поход лишний.
+  if (!intent.priceFromSignal || intent.orderType !== 'market' || !base.deps.getMarkPrice) {
+    return { entryPrice: intent.entryPrice }
+  }
+
+  const currentMark = await base.deps.getMarkPrice(intent.symbol)
+  if (currentMark === null) return { skipReason: 'mark_price_unavailable' }
+  const mark = new Decimal(currentMark)
+  const driftPct = mark.minus(intent.entryPrice).abs().div(intent.entryPrice).mul(100)
+
+  const threshold = base.deps.maxEntrySlippagePct
+  if (threshold !== undefined && threshold !== '' && threshold !== 'off' && driftPct.gt(threshold)) {
+    // Гейт включён явно — прежнее поведение: сигнал считается протухшим, вход не открываем.
+    return { skipReason: 'price_slippage' }
+  }
+
+  if (driftPct.gt(ENTRY_DRIFT_LOG_PCT)) {
+    console.log(
+      `[pipeline] msg ${base.message.tgMessageId} ${intent.symbol}: вход по текущим — сигнальная цена ` +
+        `${intent.entryPrice.toString()}, рынок ${mark.toString()} (отклонение ${driftPct.toFixed(2)}%)`,
+    )
+  }
+  return { entryPrice: mark }
 }
 
 /**
@@ -1342,12 +1411,12 @@ async function handleOpen(
     await releaseStaleTrade(trx, base, verdict.tradeId, intent.symbol)
   }
 
-  // Вход диапазоном без живого тикер-фида (задача 10 — Ф1 его не подключает) — берём середину
-  // диапазона как цену симулированного market-филла (research: "entry для лимитки — цена
-  // лимитки, для market — текущая цена"; тот же 1.5004 для LIT 2796, что и в sizing.test.ts).
+  // Цена входа: у РЫНОЧНОГО ордера — живая, а не середина диапазона сигнала (см. resolveEntryPrice).
   // Decimal, а НЕ JS-float (Minor #3 адверсариального ревью, CLAUDE.md: "деньги — Decimal/строки")
   // — это единственная денежная величина ядра, которая считалась во float, до этого исправления.
-  const entryPrice = intent.entryPrice
+  const resolved = await resolveEntryPrice(base, intent)
+  if ('skipReason' in resolved) return resolved
+  const entryPrice = resolved.entryPrice
 
   // ── Стоп: авторский, либо наш защитный ───────────────────────────────────────────────────────
   //
@@ -1417,27 +1486,30 @@ async function handleOpen(
     intent.side === 'long' ? projectedLiq.mul(new Decimal(1).plus(buf)).lt(sl) : projectedLiq.mul(new Decimal(1).minus(buf)).gt(sl)
   if (!safeStop) return { skipReason: 'unsafe_stop' }
 
-  // Important I2 адверсариального ревью (p3-core-fix-report.md): вход всегда market по
-  // СИГНАЛЬНОЙ цене — риск/сайзинг ниже считаются от entryPrice, а реальный филл может быть
-  // далеко, если сигнал протух (staleness) или цена уже ушла (slippage). Гейт применяется ТОЛЬКО
-  // когда есть живой источник цены (live, deps.getMarkPrice подключён main.ts) — dry_run НЕ
-  // вызывает его вовсе (fail-open, dry_run не имеет и не должен иметь сетевого пути к бирже, см.
-  // PipelineDeps.equity выше). Фикс p3-slippage-fix (Important, найден e2e): если getMarkPrice
-  // ПОДКЛЮЧЁН, но сам вызов вернул null (сбой похода за ценой/пустой тикер, main.ts::
-  // createMarkPriceGetter) — гейт теперь fail-CLOSED (skip mark_price_unavailable), а НЕ
-  // fail-open, как было раньше. Раньше null тихо пропускал проверку отклонения — торговая
-  // система не должна входить вслепую, если не может достоверно узнать текущую цену.
-  //
-  // Гейт осмыслен ТОЛЬКО когда цена входа пришла из сигнала И вход рыночный:
-  //  - market_entry («с текущих»): цена = живой mark, отклонение ≡ 0 — проверять нечего;
-  //  - limit_entry («зайду от 76.3»): лимитка ПО ОПРЕДЕЛЕНИЮ стоит вне рынка — гейт зарубил бы
-  //    каждый такой вход, хотя автор осознанно назначил цену.
-  if (base.deps.getMarkPrice && intent.priceFromSignal && intent.orderType === 'market') {
-    const currentMark = await base.deps.getMarkPrice(intent.symbol)
-    if (currentMark === null) return { skipReason: 'mark_price_unavailable' }
-    const maxSlippagePct = new Decimal(base.deps.maxEntrySlippagePct ?? DEFAULT_MAX_ENTRY_SLIPPAGE_PCT)
-    const deviationPct = new Decimal(currentMark).minus(entryPrice).abs().div(entryPrice).mul(100)
-    if (deviationPct.gt(maxSlippagePct)) return { skipReason: 'price_slippage' }
+  // Цели, до которых рынок УЖЕ дошёл, в лесенку не ставим: reduceOnly-ордер по ту сторону цены
+  // входа — это обещание закрыться там, где закрываться уже поздно (для лонга цель ниже входа
+  // мгновенно исполнилась бы в убыток от входа, для шорта — выше). Раньше такие цели отсекались
+  // побочно, гейтом слиппеджа: он просто не пускал вход, если рынок ушёл. Гейт выключен —
+  // отсекаем прицельно, по каждой цели отдельно.
+  const liveTps = intent.tps
+    .map((price, index) => ({ price, index }))
+    .filter((tp) => (intent.side === 'long' ? new Decimal(tp.price).gt(entryPrice) : new Decimal(tp.price).lt(entryPrice)))
+  if (intent.tps.length > 0 && liveTps.length === 0) {
+    // Пройдены ВСЕ цели — движение, ради которого давался сигнал, уже случилось. Входить в него
+    // на излёте, имея из выходов только стоп, — не «немного опоздали», а другая сделка.
+    console.warn(
+      `[pipeline] msg ${base.message.tgMessageId} ${intent.symbol}: рынок ${entryPrice.toString()} прошёл ВСЕ цели ` +
+        `сигнала (${intent.tps.join(', ')}) — вход не открываем`,
+    )
+    return { skipReason: 'targets_passed' }
+  }
+  if (liveTps.length < intent.tps.length) {
+    const kept = new Set(liveTps.map((tp) => tp.index))
+    console.warn(
+      `[pipeline] msg ${base.message.tgMessageId} ${intent.symbol}: цели ` +
+        `${intent.tps.filter((_, i) => !kept.has(i)).join(', ')} уже пройдены рынком ${entryPrice.toString()} — ` +
+        `лесенка ставится на оставшиеся (${liveTps.map((tp) => tp.price).join(', ')})`,
+    )
   }
 
   const sizeResult = computeSize({
@@ -1512,8 +1584,8 @@ async function handleOpen(
     stopLoss: sl.toString(),
   })
 
-  if (intent.tps.length > 0) {
-    const tpTargets = buildTpTargets(sizeResult.qty, intent.tps, instrument.qtyStep)
+  if (liveTps.length > 0) {
+    const tpTargets = buildTpTargets(sizeResult.qty, liveTps, instrument.qtyStep)
     if (tpTargets.length > 0) {
       await base.deps.executionPort.placeTpLadder(trx, { ...orderCtx, tps: tpTargets })
     }

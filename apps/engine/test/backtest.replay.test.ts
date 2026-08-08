@@ -324,8 +324,13 @@ describe('replay — реплей CH1 в изолированной схеме',
     expect(report.executed).toBe(1) // LIT вошёл бы (copy принудительно включён, хотя в public off)
     expect(report.deltasExecuted).toBe(1) // дельта "первая цель есть" по LIT
     expect(report.skipped['symbol_not_listed']).toBe(1)
-    expect(report.skipped['price_slippage']).toBe(1)
-    expect(report.byGuard['price_slippage']).toBe(1)
+    // Сигнал 1005 (SOL) с ценой входа далеко от рынка раньше ловился гейтом слиппеджа. Гейт
+    // выключен (решение заказчика 08.08.2026), вход теперь считается по ЖИВОЙ цене — и тот же
+    // сигнал отсекается по существу: авторский стоп оказывается по ту сторону текущего рынка,
+    // то есть сделка уже не та, ради которой давался сигнал.
+    expect(report.skipped['price_slippage']).toBeUndefined()
+    expect(report.skipped['invalid_sl_side']).toBe(1)
+    expect(report.byGuard['invalid_sl_side']).toBe(1)
     expect(report.entriesGuarded).toBe(1)
 
     // Сигнал без стопа (1002) БОЛЬШЕ НЕ выбрасывается в skip(no_SL): regex не уверен → отдаём AI.

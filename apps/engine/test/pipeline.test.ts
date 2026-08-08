@@ -410,7 +410,7 @@ describe('pipeline — гейт staleness/slippage перед market-входо�
     expect(action.status).toBe('executed')
   })
 
-  it('mark 6% выше сигнальной цены (100 -> 106), порог 0.5% по умолчанию -> skip price_slippage, 0 ордеров', async () => {
+  it('mark 6% выше сигнальной цены (100 -> 106), гейт выключен по умолчанию -> вход ПО ЖИВОЙ цене', async () => {
     const channelId = nextChannelId++
     await seedChannel({ channelId, symbol: 'GGGUSDT' })
     const localDeps: PipelineDeps = {
@@ -425,6 +425,37 @@ describe('pipeline — гейт staleness/slippage перед market-входо�
     await processMessage(db, message, localDeps)
 
     const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('executed')
+
+    // Ключевое: и ордер, и средняя сделки считаются от 106 (рынок), а не от 100 (сигнал) —
+    // иначе журнал и риск-математика описывали бы цену, которой на рынке уже нет.
+    const entry = await db
+      .selectFrom('orders')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .where('purpose', '=', 'entry')
+      .executeTakeFirstOrThrow()
+    expect(new Decimal(entry.price!).toString()).toBe('106')
+    const trade = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    expect(new Decimal(trade.avg_entry!).toString()).toBe('106')
+  })
+
+  it('порог задан явно -> прежний гейт: 6% отклонение снова skip price_slippage, 0 ордеров', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'GG2USDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      aiEnabled: false,
+      getMarkPrice: async () => '106',
+      maxEntrySlippagePct: '0.5', // оператор вернул защиту от протухших сигналов
+    }
+    const text = '#GG2/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
+    const message = await insertMessage(channelId, 1, text)
+    await processMessage(db, message, localDeps)
+
+    const action = await actionFor(channelId, 1)
     expect(action.status).toBe('skipped')
     expect(action.skip_reason).toBe('price_slippage')
 
@@ -434,7 +465,7 @@ describe('pipeline — гейт staleness/slippage перед market-входо�
     expect(orders).toHaveLength(0)
   })
 
-  it('mark 0.2% выше сигнальной цены (100 -> 100.2), в пределах порога 0.5% -> входит как обычно', async () => {
+  it('mark 0.2% выше сигнальной цены (100 -> 100.2) -> входит по 100.2, а не по 100', async () => {
     const channelId = nextChannelId++
     await seedChannel({ channelId, symbol: 'HHHUSDT' })
     const localDeps: PipelineDeps = {
@@ -453,6 +484,7 @@ describe('pipeline — гейт staleness/slippage перед market-входо�
 
     const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
     expect(trades).toHaveLength(1)
+    expect(new Decimal(trades[0]!.avg_entry!).toString()).toBe('100.2')
   })
 
   it('кастомный порог maxEntrySlippagePct — 6% отклонение проходит, если порог поднят до 10%', async () => {
@@ -472,6 +504,61 @@ describe('pipeline — гейт staleness/slippage перед market-входо�
 
     const action = await actionFor(channelId, 1)
     expect(action.status).toBe('executed')
+  })
+
+  // Гейт слиппеджа заодно защищал от протухшего сигнала: рынок ушёл — вход не открывался. Теперь
+  // вход открывается по живой цене, поэтому защиту несут САМИ ЦЕЛИ: то, до чего рынок уже дошёл,
+  // ставить reduceOnly-ордером бессмысленно.
+  it('часть целей уже пройдена рынком -> лесенка только на оставшиеся, номера ступеней сохраняются', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'PPPUSDT', qtyStep: '0.001' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      aiEnabled: false,
+      getMarkPrice: async () => '104', // рынок уже выше первой цели (103), но ниже второй (106)
+    }
+    const text = '#PPP/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\n\nTP: 103$ - 106$\n\nSL: 90$\n\nРиск: 1%'
+    await processMessage(db, await insertMessage(channelId, 1, text), localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('executed')
+
+    const tps = await db
+      .selectFrom('orders')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .where('purpose', '=', 'tp')
+      .execute()
+    expect(tps).toHaveLength(1)
+    expect(new Decimal(tps[0]!.price!).toString()).toBe('106')
+    // Номер ступени — ИСХОДНЫЙ (вторая цель сигнала), иначе «вторую цель» автора мы применили бы
+    // к чужой ступени лесенки.
+    expect(tps[0]!.tp_index).toBe(1)
+  })
+
+  it('рынок прошёл ВСЕ цели сигнала -> вход не открывается (targets_passed)', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'QQQUSDT' })
+    const localDeps: PipelineDeps = {
+      executionPort: createExecutionPort('dry_run'),
+      network: 'testnet',
+      equity: '1000',
+      aiEnabled: false,
+      getMarkPrice: async () => '107', // выше обеих целей: движение сигнала уже отработано
+    }
+    const text = '#QQQ/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\n\nTP: 103$ - 106$\n\nSL: 90$\n\nРиск: 1%'
+    await processMessage(db, await insertMessage(channelId, 1, text), localDeps)
+
+    const action = await actionFor(channelId, 1)
+    expect(action.status).toBe('skipped')
+    expect(action.skip_reason).toBe('targets_passed')
+
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades).toHaveLength(0)
+    const orders = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).execute()
+    expect(orders).toHaveLength(0)
   })
 
   it('getMarkPrice возвращает null (сбой похода за ценой/тикер недоступен) -> гейт fail-CLOSED, skip mark_price_unavailable', async () => {
@@ -509,7 +596,7 @@ describe('pipeline — createMarkPriceGetter(main.ts) + гейт I2, сквоз�
     return { getTicker: impl }
   }
 
-  it('getTicker -> markPrice=106 при сигнале entry=100 (6% отклонение) -> skip price_slippage', async () => {
+  it('getTicker -> markPrice=106 при сигнале entry=100 (6% отклонение), гейт включён порогом -> skip price_slippage', async () => {
     const channelId = nextChannelId++
     await seedChannel({ channelId, symbol: 'KKKUSDT' })
     const localDeps: PipelineDeps = {
@@ -518,6 +605,7 @@ describe('pipeline — createMarkPriceGetter(main.ts) + гейт I2, сквоз�
       equity: '1000',
       aiEnabled: false,
       getMarkPrice: createMarkPriceGetter(mockRest(async () => ({ markPrice: '106', lastPrice: '106' }))),
+      maxEntrySlippagePct: '0.5',
     }
     const text = '#KKK/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%'
     const message = await insertMessage(channelId, 1, text)
