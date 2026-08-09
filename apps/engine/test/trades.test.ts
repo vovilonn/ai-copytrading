@@ -3,7 +3,9 @@ import { Kysely, sql } from 'kysely'
 import { resetTestSchema } from 'test-db'
 import { createDb, type DB } from 'api/db/database.js'
 import { migrateToLatest } from 'api/db/migrate.js'
+import { Decimal } from 'decimal.js'
 import { acquireSymbol, releaseSymbol, openTrade, addLeg, closeTrade, computeIsWin } from '../src/state/trades.js'
+import { recalcTradeMoney } from '../src/state/recalc-trade.js'
 
 let db: Kysely<DB>
 
@@ -241,5 +243,65 @@ describe('computeIsWin', () => {
   it('ровно ноль -> null (исход неизвестен: безубыток либо dry-run без расчёта PnL)', () => {
     expect(computeIsWin('0')).toBeNull()
     expect(computeIsWin('0.0000000000')).toBeNull()
+  })
+})
+
+// Живой счёт 10.08.2026: журнал показывал realized +17.05, биржа по тем же сделкам — closedPnl
+// +8.63, а депозит вырос примерно на 6. Разница ровно в комиссиях (8.38): агрегат сделки хранил
+// БРУТТО, а вычитал комиссию из него никто — ни PnL-карточки, ни таблица закрытых, ни winRate.
+describe('recalcTradeMoney — realized_pnl НЕТТО (за вычетом комиссий и фандинга)', () => {
+  async function seedTradeWithExecutions(
+    fills: Array<{ pnl: string; fee: string; closedSize?: string }>,
+  ): Promise<string> {
+    const trade = await openTrade(db, { channelId: 1, symbol: 'SOLUSDT', side: 'long', status: 'closed' })
+    for (const [i, fill] of fills.entries()) {
+      await sql`
+        INSERT INTO executions (trade_id, bybit_exec_id, symbol, side, exec_qty, exec_price, exec_fee, exec_pnl, closed_size, exec_ts, source)
+        VALUES (${trade.tradeId}::uuid, ${`exec-${trade.seq}-${i}`}, 'SOLUSDT', 'short', 1, 100,
+                ${fill.fee}::numeric, ${fill.pnl}::numeric, ${fill.closedSize ?? '1'}::numeric, now(), 'ws')
+      `.execute(db)
+    }
+    return trade.tradeId
+  }
+
+  it('комиссия вычитается: брутто 12.5 при комиссии 0.05 -> realized 12.45, fees_paid 0.05', async () => {
+    const tradeId = await seedTradeWithExecutions([{ pnl: '12.5', fee: '0.05' }])
+
+    const result = await recalcTradeMoney(db, tradeId)
+
+    expect(new Decimal(result!.realizedPnl).toString()).toBe('12.45')
+    expect(new Decimal(result!.feesPaid).toString()).toBe('0.05')
+    // Брутто не потеряно — восстанавливается сложением.
+    expect(new Decimal(result!.realizedPnl).plus(result!.feesPaid).toString()).toBe('12.5')
+  })
+
+  it('несколько филлов: вычитается СУММА комиссий, а не последняя', async () => {
+    const tradeId = await seedTradeWithExecutions([
+      { pnl: '3', fee: '0.02' },
+      { pnl: '2', fee: '0.03' },
+      { pnl: '-1', fee: '0.01' },
+    ])
+
+    const result = await recalcTradeMoney(db, tradeId)
+
+    expect(new Decimal(result!.realizedPnl).toString()).toBe('3.94') // 4 − 0.06
+    expect(new Decimal(result!.feesPaid).toString()).toBe('0.06')
+  })
+
+  it('сделка «в плюс» до комиссий, но в минус после -> is_win=false', async () => {
+    const tradeId = await seedTradeWithExecutions([{ pnl: '0.1', fee: '0.5' }])
+
+    const result = await recalcTradeMoney(db, tradeId)
+
+    expect(new Decimal(result!.realizedPnl).toString()).toBe('-0.4')
+    expect(result!.isWin).toBe(false) // раньше такая сделка считалась выигранной
+  })
+
+  it('фандинг (комиссия без торгового PnL) уменьшает результат сделки', async () => {
+    const tradeId = await seedTradeWithExecutions([{ pnl: '0', fee: '0.01', closedSize: '0' }])
+
+    const result = await recalcTradeMoney(db, tradeId)
+
+    expect(new Decimal(result!.realizedPnl).toString()).toBe('-0.01')
   })
 })

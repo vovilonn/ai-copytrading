@@ -573,7 +573,8 @@ describe('applyExecutionPush', () => {
     expect(execRow.closed_size).toBe('50.0000000000')
 
     const tradeAfterFirst = await db.selectFrom('trades').select('realized_pnl').where('id', '=', tradeId).executeTakeFirstOrThrow()
-    expect(tradeAfterFirst.realized_pnl).toBe('12.5000000000')
+    // НЕТТО: брутто-филл 12.5 минус комиссия 0.05 — ровно то, на что изменился баланс.
+    expect(tradeAfterFirst.realized_pnl).toBe('12.4500000000')
 
     // Повтор того же bybit_exec_id (реконнект/редоставка) — идемпотентно, не дублирует и не задваивает PnL.
     const second = await applyExecutionPush(db, push)
@@ -587,7 +588,7 @@ describe('applyExecutionPush', () => {
     expect(Number(countAfterSecond.n)).toBe(1)
 
     const tradeAfterSecond = await db.selectFrom('trades').select('realized_pnl').where('id', '=', tradeId).executeTakeFirstOrThrow()
-    expect(tradeAfterSecond.realized_pnl).toBe('12.5000000000')
+    expect(tradeAfterSecond.realized_pnl).toBe('12.4500000000')
   })
 })
 

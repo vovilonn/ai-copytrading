@@ -235,8 +235,9 @@ describe('догон истории: РУЧНЫЕ действия операт�
     expect(exec.source).toBe('rest')
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', tradeId).executeTakeFirstOrThrow()
-    // gross = closedPnl + openFee + closeFee = 1 + 0.004 + 0.0043 (в БД хранится БРУТТО)
-    expect(new Decimal(trade.realized_pnl).toFixed(4)).toBe('1.0083')
+    // executions хранят БРУТТО (gross = closedPnl + openFee + closeFee = 1 + 0.004 + 0.0043),
+    // а агрегат сделки — НЕТТО: брутто минус учтённая нами комиссия закрытия (0.0043).
+    expect(new Decimal(trade.realized_pnl).toFixed(4)).toBe('1.0040')
     expect(new Decimal(trade.fees_paid).toString()).toBe('0.0043') // писателя у этого поля не было вовсе
     expect(trade.status).toBe('closed')
     expect(trade.is_win).toBe(true)
@@ -350,7 +351,7 @@ describe('догон истории: РУЧНЫЕ действия операт�
     expect(exec.trade_id).toBe(tradeId) // ← иначе сделка закрылась бы по стопу с PnL = 0
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', tradeId).executeTakeFirstOrThrow()
-    expect(new Decimal(trade.realized_pnl).toFixed(3)).toBe('-1.990') // gross = -2 + 0.005 + 0.005
+    expect(new Decimal(trade.realized_pnl).toFixed(3)).toBe('-1.995') // брутто -1.990 минус комиссия 0.005
     expect(trade.is_win).toBe(false)
   })
 })
@@ -438,8 +439,10 @@ describe('догон истории: идемпотентность и стат�
     await reconcileOnStart(db, rest)
 
     const trade = await db.selectFrom('trades').selectAll().where('id', '=', tradeId).executeTakeFirstOrThrow()
-    // Комиссия фандинга учтена, но PnL от него не появился.
+    // Размер и средняя цена от фандинга не двигаются — торгового исполнения не было. Но деньги он
+    // с баланса снял, поэтому в НЕТТО-результате сделки он обязан быть виден: fees_paid=0.01 и
+    // realized_pnl=-0.01. Раньше PnL сделки оставался нулём, хотя баланс уменьшился.
     expect(new Decimal(trade.fees_paid).toString()).toBe('0.01')
-    expect(new Decimal(trade.realized_pnl).isZero()).toBe(true)
+    expect(new Decimal(trade.realized_pnl).toString()).toBe('-0.01')
   })
 })
