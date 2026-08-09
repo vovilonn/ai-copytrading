@@ -214,6 +214,33 @@ beforeAll(async () => {
     ])
     .execute()
 
+  // Деньги, которые прежний фильтр status='closed' терял: комиссия входа по ОТКРЫТОЙ сделке
+  // (биржа списала её уже сейчас) и результат ЧАСТИЧНО закрытой (статус не подходил под фильтр).
+  await db
+    .insertInto('trades')
+    .values({
+      human_ref: 'TR-9105',
+      seq: 9105,
+      channel_id: CHANNEL_A_ID,
+      symbol: 'ARBUSDT',
+      side: 'long',
+      status: 'open',
+      realized_pnl: '-0.25', // комиссия входа
+    })
+    .execute()
+  await db
+    .insertInto('trades')
+    .values({
+      human_ref: 'TR-9106',
+      seq: 9106,
+      channel_id: CHANNEL_B_ID,
+      symbol: 'INJUSDT',
+      side: 'long',
+      status: 'partially_closed',
+      realized_pnl: '20.00', // зафиксированная часть
+    })
+    .execute()
+
   // --- Task 2: закрытые/отменённые сделки для /history, расширенной stats и by-channel ---
   const seedMsg = await db
     .insertInto('messages')
@@ -631,13 +658,15 @@ describe('GET /api/positions/stats', () => {
     expect(stats.marginUsed).toBe('$4,760')
   })
 
-  it('realizedPnl = SUM(realized closed), totalPnl = unrealised(open) + realized', async () => {
+  it('realizedPnl = SUM(realized) по ВСЕМ сделкам, totalPnl = unrealised(open) + realized', async () => {
     const res = await agent.get('/api/positions/stats').expect(200)
     const stats = res.body as PositionStatsDto
-    // closed: TR-9103(0) + TR-7001(150.50) + TR-7002(-40.25) = 110.25; cancelled TR-7003 не в сумме.
-    expect(stats.realizedPnl).toBe('+$110.25')
-    // 500 (unrealised open) + 110.25 (realized) = 610.25.
-    expect(stats.totalPnl).toBe('+$610.25')
+    // TR-7001(150.50) + TR-7002(-40.25) + TR-9105(-0.25, комиссия входа по ОТКРЫТОЙ сделке)
+    // + TR-9106(20.00, ЧАСТИЧНО закрытая) = 130.00. Первые два слагаемых учитывались и раньше,
+    // два последних фильтр status='closed' выбрасывал, хотя деньги уже двинулись.
+    expect(stats.realizedPnl).toBe('+$130.00')
+    // 500 (unrealised open) + 130.00 (realized) = 630.00 — ровно изменение депозита.
+    expect(stats.totalPnl).toBe('+$630.00')
   })
 })
 
@@ -654,14 +683,14 @@ describe('GET /api/positions/stats/by-channel', () => {
     const a = rows.find((r) => r.channelId === CHANNEL_A_ID)!
     expect(a.openPositions).toBe(2) // BTC + ETH открыты
     expect(a.unrealisedPnl).toBe('+$500.00')
-    expect(a.realizedPnl).toBe('+$110.25') // TR-7001 + TR-7002
-    expect(a.totalPnl).toBe('+$610.25')
+    expect(a.realizedPnl).toBe('+$110.00') // TR-7001 + TR-7002 + комиссия открытой TR-9105
+    expect(a.totalPnl).toBe('+$610.00')
     expect(a.winRate).toBe('50%') // 1 win / 2 decided (TR-7001 win, TR-7002 loss)
 
     const b = rows.find((r) => r.channelId === CHANNEL_B_ID)!
     expect(b.openPositions).toBe(1) // XRP (SOL size=0 не в счёте)
     expect(b.unrealisedPnl).toBe('+$0.00')
-    expect(b.realizedPnl).toBe('+$0.00') // TR-9103 closed realized 0
+    expect(b.realizedPnl).toBe('+$20.00') // TR-9103 closed (0) + TR-9106 частично закрытая (20)
     expect(b.winRate).toBe('—') // is_win null -> исход неизвестен
   })
 })

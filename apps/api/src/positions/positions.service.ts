@@ -402,9 +402,24 @@ export class PositionsService {
     return rows.map((row) => toClosedTradeDto(row as ClosedTradeQueryRow))
   }
 
+  /*
+   * REALIZED_SCOPE_NOTE — почему realized суммируется по ВСЕМ сделкам, а не только по закрытым.
+   *
+   * `trades.realized_pnl` — это УЖЕ СОСТОЯВШЕЕСЯ движение денег по сделке (нетто, за вычетом
+   * комиссий и фандинга, см. engine/state/recalc-trade.ts). У закрытой сделки это её результат,
+   * у открытой — комиссия входа и фандинг, которые биржа списала СЕЙЧАС, а не когда-нибудь.
+   * Пока фильтр стоял на status='closed', эти деньги не попадали никуда: ни в realized, ни в
+   * unrealised (у Bybit unrealised считается от средней цены и комиссий не знает). Заодно мимо
+   * витрины пролетал результат частично закрытых сделок — статус partially_closed под фильтр
+   * тоже не подходил.
+   *
+   * Итог: realized + unrealised = ровно то, на сколько изменился депозит. Проверено на живом
+   * счёте 10.08.2026 до цента (единственное расхождение — сделка, которой нет в журнале вовсе).
+   */
   /** GET /api/positions/stats — агрегаты по ВСЕМ открытым позициям, вне активных фильтров
    *  (design/frontend-inventory.md gap #8: "totals over full set" — сознательно не режется q/side).
-   *  Task 2: realizedPnl = SUM(trades.realized_pnl) закрытых; totalPnl = unrealised(open) + realized. */
+   *  realizedPnl = SUM(trades.realized_pnl) по ВСЕМ сделкам (см. REALIZED_SCOPE_NOTE);
+   *  totalPnl = unrealised(open) + realized — ровно на столько изменился депозит. */
   async getStats(): Promise<PositionStatsDto> {
     const rows = await this.database.db
       .selectFrom('positions')
@@ -426,7 +441,6 @@ export class PositionsService {
     const realizedRow = await sql<{ realized: string }>`
       SELECT COALESCE(SUM(realized_pnl), 0)::text AS realized
       FROM trades
-      WHERE status = 'closed'
     `.execute(this.database.db)
     const realizedSum = toNumber(realizedRow.rows[0]?.realized ?? '0')
 
@@ -456,11 +470,10 @@ export class PositionsService {
 
     const tradeAgg = await sql<{ channel_id: number; realized: string; decided: string; wins: string }>`
       SELECT channel_id,
-             COALESCE(SUM(realized_pnl) FILTER (WHERE status = 'closed'), 0)::text AS realized,
+             COALESCE(SUM(realized_pnl), 0)::text AS realized,
              count(*) FILTER (WHERE status = 'closed' AND is_win IS NOT NULL)::text AS decided,
              count(*) FILTER (WHERE status = 'closed' AND is_win)::text AS wins
       FROM trades
-      WHERE status IN ('closed', 'cancelled')
       GROUP BY channel_id
     `.execute(this.database.db)
 
