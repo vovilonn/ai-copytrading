@@ -274,6 +274,40 @@ describe('buildContext — reply-parent текст', () => {
     const built = await buildContext(db, { id: messageId, channelId: CHANNEL_ID, replyToMsgId: null })
     expect(built.replyParentText).toBeUndefined()
   })
+
+  // Живой случай 09.08.2026: «Sol 1🎯» <- «2🎯» <- «3🎯». Символ назван ОДИН раз, в корне ветки, и
+  // на втором хопе прежний контекст (ровно один родитель) его терял — тейк по солане ушёл на биток.
+  it('цепочка терсных реплик: предки выше родителя доезжают до модели, символ ветки вычисляется', async () => {
+    const root = await seedMessage({ text: 'Sol 1🎯\nNext - 75.7, 77.2' })
+    const middle = await seedMessage({ text: '2🎯', replyToMsgId: root.tgMessageId })
+    const last = await seedMessage({ text: '3🎯', replyToMsgId: middle.tgMessageId })
+
+    const built = await buildContext(db, { id: last.messageId, channelId: CHANNEL_ID, replyToMsgId: middle.tgMessageId })
+
+    expect(built.replyParentText).toBe('2🎯')
+    expect(built.replyChain).toEqual(['Sol 1🎯\nNext - 75.7, 77.2'])
+    expect(built.replyChainSymbol).toBe('SOLUSDT')
+  })
+
+  it('ближайший предок с символами называет их НЕСКОЛЬКО -> подсказки нет (не гадаем)', async () => {
+    const root = await seedMessage({ text: 'Sl btc 60000, Sl Eth 1800' })
+    const child = await seedMessage({ text: '2🎯', replyToMsgId: root.tgMessageId })
+
+    const built = await buildContext(db, { id: child.messageId, channelId: CHANNEL_ID, replyToMsgId: root.tgMessageId })
+
+    expect(built.replyChainSymbol).toBeUndefined()
+    expect(built.replyParentText).toBe('Sl btc 60000, Sl Eth 1800')
+  })
+
+  it('цикл в данных (сообщение отвечает само себе) не вешает сборку контекста', async () => {
+    const { messageId, tgMessageId } = await seedMessage({ text: '3🎯' })
+    await db.updateTable('messages').set({ reply_to_msg_id: tgMessageId }).where('id', '=', messageId).execute()
+
+    const built = await buildContext(db, { id: messageId, channelId: CHANNEL_ID, replyToMsgId: tgMessageId })
+
+    expect(built.replyParentText).toBe('3🎯')
+    expect(built.replyChain).toBeUndefined()
+  })
 })
 
 describe('buildContext — картинки message_media', () => {

@@ -39,23 +39,54 @@ export function parseCh2(ctx: ParseContext): ParsedResult {
 const CLEAN_HASHTAG_RE = /#([a-zA-Z]{2,10})usdt/i
 
 /**
- * Резолвит символ из произвольного фрагмента текста: сначала чистый хэштег `#TICKERUSDT`
- * (структурный сигнал), иначе первое резолвящееся коин-слово (`extractCoins`). Используется
- * для reply-parent lookup в D — задача 2 Ф1 предупреждает: резолв ВСЕГО "#SOLUSDT" через
- * ctx.resolveSymbol даёт "SOLUSDTUSDT" (слитный хэштег), поэтому здесь, как и в A, в резолвер
- * идёт ТОЛЬКО чистая группа тикера (`SOL`), а не весь хэштег с суффиксом.
+ * Символ из ЦЕПОЧКИ реплаев: поднимаемся от прямого родителя вверх, пока не встретим сообщение,
+ * где символ вообще называется.
+ *
+ * Одного хопа не хватает: автор ведёт позицию цепочкой терсных реплик («Sol 1🎯» ← «2🎯» ← «3🎯»),
+ * и символ назван только в корне ветки. Живой случай 09.08.2026 — «3🎯» в ответ на «2🎯»:
+ * прямой родитель символа не содержит, и тейк по солане уехал на биток.
+ *
+ * НЕОДНОЗНАЧНОСТЬ ОСТАНАВЛИВАЕТ ПОИСК. Если ближайший предок, где символы есть, называет их
+ * НЕСКОЛЬКО («Sl btc, Sl Eth»), угадывать нельзя — и лезть выше тоже: более дальний предок к
+ * этой реплике относится слабее, чем тот, в который автор целился. Возвращаем null (дальше
+ * сработает фолбэк route ai — модель видит всю ветку и картинки).
  */
-function resolveSymbolFromText(text: string, ctx: ParseContext): string | null {
+const REPLY_CHAIN_MAX_HOPS = 6
+
+function resolveSymbolFromReplyChain(ctx: ParseContext): string | null {
+  const seen = new Set<number>()
+  let currentId = ctx.message.replyToMsgId
+  for (let hop = 0; currentId !== null && hop < REPLY_CHAIN_MAX_HOPS; hop++) {
+    if (seen.has(currentId)) return null // цикл в данных
+    seen.add(currentId)
+    const parent = ctx.getMessage(currentId)
+    if (parent === null) return null
+    const symbols = symbolsInText(parent.text, ctx)
+    if (symbols.length === 1) return symbols[0]!
+    if (symbols.length > 1) return null // неоднозначно — не гадаем
+    currentId = parent.replyToMsgId
+  }
+  return null
+}
+
+/**
+ * Все РАЗНЫЕ торгуемые символы, названные в тексте: чистый хэштег `#TICKERUSDT` (структурный
+ * сигнал) плюс коин-слова. Задача 2 Ф1 предупреждает: резолв ВСЕГО "#SOLUSDT" через
+ * ctx.resolveSymbol даёт "SOLUSDTUSDT" (слитный хэштег), поэтому в резолвер идёт ТОЛЬКО чистая
+ * группа тикера (`SOL`), а не весь хэштег с суффиксом.
+ */
+function symbolsInText(text: string, ctx: ParseContext): string[] {
+  const found = new Set<string>()
   const hashtagMatch = CLEAN_HASHTAG_RE.exec(text)
   if (hashtagMatch) {
-    const symbol = ctx.resolveSymbol(hashtagMatch[1]!) // группа обязательная — иначе regex не матчит
-    if (symbol !== null && ctx.isListed(symbol)) return symbol
+    const symbol = ctx.resolveSymbol(hashtagMatch[1]!)
+    if (symbol !== null && ctx.isListed(symbol)) found.add(symbol)
   }
   for (const coin of extractCoins(text)) {
     const symbol = ctx.resolveSymbol(coin)
-    if (symbol !== null && ctx.isListed(symbol)) return symbol
+    if (symbol !== null && ctx.isListed(symbol)) found.add(symbol)
   }
-  return null
+  return [...found]
 }
 
 /**
@@ -466,13 +497,11 @@ function tryDeltaSl(text: string, ctx: ParseContext): ParsedResult | null {
   }
 
   if (intents.length === 0) {
-    // Ни одна sl/стоп-строка не дала символ напрямую — единственный хоп по reply-родителю
+    // Ни одна sl/стоп-строка не дала символ напрямую — идём вверх по ЦЕПОЧКЕ реплаев
     // (research §7: приоритет reply → state → coin-в-тексте; в CH2 у 84% reply бесполезен,
-    // но когда родитель разрешается (пример 221445 → reply 221443, структурный #SOLUSDT-сигнал),
+    // но когда ветка разрешается (пример 221445 → reply 221443, структурный #SOLUSDT-сигнал),
     // это лучше, чем гадать по случайному коин-слову в другой строке).
-    const replyId = ctx.message.replyToMsgId
-    const parent = replyId !== null ? ctx.getMessage(replyId) : null
-    const parentSymbol = parent !== null ? resolveSymbolFromText(parent.text, ctx) : null
+    const parentSymbol = resolveSymbolFromReplyChain(ctx)
     const anchorLine = gateLines[0]
     if (parentSymbol !== null && anchorLine !== undefined) {
       const op = extractSlOpFromLine(anchorLine)

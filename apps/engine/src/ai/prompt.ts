@@ -40,7 +40,9 @@ MULTI-SYMBOL: one message may manage several symbols ("🔄 Менеджмент
 
 IMAGES ARE MANDATORY CONTEXT. Terse messages ("2🎯","Первые цели","Скинул один объем","Фиксану вместо первой") carry the symbol/side/price ONLY in the attached image (WEEX result card: symbol, Лонг/Шорт, leverage 10x, Цена входа, Цена маркировки; or a TradingView chart with the ticker top-left). Read the image to resolve symbol/side; set image_used=true and evidence_source="image"/"both". If symbol is still unresolved, symbol="UNKNOWN" and needs_human=true.
 
-CONTEXT PROVIDED: the message text, its timestamp, the parent message it replies to (if any), and the channel's currently OPEN positions (to resolve which symbol a symbol-less delta refers to). Prefer an explicit symbol in text/image; else use the reply parent; else the open-positions list; else UNKNOWN.
+CONTEXT PROVIDED: the message text, its timestamp, the REPLY THREAD it belongs to (parent, then further ancestors, nearest first), and the channel's currently OPEN positions (to resolve which symbol a symbol-less delta refers to). Resolve the symbol in this order: an explicit symbol in text/image; else [reply_thread_symbol] when given (the engine read it off the thread deterministically — do not override it with a guess from OPEN_POSITIONS); else the reply thread texts, nearest ancestor first; else the open-positions list; else UNKNOWN.
+
+REPLY THREADS ARE CHAINS. The trader runs a position as a chain of terse replies, each answering the previous one ("Sol 1🎯" <- "2🎯" <- "3🎯"): the symbol is stated ONCE, at the root of the thread, and every later reply inherits it. Never fall back to "the most recent/most prominent open position" while an ancestor in the thread names a symbol — that is how a SOL take-profit gets applied to a BTC position.
 
 SIDE: 📈/LONG/Лонг=long, 📉/SHORT/Шорт=short. Trader here is long-biased; a bare "фикс/стоп" on an open long => side=long.
 
@@ -81,6 +83,10 @@ export interface BuildUserTurnParams {
   tMsg: string
   /** Текст родительского сообщения по reply, если есть. */
   replyParentText?: string
+  /** Тексты предков ВЫШЕ родителя, ближайший первым (ветка терсных реплик). */
+  replyChain?: string[]
+  /** Символ, вычитанный из ветки самим движком (детерминированно) — сильная подсказка модели. */
+  replyChainSymbol?: string
   openPositions: OpenPositionSummary[]
   images: PromptImage[]
 }
@@ -124,6 +130,15 @@ export function buildUserTurn(params: BuildUserTurnParams): AnthropicContentBloc
   const contextLines: string[] = [`t_msg=${params.tMsg}`]
   if (params.replyParentText !== undefined) {
     contextLines.push(`[reply_to]: ${params.replyParentText}`)
+  }
+  // Ветка выше родителя — ближайший предок первым: символ терсной реплики живёт в корне ветки.
+  if (params.replyChain !== undefined && params.replyChain.length > 0) {
+    params.replyChain.forEach((text, index) => {
+      contextLines.push(`[reply_thread +${index + 2}]: ${text}`)
+    })
+  }
+  if (params.replyChainSymbol !== undefined) {
+    contextLines.push(`[reply_thread_symbol]: ${params.replyChainSymbol}`)
   }
   const openPositionsJson = JSON.stringify(params.openPositions.map(serializeOpenPosition))
   contextLines.push(`OPEN_POSITIONS: ${openPositionsJson}`)

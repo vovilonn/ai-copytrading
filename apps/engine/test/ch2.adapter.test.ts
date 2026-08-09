@@ -584,3 +584,66 @@ describe('ch2.adapter — рыночный вход и лимитки в ОДН�
     expect(result.intents).toHaveLength(3)
   })
 })
+
+// Живой случай 09.08.2026 (msg 221572, канал AACADEMY): автор ведёт позицию цепочкой терсных
+// реплик — «Sol 1🎯» ← «2🎯» ← «3🎯». Символ назван ОДИН раз, в корне ветки. Контекст знал ровно
+// одного родителя, и на втором хопе символ терялся: тейк по солане уехал на биток.
+describe('ch2.adapter — символ берётся из ЦЕПОЧКИ реплаев, а не только у прямого родителя', () => {
+  /** @param chain сообщения ветки: ключ — tg id, значение — [текст, id родителя]. */
+  function ctxWithChain(text: string, replyToMsgId: number | null, chain: Record<number, [string, number | null]>): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 999, text, date: '2026-08-09T15:43:00Z', replyToMsgId, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: (id: number) => {
+        const found = chain[id]
+        if (!found) return null
+        return { id, text: found[0], date: '2026-08-09T00:00:00Z', replyToMsgId: found[1], groupedId: null, media: null, mediaFile: null }
+      },
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('символ найден через ДВА хопа вверх по ветке', () => {
+    const result = parseCh2(
+      ctxWithChain('Стоп в бу', 221570, {
+        221570: ['2🎯', 221569],
+        221569: ['Sol 1🎯\nNext - 75.7, 77.2', 221564],
+      }),
+    )
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toHaveLength(1)
+    expect(result.intents[0]).toMatchObject({ kind: 'delta', symbol: 'SOLUSDT', ops: [{ op: 'sl_breakeven' }] })
+  })
+
+  it('ближайший предок с символами называет их НЕСКОЛЬКО -> не гадаем, отдаём в AI', () => {
+    const result = parseCh2(
+      ctxWithChain('Стоп в бу', 100, {
+        100: ['Sl btc 60000\nSl Eth 1800', 99],
+        99: ['Sol long с текущих', null],
+      }),
+    )
+
+    expect(result.route).toBe('ai')
+    expect(result.intents).toHaveLength(0)
+  })
+
+  it('ветка глубже лимита хопов -> символ не выдумывается', () => {
+    const chain: Record<number, [string, number | null]> = {}
+    for (let i = 0; i < 8; i++) chain[200 + i] = ['🎯', 200 + i + 1]
+    chain[208] = ['Sol 1🎯', null]
+
+    const result = parseCh2(ctxWithChain('Стоп в бу', 200, chain))
+
+    expect(result.route).toBe('ai')
+  })
+
+  it('цикл в ветке (сообщение отвечает само себе) не зацикливает разбор', () => {
+    const result = parseCh2(ctxWithChain('Стоп в бу', 300, { 300: ['2🎯', 300] }))
+
+    expect(result.route).toBe('ai')
+  })
+})

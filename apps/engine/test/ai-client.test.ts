@@ -115,6 +115,26 @@ describe('buildUserTurn (сборка промпта)', () => {
     expect(ctx && ctx.type === 'text' && ctx.text).toContain('"sl":"BE"')
     expect(ctx && ctx.type === 'text' && ctx.text).toContain('Стоп на твх')
   })
+
+  // Ветка терсных реплик («Sol 1🎯» <- «2🎯» <- «3🎯»): символ назван в корне, поэтому модель
+  // должна видеть предков выше родителя и готовую подсказку движка (живой случай 09.08.2026).
+  it('ветка реплаев и вычисленный символ ветки доезжают до модели', () => {
+    const blocks = buildUserTurn({
+      text: '3🎯',
+      tMsg: '2026-08-09T15:43:59.000Z',
+      replyParentText: '2🎯',
+      replyChain: ['Sol 1🎯\nNext - 75.7, 77.2', '#SOLUSDT Long'],
+      replyChainSymbol: 'SOLUSDT',
+      openPositions: [{ sym: 'BTCUSDT', side: 'long', legs: 0, avgEntry: 64868, sl: 63200, tpsLeft: [65800, 66800, 67800] }],
+      images: [],
+    })
+    const ctx = blocks.find((b) => b.type === 'text' && b.text.includes('MESSAGE TEXT:'))
+    const text = ctx && ctx.type === 'text' ? ctx.text : ''
+    expect(text).toContain('[reply_to]: 2🎯')
+    expect(text).toContain('[reply_thread +2]: Sol 1🎯')
+    expect(text).toContain('[reply_thread +3]: #SOLUSDT Long')
+    expect(text).toContain('[reply_thread_symbol]: SOLUSDT')
+  })
 })
 
 describeLive('callExtractSignal (живой ai-proxy) — требует AI_LIVE_TESTS=1', () => {

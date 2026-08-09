@@ -10,6 +10,7 @@ import { Decimal } from 'decimal.js'
 import { sql, type Kysely } from 'kysely'
 import type { DB } from 'api/db/database.js'
 import { resolveMediaRoot } from 'api/config/config.schema.js'
+import { extractCoins, resolveSymbol } from '../symbol-resolver.js'
 import { serializeOpenPosition, type OpenPositionSummary, type PromptImage } from './prompt.js'
 
 // message_media.storage_path хранится ОТНОСИТЕЛЬНЫМ ('var/media/<key>/<file>'), а корень на диске
@@ -36,6 +37,13 @@ export interface BuildContextMessage {
 export interface BuiltAiContext {
   openPositions: OpenPositionSummary[]
   replyParentText?: string
+  /**
+   * Тексты ПРЕДКОВ выше прямого родителя, ближайший первым (см. loadReplyChain). Нужны там же,
+   * где и родитель: символ терсной реплики может лежать на два-три хопа выше по ветке.
+   */
+  replyChain?: string[]
+  /** Символ, однозначно вычитанный из ветки реплаев движком (не моделью), если такой нашёлся. */
+  replyChainSymbol?: string
   images: PromptImage[]
   /** sha256 компактного снимка openPositions — идёт в cache.ts::cacheKey (research §10:
    *  "hash(open_positions_snapshot)"), т.к. символ дельты может зависеть от текущих позиций. */
@@ -51,15 +59,38 @@ const OPEN_TP_STATUSES = ['created', 'pending_submit', 'submitted'] as const
  * (файл с диска по storage_path, base64).
  */
 export async function buildContext(db: Kysely<DB>, message: BuildContextMessage): Promise<BuiltAiContext> {
-  const [openPositions, replyParentText, images] = await Promise.all([
+  const [openPositions, replyChain, images] = await Promise.all([
     loadOpenPositions(db, message.channelId),
-    loadReplyParentText(db, message.channelId, message.replyToMsgId),
+    loadReplyChain(db, message.channelId, message.replyToMsgId),
     loadImages(db, message.id),
   ])
 
   const result: BuiltAiContext = { openPositions, images, openPositionsHash: hashOpenPositions(openPositions) }
-  if (replyParentText !== undefined) result.replyParentText = replyParentText
+  const [parent, ...ancestors] = replyChain
+  if (parent !== undefined) result.replyParentText = parent
+  if (ancestors.length > 0) result.replyChain = ancestors
+  const chainSymbol = resolveChainSymbol(replyChain)
+  if (chainSymbol !== undefined) result.replyChainSymbol = chainSymbol
   return result
+}
+
+/**
+ * Символ ветки — ПЕРВЫЙ предок (снизу вверх), где символ вообще назван, и назван ОДНОЗНАЧНО.
+ * Несколько разных символов у ближайшего такого предка («Sl btc.. Sl Eth..») означают, что
+ * подсказывать нечего: модель разберётся по текстам ветки и картинке лучше, чем мы угадаем.
+ * Резолв — чистый алиас (isListed здесь недоступен и не нужен: это подсказка, а не гейт).
+ */
+function resolveChainSymbol(chain: readonly string[]): string | undefined {
+  for (const text of chain) {
+    const found = new Set<string>()
+    for (const coin of extractCoins(text)) {
+      const symbol = resolveSymbol(coin, () => true)
+      if (symbol !== null) found.add(symbol)
+    }
+    if (found.size === 1) return [...found][0]
+    if (found.size > 1) return undefined
+  }
+  return undefined
 }
 
 /** sha256 канонической сериализации openPositions — ТА ЖЕ форма (serializeOpenPosition из
@@ -154,24 +185,39 @@ async function loadOpenedTgMessageId(db: Kysely<DB>, tradeId: string): Promise<n
 }
 
 // ---------------------------------------------------------------------------
-// Текст reply-родителя.
+// Ветка реплаев.
 // ---------------------------------------------------------------------------
 
-async function loadReplyParentText(
-  db: Kysely<DB>,
-  channelId: number,
-  replyToMsgId: number | null,
-): Promise<string | undefined> {
-  if (replyToMsgId === null) return undefined
-  // tg_message_id уникален ТОЛЬКО в паре с channel_id (messages: UNIQUE(channel_id, tg_message_id)) —
-  // без фильтра по каналу можно было бы найти чужое сообщение с тем же numeric id.
-  const row = await db
-    .selectFrom('messages')
-    .select('text')
-    .where('channel_id', '=', channelId)
-    .where('tg_message_id', '=', replyToMsgId)
-    .executeTakeFirst()
-  return row?.text
+/**
+ * Автор ведёт сделку цепочкой коротких реплик: «Sol 1🎯» ← «2🎯» ← «3🎯». Символ назван ОДИН раз,
+ * в корне ветки, и на втором хопе прежний контекст (ровно один родитель) его терял: живой случай
+ * 09.08.2026 — «3🎯» разобралось как тейк по BTC вместо SOL, потому что в тексте родителя («2🎯»)
+ * символа нет, а среди открытых позиций биток выглядел свежее.
+ *
+ * Поднимаемся до MAX_REPLY_CHAIN_HOPS предков; `seen` защищает от цикла в данных.
+ */
+const MAX_REPLY_CHAIN_HOPS = 6
+
+async function loadReplyChain(db: Kysely<DB>, channelId: number, replyToMsgId: number | null): Promise<string[]> {
+  const texts: string[] = []
+  const seen = new Set<number>()
+  let currentId = replyToMsgId
+  for (let hop = 0; currentId !== null && hop < MAX_REPLY_CHAIN_HOPS; hop++) {
+    if (seen.has(currentId)) break
+    seen.add(currentId)
+    // tg_message_id уникален ТОЛЬКО в паре с channel_id (messages: UNIQUE(channel_id, tg_message_id)) —
+    // без фильтра по каналу можно было бы найти чужое сообщение с тем же numeric id.
+    const row = await db
+      .selectFrom('messages')
+      .select(['text', 'reply_to_msg_id'])
+      .where('channel_id', '=', channelId)
+      .where('tg_message_id', '=', currentId)
+      .executeTakeFirst()
+    if (!row) break
+    texts.push(row.text)
+    currentId = row.reply_to_msg_id
+  }
+  return texts
 }
 
 // ---------------------------------------------------------------------------

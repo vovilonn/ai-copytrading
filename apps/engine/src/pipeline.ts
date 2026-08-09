@@ -464,6 +464,10 @@ async function runAiBranch(
         text: message.text,
         tMsg: message.msgTs.toISOString(),
         ...(aiContext.replyParentText !== undefined ? { replyParentText: aiContext.replyParentText } : {}),
+        // Ветка реплаев целиком: символ терсной реплики («3🎯») лежит в корне ветки, а не у
+        // прямого родителя (живой случай 09.08.2026 — тейк по SOL уехал на BTC).
+        ...(aiContext.replyChain !== undefined ? { replyChain: aiContext.replyChain } : {}),
+        ...(aiContext.replyChainSymbol !== undefined ? { replyChainSymbol: aiContext.replyChainSymbol } : {}),
         openPositions: aiContext.openPositions,
         images: aiContext.images,
         db: callsDb,
@@ -542,16 +546,55 @@ function toParseContextMessage(row: {
   }
 }
 
+/**
+ * ЦЕПОЧКА РЕПЛАЕВ, А НЕ ОДИН РОДИТЕЛЬ.
+ *
+ * Автор ведёт сделку короткими репликами в ответ на предыдущую: «Sol 1🎯» ← «2🎯» ← «3🎯».
+ * Символ назван ОДИН раз, в начале ветки, а дальше каждое сообщение отвечает такой же терсной
+ * реплике без символа. Раньше контекст знал ровно одного родителя — и на втором таком хопе символ
+ * терялся: живой случай 09.08.2026 (msg 221572 «3🎯») разобрался как тейк по BTC, потому что
+ * ближайшим «понятным» символом оказалась свежая заявка по битку, а не солана из корня ветки.
+ *
+ * Поднимаемся вверх до REPLY_CHAIN_MAX_HOPS сообщений. Ограничение — не экономия запросов
+ * (их считанные единицы), а смысл: чем дальше предок, тем слабее его связь с текущей репликой.
+ * `seen` — защита от цикла (сообщение-ответ само на себя в кривых данных повесило бы движок).
+ */
+const REPLY_CHAIN_MAX_HOPS = 6
+
+type ReplyChainRow = {
+  tg_message_id: number
+  text: string
+  msg_ts: Date
+  reply_to_msg_id: number | null
+  grouped_id: string | null
+  media_kind: string | null
+}
+
+async function loadReplyChain(
+  trx: Kysely<DB>,
+  channelId: number,
+  startId: number | null,
+): Promise<Map<number, ReplyChainRow>> {
+  const chain = new Map<number, ReplyChainRow>()
+  let currentId = startId
+  for (let hop = 0; currentId !== null && hop < REPLY_CHAIN_MAX_HOPS; hop++) {
+    if (chain.has(currentId)) break // цикл
+    // tg_message_id уникален ТОЛЬКО в паре с channel_id — фильтр по каналу обязателен.
+    const row = await trx
+      .selectFrom('messages')
+      .select(['tg_message_id', 'text', 'msg_ts', 'reply_to_msg_id', 'grouped_id', 'media_kind'])
+      .where('channel_id', '=', channelId)
+      .where('tg_message_id', '=', currentId)
+      .executeTakeFirst()
+    if (!row) break
+    chain.set(row.tg_message_id, row)
+    currentId = row.reply_to_msg_id
+  }
+  return chain
+}
+
 async function buildParseContext(trx: Kysely<DB>, message: PipelineMessage, instruments: InstrumentMap): Promise<ParseContext> {
-  const replyTarget =
-    message.replyToMsgId !== null
-      ? await trx
-          .selectFrom('messages')
-          .select(['tg_message_id', 'text', 'msg_ts', 'reply_to_msg_id', 'grouped_id', 'media_kind'])
-          .where('channel_id', '=', message.channelId)
-          .where('tg_message_id', '=', message.replyToMsgId)
-          .executeTakeFirst()
-      : undefined
+  const replyChain = await loadReplyChain(trx, message.channelId, message.replyToMsgId)
 
   // openPositions — глобальная (across all channels) видимость открытых позиций по символу
   // (research §10: нужна для CH2/Ф2, чтобы не отдать чужой символ другому каналу молча). CH1
@@ -587,17 +630,22 @@ async function buildParseContext(trx: Kysely<DB>, message: PipelineMessage, inst
     // см. отчёт по задаче 7).
     resolveSymbol: (raw: string) => resolveSymbol(raw, () => true),
     isListed: (symbol: string) => instruments.get(symbol)?.status === 'Trading',
-    getMessage: (id: number) =>
-      replyTarget && replyTarget.tg_message_id === id
-        ? toParseContextMessage({
-            tgMessageId: replyTarget.tg_message_id,
-            text: replyTarget.text,
-            msgTs: replyTarget.msg_ts,
-            replyToMsgId: replyTarget.reply_to_msg_id,
-            groupedId: replyTarget.grouped_id,
-            mediaKind: replyTarget.media_kind,
+    // Отдаёт ЛЮБОЕ сообщение из цепочки реплаев, а не только прямого родителя: терсная реплика
+    // («3🎯») сплошь и рядом отвечает такой же терсной реплике, и символ лежит на два-три хопа
+    // выше (см. loadReplyChain).
+    getMessage: (id: number) => {
+      const row = replyChain.get(id)
+      return row === undefined
+        ? null
+        : toParseContextMessage({
+            tgMessageId: row.tg_message_id,
+            text: row.text,
+            msgTs: row.msg_ts,
+            replyToMsgId: row.reply_to_msg_id,
+            groupedId: row.grouped_id,
+            mediaKind: row.media_kind,
           })
-        : null,
+    },
     openPositions,
     // "Последний тронутый символ" — эвристика CH2 (Ф2), доказанно промахивается на реальном
     // дампе (research: сообщение 221447) — в Ф1 не отслеживаем, всегда null.
