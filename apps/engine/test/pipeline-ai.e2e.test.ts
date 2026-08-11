@@ -684,6 +684,107 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
   // Доливка не трогала цели: они оставались выставлены на прежний объём, и после добора позиция
   // выходила по лесенке лишь частично, а остаток держался до стопа. Живые случаи ARB/INJ/MMT
   // (30-31.07.2026): лесенка покрывала 7-14% позиции.
+  // Живой случай 11.08.2026 (XRP, msg 221579): «По Xrp после усреднения твх 1.03, там буду
+  // скидывать доливку / Если что первый Таргет 1.048». Вход 479.7 + доливка 495 = позиция 974.7.
+  // Бот прочитал «твх 1.03» как стоп-лосс (биржа его отвергла — для лонга в минусе он выше рынка),
+  // выход доливки на 1.03 не поставил вовсе, а «первый таргет» посчитал от ПЕРВОГО входа: 159.9,
+  // то есть 16% реальной позиции.
+  describe('выход доливки на названной цене + лесенка от полного объёма', () => {
+    async function seedWithAdd(entryQty: string, addQty: string) {
+      await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+      await seedInstrument(db, 'BTCUSDT')
+      const seeded = await seedOpenPosition(db, { channelId: CH2_ID, channelOrd: CH2_ORD, symbol: 'BTCUSDT', side: 'long', entryPrice: '60000', qty: entryQty })
+      // Доливка: лега + рост позиции (то же, что делает handleAdd + филл с биржи).
+      await addLeg(db, { tradeId: seeded.tradeId, legIndex: 1, kind: 'add', requestedQty: addQty, status: 'filled' })
+      await db
+        .updateTable('trade_legs')
+        .set({ filled_qty: addQty })
+        .where('trade_id', '=', seeded.tradeId)
+        .where('leg_index', '=', 1)
+        .execute()
+      await sql`UPDATE positions SET size = size + ${addQty}::numeric WHERE channel_id = ${CH2_ID} AND symbol = 'BTCUSDT'`.execute(db)
+      return seeded
+    }
+
+    async function tpOrders(tradeId: string) {
+      return db
+        .selectFrom('orders')
+        .selectAll()
+        .where('trade_id', '=', tradeId)
+        .where('purpose', '=', 'tp')
+        .where('status', '=', 'submitted')
+        .orderBy('price', 'asc')
+        .execute()
+    }
+
+    it('цель size_marker=one_unit -> reduce-only лимитка ровно на объём доливки', async () => {
+      const { tradeId } = await seedWithAdd('3', '3')
+      mock.queue.push(
+        toolUseResponse(
+          baseOutput({
+            message_type: 'modify_tp',
+            confidence: 0.9,
+            actions: [{ type: 'modify_tp', symbol: 'BTCUSDT', side: 'long', evidence_source: 'text',
+                        take_profits: [{ value: 61000, size_marker: 'one_unit' }, { value: 62000, index: 1 }] }],
+          }),
+        ),
+      )
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'На 61000 скину доливку, первый таргет 62000' }), deps)
+
+      const tps = await tpOrders(tradeId)
+      expect(tps).toHaveLength(2)
+      // Доливка выходит целиком на своей цене...
+      expect(new Decimal(tps[0]!.qty ?? '0').toString()).toBe('3')
+      expect(new Decimal(tps[0]!.price ?? '0').toString()).toBe('61000')
+      // ...а ступень лесенки делит ТО, ЧТО ОСТАЁТСЯ (6 − 3 = 3), треть от этого = 1.
+      expect(new Decimal(tps[1]!.qty ?? '0').toString()).toBe('1')
+      expect(new Decimal(tps[1]!.price ?? '0').toString()).toBe('62000')
+    })
+
+    it('без доливок цель one_unit пропускается (объём выдумывать нельзя), обычная ступень остаётся', async () => {
+      await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+      await seedInstrument(db, 'BTCUSDT')
+      const { tradeId } = await seedOpenPosition(db, { channelId: CH2_ID, channelOrd: CH2_ORD, symbol: 'BTCUSDT', side: 'long', entryPrice: '60000', qty: '3' })
+      mock.queue.push(
+        toolUseResponse(
+          baseOutput({
+            message_type: 'modify_tp',
+            confidence: 0.9,
+            actions: [{ type: 'modify_tp', symbol: 'BTCUSDT', side: 'long', evidence_source: 'text',
+                        take_profits: [{ value: 61000, size_marker: 'one_unit' }, { value: 62000, index: 1 }] }],
+          }),
+        ),
+      )
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'На 61000 скину доливку, первый таргет 62000' }), deps)
+
+      const tps = await tpOrders(tradeId)
+      expect(tps).toHaveLength(1)
+      expect(new Decimal(tps[0]!.price ?? '0').toString()).toBe('62000')
+      expect(new Decimal(tps[0]!.qty ?? '0').toString()).toBe('1') // треть от 3
+    })
+
+    it('после доливки «первая цель» считается от ПОЛНОГО объёма, а не от первого входа', async () => {
+      const { tradeId } = await seedWithAdd('3', '3')
+      mock.queue.push(
+        toolUseResponse(
+          baseOutput({
+            message_type: 'modify_tp',
+            confidence: 0.9,
+            actions: [{ type: 'modify_tp', symbol: 'BTCUSDT', side: 'long', evidence_source: 'text',
+                        take_profits: [{ value: 62000, index: 1 }] }],
+          }),
+        ),
+      )
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Первый таргет 62000' }), deps)
+
+      const tps = await tpOrders(tradeId)
+      expect(new Decimal(tps[0]!.qty ?? '0').toString()).toBe('2') // треть от 6, а не от 3
+    })
+  })
+
   describe('добор пересчитывает TP-лесенку под новый объём', () => {
     async function seedWithLadder(qty: string) {
       await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })

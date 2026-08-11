@@ -57,6 +57,9 @@ export interface TakeProfitSpec {
    *  долю из размера лесенки модель не должна — это арифметика, её делает пайплайн. */
   fraction?: number | null
   marker?: 'none' | 'current_price'
+  /** «one_unit» — на эту цель уходит ОДНА доливка целиком («на 1.03 скину доливку»): долю в
+   *  процентах автор не называет, он мыслит легами, а их объёмы знает пайплайн. */
+  size_marker?: 'one_unit' | 'none'
 }
 
 export interface CloseAmountSpec {
@@ -183,6 +186,7 @@ export const EXTRACT_SIGNAL_TOOL = {
                   index: { type: ['integer', 'null'] },
                   fraction: { type: ['number', 'null'] },
                   marker: { type: 'string', enum: ['none', 'current_price'] },
+                  size_marker: { type: 'string', enum: ['one_unit', 'none'] },
                 },
               },
             },

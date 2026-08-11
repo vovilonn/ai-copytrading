@@ -109,7 +109,10 @@ export type DeltaOp =
   | {
       op: 'tp_set'
       ladderTotal?: number
-      targets: Array<{ value?: number; marker?: 'current_price'; index?: number; fraction?: number }>
+      // `unit:'one_unit'` — размер этой цели равен ОДНОЙ доливке («на 1.03 скину доливку»): доля в
+      // процентах автору неизвестна, он мыслит легами. Резолвит пайплайн (он знает объёмы лег), как
+      // и у partial_close с тем же маркером.
+      targets: Array<{ value?: number; marker?: 'current_price'; index?: number; fraction?: number; unit?: 'one_unit' }>
     }
   // cancel_order (extract_signal.actions[].type) — отмена ЕЩЁ НЕ исполненного pending-ордера
   // (лимитный вход/добор), НЕ путать с sl_cancel (снятие уже выставленного стоп-лосса).

@@ -289,7 +289,7 @@ function mapStopLoss(sl: StopLossSpec | undefined): DeltaOp | null {
 function mapTakeProfits(tps: TakeProfitSpec[] | undefined, ladderTotal?: number | null): DeltaOp | null {
   if (tps === undefined || tps.length === 0) return null
 
-  type Target = { value?: number; marker?: 'current_price'; index?: number; fraction?: number }
+  type Target = { value?: number; marker?: 'current_price'; index?: number; fraction?: number; unit?: 'one_unit' }
   const targets = tps
     .map((tp): Target | null => {
       // index/fraction переносим на ЛЮБУЮ форму цели: по ним пайплайн считает долю позиции и
@@ -298,6 +298,8 @@ function mapTakeProfits(tps: TakeProfitSpec[] | undefined, ladderTotal?: number 
       const extra: Target = {
         ...(typeof tp.index === 'number' ? { index: tp.index } : {}),
         ...(typeof tp.fraction === 'number' ? { fraction: tp.fraction } : {}),
+        // «на 1.03 скину доливку» — размер цели равен одной доливке; объём леги знает пайплайн.
+        ...(tp.size_marker === 'one_unit' ? { unit: 'one_unit' as const } : {}),
       }
       if (tp.marker === 'current_price') return { marker: 'current_price', ...extra }
       if (tp.value !== undefined && tp.value !== null) return { value: tp.value, ...extra }

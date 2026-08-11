@@ -1131,7 +1131,7 @@ function buildTpTargets(
 function buildLadderTargets(params: {
   basis: Decimal
   remaining: Decimal
-  targets: ReadonlyArray<{ price: Decimal; index?: number; fraction?: number }>
+  targets: ReadonlyArray<{ price: Decimal; index?: number; fraction?: number; qty?: Decimal }>
   ladderTotal?: number
   qtyStep: string
 }): { price: string; qty: string; index: number }[] {
@@ -1145,7 +1145,9 @@ function buildLadderTargets(params: {
   for (const [i, target] of params.targets.entries()) {
     // Делим базис на число ступеней, а НЕ умножаем на долю 1/N: 1/3 в Decimal — это 0.333…3, и
     // три такие ступени не сложились бы обратно в объём (3 × 0.33…3 = 0.99…9 → потеря шага).
-    const stepQty = target.fraction !== undefined ? params.basis.mul(target.fraction) : params.basis.div(slots)
+    // Приоритет размера: готовый объём («скину доливку» — объём леги посчитал пайплайн) →
+    // явная доля автора («на первой фикс 30%») → равная ступень лесенки.
+    const stepQty = target.qty ?? (target.fraction !== undefined ? params.basis.mul(target.fraction) : params.basis.div(slots))
     // Ступень не может превысить остаток — и следующая ступень считает уже от того, что осталось.
     const qty = Decimal.min(floorTo(params.qtyStep, stepQty), left)
     if (qty.lte(0)) continue // ступень меньше шага объёма — молча пропускаем эту цель
@@ -1241,6 +1243,51 @@ async function specFromMarketEntry(
     tps: intent.tps ?? [],
     ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct } : {}),
   }
+}
+
+/**
+ * Базис TP-лесенки — САМЫЙ БОЛЬШОЙ объём, которым сделка когда-либо была: вход плюс исполненные
+ * доливки, но не меньше текущей позиции.
+ *
+ * Раньше базисом был `trades.initial_size` — размер ПЕРВОГО входа. После доливки лесенка считалась
+ * от него и покрывала позицию лишь частично: живой случай 11.08.2026 — XRP, вход 479.7 + доливка
+ * 495, «первый таргет» встал на 159.9 (треть первого входа), то есть на 16% реальной позиции.
+ *
+ * Почему именно максимум из двух величин:
+ *  - сумма ИСПОЛНЕННЫХ лег — то, что автор в сделку реально вложил; ещё не сработавшая лимитная
+ *    доливка в неё не входит (позиции такого объёма пока нет, и обещать её выход нельзя);
+ *  - текущий размер позиции страхует случай, когда филлы в журнал не доехали (догон истории,
+ *    ручной вход оператора) — базис не должен оказаться меньше того, что реально висит на бирже;
+ *  - остаток базисом быть не может: после фиксации части ступени схлопывались бы каждый раз
+ *    заново («первая цель» после закрытия половины давала бы уже шестую часть, а не треть).
+ */
+async function resolveLadderBasis(trx: Kysely<DB>, tradeId: string, positionSize: Decimal): Promise<Decimal> {
+  const { rows } = await sql<{ total: string }>`
+    SELECT COALESCE(SUM(COALESCE(filled_qty, 0)), 0)::text AS total
+    FROM trade_legs
+    WHERE trade_id = ${tradeId}::uuid AND kind IN ('entry', 'add')
+  `.execute(trx)
+  return Decimal.max(new Decimal(rows[0]?.total ?? 0), positionSize)
+}
+
+/**
+ * Объём ОДНОЙ доливки сделки — «скину доливку», «закрыл один объём».
+ *
+ * Автор мыслит легами, а не процентами: доливка была на свою сумму, и выходить из неё он собирается
+ * целиком. Берём ПОСЛЕДНЮЮ исполненную лег-доливку (kind='add'): именно про неё говорят «доливка»,
+ * когда их было несколько. Доливок нет вовсе — null, вызывающий код решает, что делать дальше.
+ */
+async function resolveOneUnitQty(trx: Kysely<DB>, tradeId: string): Promise<Decimal | null> {
+  const leg = await trx
+    .selectFrom('trade_legs')
+    .select(['filled_qty', 'requested_qty'])
+    .where('trade_id', '=', tradeId)
+    .where('kind', '=', 'add')
+    .orderBy('leg_index', 'desc')
+    .executeTakeFirst()
+  if (!leg) return null
+  const qty = new Decimal(leg.filled_qty ?? leg.requested_qty ?? 0)
+  return qty.gt(0) ? qty : null
 }
 
 /**
@@ -2023,9 +2070,10 @@ async function handleDelta(
           }
         }
 
-        // Базис — ИСХОДНЫЙ объём: лесенка из трёх целей делит на равные части именно его, поэтому
-        // «первая цель» закрывает треть позиции, а не треть остатка.
-        const basis = trade?.initial_size != null ? new Decimal(trade.initial_size) : remaining
+        // Базис — ВЕСЬ вложенный объём (вход + доливки): лесенка из трёх целей делит на равные
+        // части именно его, поэтому «первая цель» закрывает треть позиции, а не треть остатка и не
+        // треть первого входа (после доливки это разные числа, см. resolveLadderBasis).
+        const basis = await resolveLadderBasis(trx, position.trade_id, remaining)
         const closeQty = Decimal.min(floorTo(instrument.qtyStep, basis.mul(DEFAULT_TP_HIT_FRACTION)), remaining)
         if (closeQty.lte(0)) {
           gateSkip = 'zero_qty'
@@ -2071,6 +2119,10 @@ async function handleDelta(
           break
         }
 
+        // «Скинул один объём» — закрывается ЛЕГА (доливка) целиком, а не доля позиции: маркер
+        // one_unit доезжал из модели и молча игнорировался, вместо доливки закрывалась половина.
+        const unitQty = op.unit === 'one_unit' ? await resolveOneUnitQty(trx, position.trade_id) : null
+
         // Доля: «половину» → 0.5. Базис — остаток (автор говорит про то, что видит СЕЙЧАС), либо
         // исходный объём, если модель явно указала basis='original'.
         const fraction = new Decimal(op.fraction ?? DEFAULT_PARTIAL_CLOSE_FRACTION)
@@ -2078,7 +2130,7 @@ async function handleDelta(
           op.basis === 'original' && trade?.initial_size != null ? new Decimal(trade.initial_size) : remaining
 
         // Округляем ВНИЗ к шагу объёма — иначе биржа отвергнет ордер. И не закрываем больше остатка.
-        const closeQty = Decimal.min(floorTo(instrument.qtyStep, basisSize.mul(fraction)), remaining)
+        const closeQty = Decimal.min(floorTo(instrument.qtyStep, unitQty ?? basisSize.mul(fraction)), remaining)
 
         if (closeQty.lte(0)) {
           gateSkip = 'zero_qty' // остаток меньше шага объёма — «половину» физически нечем закрыть
@@ -2116,7 +2168,7 @@ async function handleDelta(
           symbol: intent.symbol,
           tradeId: position.trade_id,
           side: position.side,
-          basis: trade?.initial_size != null ? new Decimal(trade.initial_size) : remaining,
+          basis: await resolveLadderBasis(trx, position.trade_id, remaining),
           remaining,
           markPrice: position.mark_price,
           targets: op.targets,
@@ -2216,7 +2268,7 @@ async function handleTpSet(
     /** Сколько объёма реально осталось: суммарно лесенка не может его превысить. */
     remaining: Decimal
     markPrice: string | null
-    targets: ReadonlyArray<{ value?: number; marker?: 'current_price'; index?: number; fraction?: number }>
+    targets: ReadonlyArray<{ value?: number; marker?: 'current_price'; index?: number; fraction?: number; unit?: 'one_unit' }>
     /** Число целей в лесенке, названное автором. */
     ladderTotal?: number
     /** Порядковый номер лесенки внутри одного action (уникальность orderLinkId). */
@@ -2224,17 +2276,34 @@ async function handleTpSet(
   },
 ): Promise<string | null> {
   const markPrice = params.markPrice !== null ? new Decimal(params.markPrice) : null
-  const resolved: { price: Decimal; index?: number; fraction?: number }[] = []
+  // Цель размером «одна доливка» («после усреднения твх 1.03, там буду скидывать доливку»):
+  // объём берём у самой леги, автор его в процентах не называет.
+  const oneUnitQty = params.targets.some((t) => t.unit === 'one_unit') ? await resolveOneUnitQty(trx, params.tradeId) : null
+  const resolved: { price: Decimal; index?: number; fraction?: number; qty?: Decimal }[] = []
+  // Считаем ОТДЕЛЬНО цели, у которых не вышло определить ЦЕНУ: это признак неполного разбора всего
+  // сообщения (гейт ниже), тогда как цель, чей РАЗМЕР («одна доливка») определить нечем, — просто
+  // невыполнимая цель, из-за неё остальную лесенку терять незачем.
+  let unresolvedPrice = 0
   for (const target of params.targets) {
     const price = target.value !== undefined ? new Decimal(target.value) : target.marker === 'current_price' && markPrice !== null ? markPrice : null
-    if (price === null) continue
+    if (price === null) {
+      unresolvedPrice += 1
+      continue
+    }
+    if (target.unit === 'one_unit' && oneUnitQty === null) {
+      // Доливок у сделки нет — «скинуть доливку» нечем. Ставить вместо неё обычную ступень
+      // лесенки значило бы выдумать за автора объём, которого он не называл.
+      console.warn(`[pipeline] ${params.symbol}: цель ${price.toString()} размером «одна доливка», но доливок у сделки нет — цель пропущена`)
+      continue
+    }
     resolved.push({
       price,
       ...(target.index !== undefined ? { index: target.index } : {}),
       ...(target.fraction !== undefined ? { fraction: target.fraction } : {}),
+      ...(target.unit === 'one_unit' && oneUnitQty !== null ? { qty: oneUnitQty } : {}),
     })
   }
-  if (resolved.length !== params.targets.length || resolved.length === 0) {
+  if (unresolvedPrice > 0 || resolved.length === 0) {
     console.warn(`[pipeline] modify_tp: не все цели резолвились (current_price без mark_price?), symbol=${params.symbol} — лесенка не обновлена`)
     return null
   }
@@ -2256,8 +2325,14 @@ async function handleTpSet(
     return 'tp_beyond_market'
   }
 
+  // Объём, уже расписанный по целям-легам, из базиса лесенки вычитается: ступени делят ТО, ЧТО
+  // ОСТАЁТСЯ. Иначе в сообщении «на 1.03 скину доливку, первый таргет 1.048» первая цель забрала бы
+  // треть ВСЕЙ позиции вместе с доливкой, которая по замыслу автора выходит отдельно и раньше.
+  const earmarked = reachable.reduce((sum, t) => (t.qty !== undefined ? sum.plus(t.qty) : sum), new Decimal(0))
+  const ladderBasis = Decimal.max(0, params.basis.minus(earmarked))
+
   const tpTargets = buildLadderTargets({
-    basis: params.basis,
+    basis: ladderBasis,
     remaining: params.remaining,
     targets: reachable,
     ...(params.ladderTotal !== undefined ? { ladderTotal: params.ladderTotal } : {}),
