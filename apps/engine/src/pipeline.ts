@@ -1278,6 +1278,21 @@ async function resolveLadderBasis(trx: Kysely<DB>, tradeId: string, positionSize
  * когда их было несколько. Доливок нет вовсе — null, вызывающий код решает, что делать дальше.
  */
 async function resolveOneUnitQty(trx: Kysely<DB>, tradeId: string): Promise<Decimal | null> {
+  // Источник правды — ИСПОЛНЕННЫЙ ордер доливки, а не строка trade_legs: у лег filled_qty
+  // проставляет только handleOpen для входа, а долившийся лимитник ногу не трогает вовсе (живой
+  // XRP 11.08.2026: ордер add на 495 filled, а лега так и осталась pending с filled_qty=0).
+  const order = await trx
+    .selectFrom('orders')
+    .select('qty')
+    .where('trade_id', '=', tradeId)
+    .where('purpose', '=', 'add')
+    .where('status', '=', 'filled')
+    .orderBy('filled_at', 'desc')
+    .orderBy('created_at', 'desc')
+    .executeTakeFirst()
+  if (order?.qty != null && new Decimal(order.qty).gt(0)) return new Decimal(order.qty)
+
+  // Фолбэк — лега: dry-run/бэктест и исторические сделки, где ордера доливки в журнал не попали.
   const leg = await trx
     .selectFrom('trade_legs')
     .select(['filled_qty', 'requested_qty'])
@@ -1285,9 +1300,8 @@ async function resolveOneUnitQty(trx: Kysely<DB>, tradeId: string): Promise<Deci
     .where('kind', '=', 'add')
     .orderBy('leg_index', 'desc')
     .executeTakeFirst()
-  if (!leg) return null
-  const qty = new Decimal(leg.filled_qty ?? leg.requested_qty ?? 0)
-  return qty.gt(0) ? qty : null
+  const legQty = new Decimal(leg?.filled_qty ?? 0)
+  return legQty.gt(0) ? legQty : null
 }
 
 /**
