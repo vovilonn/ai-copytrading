@@ -430,3 +430,74 @@ describe('ch1.adapter — доля/отрицание/полное закрыт�
     expect(ops('#BTC Первый тейк +30% фиксирую 50% и стоп в б/у')).toContainEqual({ op: 'partial_close', fraction: 0.5 })
   })
 })
+
+// Живой случай прода 12.08.2026 (msg 2999) — самый дорогой на сегодня: сообщение вело ДВЕ позиции,
+// но без слова «Менеджмент» в заголовке. Правила R3/R4 брали ПЕРВЫЙ хэштег и прогоняли лексикон по
+// всему тексту: закрылся только ZRO, инструкция по ETHFI растворилась в его же ops. Позиция
+// провисела сутки и закрылась в −8.70 вместо профита.
+describe('ch1.adapter — несколько символов в одном сообщении без слова «Менеджмент»', () => {
+  function ctx(text: string, replyToMsgId: number | null = null): ParseContext {
+    return {
+      channelId: '2088626562',
+      message: { id: 1, text, date: '2026-08-12T07:09:00Z', replyToMsgId, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, () => true),
+      isListed: () => true,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  const MSG_2999 = [
+    'Доброе утро, друзья ☀️',
+    '',
+    '#ZRO - фиксирую позицию по текущим в зоне входа. Сделка затянулась, монета не показала ожидаемого движения.',
+    '',
+    '#ETHFI - фиксирую позицию по текущим полностью. Решил забрать профит в преддверии выхода данных об инфляции в США.',
+  ].join('\n')
+
+  it('обе позиции получают СВОЁ действие, а не только первая', () => {
+    const result = parseCh1(ctx(MSG_2999))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([
+      { kind: 'delta', symbol: 'ZROUSDT', ops: [{ op: 'close_remainder' }] },
+      { kind: 'delta', symbol: 'ETHFIUSDT', ops: [{ op: 'close_remainder' }] },
+    ])
+  })
+
+  it('то же самое в ответе на сообщение (R3)', () => {
+    const result = parseCh1(ctx(MSG_2999, 2997))
+
+    expect(result.intents.map((i) => ('symbol' in i ? i.symbol : null))).toEqual(['ZROUSDT', 'ETHFIUSDT'])
+  })
+
+  it('действие одного символа НЕ приклеивается к другому', () => {
+    const result = parseCh1(ctx('#ARB - держим дальше, цель близко.\n#INJ - фиксирую позицию полностью.'))
+
+    expect(result.intents).toEqual([{ kind: 'delta', symbol: 'INJUSDT', ops: [{ op: 'close_remainder' }] }])
+  })
+
+  it('разные доли по разным символам не смешиваются', () => {
+    const result = parseCh1(ctx('#ARB - зафиксировал 30%.\n#INJ - зафиксировал 50%.'))
+
+    expect(result.intents).toEqual([
+      { kind: 'delta', symbol: 'ARBUSDT', ops: [{ op: 'partial_close', fraction: 0.3 }] },
+      { kind: 'delta', symbol: 'INJUSDT', ops: [{ op: 'partial_close', fraction: 0.5 }] },
+    ])
+  })
+
+  it('действие названо ОДИН раз на два символа -> в AI, а не наугад первому', () => {
+    const result = parseCh1(ctx('Фиксирую позиции полностью по #ARB и #INJ'))
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('ambiguous_symbol')
+    expect(result.intents).toHaveLength(0)
+  })
+
+  it('один символ — прежнее поведение: действие до хэштега тоже засчитывается', () => {
+    const result = parseCh1(ctx('Фиксирую позицию полностью по #ARB, актив не идёт'))
+
+    expect(result.intents).toEqual([{ kind: 'delta', symbol: 'ARBUSDT', ops: [{ op: 'close_remainder' }] }])
+  })
+})

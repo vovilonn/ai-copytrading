@@ -171,6 +171,70 @@ function firstNonBtcHashtag(text: string): string | null {
   return allHashtags(text).find((t) => t.toUpperCase() !== 'BTC') ?? null
 }
 
+
+/**
+ * СЕГМЕНТЫ ПО СИМВОЛАМ: `#TICKER` и весь текст до СЛЕДУЮЩЕГО `#TICKER`.
+ *
+ * Одно сообщение сплошь и рядом ведёт НЕСКОЛЬКО позиций, и без слова «Менеджмент» в заголовке
+ * (по нему работает R2). Живой случай прода 12.08.2026 — сообщение 2999:
+ *
+ *     Доброе утро, друзья ☀️
+ *     #ZRO - фиксирую позицию по текущим в зоне входа. …
+ *     #ETHFI - фиксирую позицию по текущим полностью. …
+ *
+ * Правила R3/R4 брали ПЕРВЫЙ хэштег и прогоняли лексикон по ВСЕМУ тексту: закрылся только ZRO,
+ * а инструкция по ETHFI растворилась в его же ops. Позиция провисела сутки и закрылась в −8.70
+ * вместо профита, которого хотел автор.
+ */
+function symbolSegments(text: string): Array<{ ticker: string; segment: string }> {
+  const matches = [...text.matchAll(/#([A-Za-z0-9]+)/g)]
+  return matches.map((m, i) => ({
+    ticker: m[1]!, // группа обязательная — иначе паттерн не матчит
+    segment: text.slice(m.index!, matches[i + 1]?.index ?? text.length),
+  }))
+}
+
+/**
+ * Строит дельты сообщения. Один символ — прежнее поведение (лексикон по всему тексту: действие
+ * запросто стоит ДО хэштега, «фиксирую половину по #ARB»). Несколько — каждому символу только
+ * СВОЙ сегмент, чужие инструкции к нему не приклеиваются.
+ *
+ * `null` — дельт нет вовсе (правило не наше). `{ escalate: true }` — символов несколько, действие
+ * в тексте есть, но ни один сегмент его не содержит («Фиксирую по #ARB и #INJ»): приписать
+ * действие одному из них значило бы угадать, а промолчать — потерять. Такое уходит в AI.
+ */
+type DeltaBuild = { intents: ParsedIntent[] } | { escalate: true } | { notListed: true } | null
+
+function buildDeltaIntents(text: string, ctx: ParseContext, tickers: string[]): DeltaBuild {
+  const segments = symbolSegments(text).filter((s) => tickers.includes(s.ticker))
+  const resolved = segments
+    .map((s) => ({ symbol: ctx.resolveSymbol(`#${s.ticker}`), segment: s.segment }))
+    .filter((s): s is { symbol: string; segment: string } => s.symbol !== null)
+  if (resolved.length === 0) return null
+
+  const listed = resolved.filter((s) => ctx.isListed(s.symbol))
+  if (listed.length === 0) return { notListed: true }
+
+  const distinct = new Set(listed.map((s) => s.symbol))
+  if (distinct.size === 1) {
+    const ops = extractOps(text)
+    if (ops.length === 0) return null
+    return { intents: [{ kind: 'delta', symbol: listed[0]!.symbol, ops }] }
+  }
+
+  const intents: ParsedIntent[] = []
+  const seen = new Set<string>()
+  for (const { symbol, segment } of listed) {
+    if (seen.has(symbol)) continue
+    const ops = extractOps(segment)
+    if (ops.length === 0) continue
+    seen.add(symbol)
+    intents.push({ kind: 'delta', symbol, ops })
+  }
+  if (intents.length > 0) return { intents }
+  return extractOps(text).length > 0 ? { escalate: true } : null
+}
+
 // ---------------------------------------------------------------------------
 // R1. ENTRY SIGNAL
 // ---------------------------------------------------------------------------
@@ -303,21 +367,18 @@ function tryNoiseKeywords(text: string): ParsedResult | null {
 function tryDeltaReply(text: string, ctx: ParseContext): ParsedResult | null {
   if (ctx.message.replyToMsgId === null) return null
 
-  const ticker = firstNonBtcHashtag(text)
-  if (ticker === null) return null
+  // BTC в этом правиле игнорируется как «рыночный фон» (#BTC обзор), а не как позиция.
+  const tickers = allHashtags(text).filter((t) => t.toUpperCase() !== 'BTC')
+  if (tickers.length === 0) return null
 
-  const ops = extractOps(text)
-  if (ops.length === 0) return null
-
-  const symbol = ctx.resolveSymbol(`#${ticker}`)
-  if (symbol === null) return null // тикер есть, но не резолвится — отдаём другим правилам/фолбэку
-  if (!ctx.isListed(symbol)) {
-    return { route: 'skip', confidence: 0.9, intents: [], reason: 'symbol_not_listed' }
-  }
+  const built = buildDeltaIntents(text, ctx, tickers)
+  if (built === null) return null
+  if ('notListed' in built) return { route: 'skip', confidence: 0.9, intents: [], reason: 'symbol_not_listed' }
+  if ('escalate' in built) return { route: 'ai', confidence: 0.4, intents: [], reason: 'ambiguous_symbol' }
 
   // reply даёт линковку к сделке, но она избыточна для CH1 — символ сам
   // определяет позицию (изоляция «один символ — один канал», research §1 R3).
-  return { route: 'execute', confidence: 0.9, intents: [{ kind: 'delta', symbol, ops }] }
+  return { route: 'execute', confidence: 0.9, intents: built.intents }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,8 +388,8 @@ function tryDeltaReply(text: string, ctx: ParseContext): ParsedResult | null {
 function tryDeltaStandalone(text: string, ctx: ParseContext): ParsedResult | null {
   if (ctx.message.replyToMsgId !== null) return null
 
-  const ticker = firstHashtag(text)
-  if (ticker === null) return null
+  const tickers = allHashtags(text)
+  if (tickers.length === 0) return null
 
   const ops = extractOps(text)
   if (ops.length === 0) return null
@@ -339,12 +400,11 @@ function tryDeltaStandalone(text: string, ctx: ParseContext): ParsedResult | nul
     return { route: 'noise', confidence: 0.2, intents: [] }
   }
 
-  const symbol = ctx.resolveSymbol(`#${ticker}`)
-  if (symbol === null) return null
-  if (!ctx.isListed(symbol)) {
-    return { route: 'skip', confidence: 0.8, intents: [], reason: 'symbol_not_listed' }
-  }
-  return { route: 'execute', confidence: 0.8, intents: [{ kind: 'delta', symbol, ops }] }
+  const built = buildDeltaIntents(text, ctx, tickers)
+  if (built === null) return null
+  if ('notListed' in built) return { route: 'skip', confidence: 0.8, intents: [], reason: 'symbol_not_listed' }
+  if ('escalate' in built) return { route: 'ai', confidence: 0.4, intents: [], reason: 'ambiguous_symbol' }
+  return { route: 'execute', confidence: 0.8, intents: built.intents }
 }
 
 // ---------------------------------------------------------------------------
