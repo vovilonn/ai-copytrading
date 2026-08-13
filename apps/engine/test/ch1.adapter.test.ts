@@ -501,3 +501,43 @@ describe('ch1.adapter — несколько символов в одном со
     expect(result.intents).toEqual([{ kind: 'delta', symbol: 'ARBUSDT', ops: [{ op: 'close_remainder' }] }])
   })
 })
+
+// Продолжение того же класса потерь: автор помечает хэштегом ОДНУ позицию, а соседнюю называет
+// словом — «#ZRO - фиксирую позицию. По солане тоже фиксирую». Хэштег один, поэтому весь лексикон
+// уезжал на ZRO, а указание по солане пропадало. Исполнять коин-слово детерминированно нельзя (в
+// CH1 половина текста — аналитика, где «биток закрывается выше 64k» это описание свечи, а не
+// приказ), поэтому такие сообщения уходят в модель целиком.
+describe('ch1.adapter — коин-слово рядом с действием отдаёт сообщение модели', () => {
+  function ctx(text: string): ParseContext {
+    return {
+      channelId: '2088626562',
+      message: { id: 1, text, date: '2026-08-13T10:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, () => true),
+      isListed: () => true,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('«#ZRO - фиксирую позицию. По солане тоже фиксирую» -> AI, а не молчаливая потеря соланы', () => {
+    const result = parseCh1(ctx('#ZRO - фиксирую позицию полностью.\nПо солане тоже фиксирую позицию.'))
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('ambiguous_symbol')
+  })
+
+  it('коин-слово БЕЗ действия в своём предложении разбор не ломает', () => {
+    const result = parseCh1(ctx('#ARB - остаток позиции фиксирую по текущим. Актив не реагирует на снижение биткоина.'))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([{ kind: 'delta', symbol: 'ARBUSDT', ops: [{ op: 'close_remainder' }] }])
+  })
+
+  it('коин-слово того же символа, что и хэштег, эскалацию не вызывает', () => {
+    const result = parseCh1(ctx('#ARB - фиксирую позицию полностью. Арбитрум не показал движения.'))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([{ kind: 'delta', symbol: 'ARBUSDT', ops: [{ op: 'close_remainder' }] }])
+  })
+})

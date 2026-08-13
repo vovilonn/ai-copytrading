@@ -496,6 +496,11 @@ function tryDeltaSl(text: string, ctx: ParseContext): ParsedResult | null {
   // не «первое коин-слово» из всего сообщения). Так "Sl 74\nМожет быть … по битку" (221445)
   // НЕ даёт ложный BTCUSDT: "битку" находится на второй строке, где нет sl/стоп-гейта.
   for (const line of gateLines) {
+    // ДВЕ МОНЕТЫ В ОДНОЙ СТРОКЕ — не наш случай. «Закрываю солану и эфир полностью» раньше давало
+    // закрытие ТОЛЬКО соланы (брался первый коин), а эфир пропадал молча. Приписать инструкцию
+    // первой монете значит угадать, разобрать обе — тоже (может оказаться «солану закрываю, эфир
+    // держу»). Отдаём сообщение модели: она читает строку целиком.
+    if (symbolsInText(line, ctx).length > 1) return { route: 'ai', confidence: 0.4, intents: [], reason: 'ambiguous_symbol' }
     const coin = extractCoins(line)[0]
     if (coin === undefined) continue
     const symbol = ctx.resolveSymbol(coin)

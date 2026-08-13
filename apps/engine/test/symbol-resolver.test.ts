@@ -145,3 +145,33 @@ describe('extractCoins — все коин-слова из текста (researc
     expect(extractCoins('битка выросла, битка снова в деле')).toEqual(['BTC'])
   })
 })
+
+// Пропущенная падежная форма — молча потерянная инструкция: «по эфиру стоп в бу» не резолвился
+// вовсе (в списке были ефир/ефира/ефире/ефиром, но не ефиру). Разбор 13.08.2026 нашёл дыры сразу
+// в трёх монетах.
+describe('COIN_ALIASES — падежи целиком', () => {
+  const listed = () => true
+
+  it.each([
+    ['биткоин', 'BTCUSDT'],
+    ['биткоина', 'BTCUSDT'],
+    ['биткоину', 'BTCUSDT'],
+    ['биткойн', 'BTCUSDT'],
+    ['эфиру', 'ETHUSDT'],
+    ['эфириум', 'ETHUSDT'],
+    ['рипле', 'XRPUSDT'],
+    ['риплом', 'XRPUSDT'],
+    ['догу', 'DOGEUSDT'],
+  ])('«%s» -> %s', (word, symbol) => {
+    const coins = extractCoins(word)
+    expect(coins).toHaveLength(1)
+    expect(resolveSymbol(coins[0]!, listed)).toBe(symbol)
+  })
+
+  it.each(['битва', 'битвы', 'битый', 'договор', 'догадка', 'догнать', 'солнце', 'эфирный', 'эфирная'])(
+    'обычное слово «%s» монетой не считается',
+    (word) => {
+      expect(extractCoins(word)).toHaveLength(0)
+    },
+  )
+})

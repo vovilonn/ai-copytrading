@@ -1,5 +1,5 @@
 import { normalize } from '../normalize.js'
-import { extractSide } from '../symbol-resolver.js'
+import { extractCoins, extractSide } from '../symbol-resolver.js'
 import { parseNumbers, toNum } from 'shared/numbers.js'
 import type { DeltaOp, ParseContext, ParsedIntent, ParsedResult } from 'shared/domain.js'
 
@@ -195,6 +195,45 @@ function symbolSegments(text: string): Array<{ ticker: string; segment: string }
 }
 
 /**
+ * Куски, в которых живёт ОДНО указание автора: строка, а внутри строки — предложение. Точка и
+ * перевод строки заканчивают мысль, запятая — нет («зафиксировал 50%, остаток держу» — одна мысль).
+ */
+function clauses(text: string): string[] {
+  return text
+    .split(/[\n.!?]+/)
+    .map((c) => c.trim())
+    .filter((c) => c.length > 0)
+}
+
+/**
+ * КОИН-СЛОВО БЕЗ ХЭШТЕГА — ПОВОД ПОЗВАТЬ МОДЕЛЬ, А НЕ ГАДАТЬ.
+ *
+ * Автор помечает управляемую позицию хэштегом, но соседнюю может назвать словом: «#ZRO - фиксирую
+ * позицию. По солане тоже фиксирую». Хэштег один, поэтому весь лексикон уезжал на ZRO, а указание
+ * по солане пропадало — тот же класс потери, что стоил ETHFI (12.08.2026), только без второго
+ * хэштега.
+ *
+ * Исполнять коин-слово детерминированно нельзя: в CH1 половина текста — аналитика, где «биток
+ * закрывается выше 64k» это не приказ, а описание свечи. Поэтому здесь принимается единственное
+ * безопасное решение: сообщение уходит в AI, который читает его целиком и с картинками.
+ *
+ * Триггер узкий — коин-слово должно стоять в ОДНОМ предложении с action-словом и не совпадать ни
+ * с одним хэштегом сообщения. «#ARB – остаток фиксирую. Актив не реагирует на снижение биткоина»
+ * остаётся детерминированным: во втором предложении action-слов нет.
+ */
+function mentionsForeignCoinWord(text: string, ctx: ParseContext, hashtagSymbols: ReadonlySet<string>): boolean {
+  for (const clause of clauses(text)) {
+    if (extractOps(clause).length === 0) continue
+    for (const coin of extractCoins(clause)) {
+      const symbol = ctx.resolveSymbol(coin)
+      if (symbol === null || !ctx.isListed(symbol) || hashtagSymbols.has(symbol)) continue
+      return true
+    }
+  }
+  return false
+}
+
+/**
  * Строит дельты сообщения. Один символ — прежнее поведение (лексикон по всему тексту: действие
  * запросто стоит ДО хэштега, «фиксирую половину по #ARB»). Несколько — каждому символу только
  * СВОЙ сегмент, чужие инструкции к нему не приклеиваются.
@@ -216,6 +255,9 @@ function buildDeltaIntents(text: string, ctx: ParseContext, tickers: string[]): 
   if (listed.length === 0) return { notListed: true }
 
   const distinct = new Set(listed.map((s) => s.symbol))
+  // Коин-слово чужой монеты рядом с action-словом — разбираем не мы (см. mentionsForeignCoinWord).
+  if (mentionsForeignCoinWord(text, ctx, distinct)) return { escalate: true }
+
   if (distinct.size === 1) {
     const ops = extractOps(text)
     if (ops.length === 0) return null

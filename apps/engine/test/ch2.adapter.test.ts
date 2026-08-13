@@ -678,3 +678,36 @@ describe('ch2.adapter — «остаток удерживаю» это НЕ вы
     expect(ops('Остаток по битку фиксирую')).toContainEqual({ op: 'close_remainder' })
   })
 })
+
+// Та же потеря в свободном тексте: «Закрываю солану и эфир полностью» закрывало ТОЛЬКО солану —
+// правило D брало первый коин строки, второй пропадал молча.
+describe('ch2.adapter — две монеты в одной строке разбирает модель', () => {
+  function ctxFor(text: string): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 1, text, date: '2026-08-13T10:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('«Закрываю солану и эфир полностью» -> AI, а не закрытие одной соланы', () => {
+    const result = parseCh2(ctxFor('Закрываю солану и эфир полностью'))
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('ambiguous_symbol')
+  })
+
+  it('каждая монета на своей строке по-прежнему разбирается детерминированно', () => {
+    const result = parseCh2(ctxFor('Закрываю солану\nПо эфиру стоп в бу'))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([
+      { kind: 'delta', symbol: 'SOLUSDT', ops: [{ op: 'close_remainder' }] },
+      { kind: 'delta', symbol: 'ETHUSDT', ops: [{ op: 'sl_breakeven' }] },
+    ])
+  })
+})
