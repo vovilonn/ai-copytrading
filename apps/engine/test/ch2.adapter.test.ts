@@ -647,3 +647,34 @@ describe('ch2.adapter — символ берётся из ЦЕПОЧКИ реп
     expect(result.route).toBe('ai')
   })
 })
+
+// Тот же капкан, что подвёл CH1 13.08.2026: слово «остаток» стоит в гейте выхода, и фраза
+// «остаток продолжаю удерживать» читалась как «закрыть остаток».
+describe('ch2.adapter — «остаток удерживаю» это НЕ выход', () => {
+  function ctxFor(text: string): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 1, text, date: '2026-08-13T10:44:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+  const ops = (text: string) => parseCh2(ctxFor(text)).intents.flatMap((i) => (i.kind === 'delta' ? i.ops : []))
+
+  it('«остаток по битку продолжаю удерживать» -> закрытия нет', () => {
+    expect(ops('Остаток по битку продолжаю удерживать')).not.toContainEqual({ op: 'close_remainder' })
+  })
+
+  it('доля рядом с удержанием остатка сохраняется: «зафиксировал 50% по битку, остаток держу»', () => {
+    const result = ops('Зафиксировал 50% по битку, остаток держу')
+    expect(result).toContainEqual({ op: 'partial_close', fraction: 0.5 })
+    expect(result).not.toContainEqual({ op: 'close_remainder' })
+  })
+
+  it('настоящее закрытие остатка по-прежнему закрывает: «остаток по битку фиксирую»', () => {
+    expect(ops('Остаток по битку фиксирую')).toContainEqual({ op: 'close_remainder' })
+  })
+})
