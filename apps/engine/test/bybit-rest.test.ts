@@ -679,13 +679,13 @@ describe('resolveAvailableBalance — доступный остаток, ког�
     expect(resolveAvailableBalance('123.45', [usdt])).toBe('123.45')
   })
 
-  it('пустая строка -> считаем сами: собственные средства минус занятая маржа', () => {
-    // 283.28345633 − 36.63134143 − 0
-    expect(resolveAvailableBalance('', [usdt])).toBe('246.6521149')
+  it('пустая строка -> считаем сами: баланс кошелька минус занятая маржа', () => {
+    // 278.71085633 − 36.63134143 − 0
+    expect(resolveAvailableBalance('', [usdt])).toBe('242.0795149')
   })
 
   it('маржа под выставленными ордерами тоже вычитается', () => {
-    expect(resolveAvailableBalance('', [{ ...usdt, totalOrderIM: '10' }])).toBe('236.6521149')
+    expect(resolveAvailableBalance('', [{ ...usdt, totalOrderIM: '10' }])).toBe('232.0795149')
   })
 
   it('перегруз маржой -> ноль, а не отрицательный остаток', () => {
@@ -694,11 +694,28 @@ describe('resolveAvailableBalance — доступный остаток, ког�
 
   it('нет данных по монете -> пустая строка: врать числом нельзя, пусть решает вызывающий', () => {
     expect(resolveAvailableBalance('', [])).toBe('')
-    expect(resolveAvailableBalance('', [{ ...usdt, equity: '' }])).toBe('')
+    expect(resolveAvailableBalance('', [{ ...usdt, walletBalance: '' }])).toBe('')
   })
 
   it('settle-монета выбирается по USDT, а не по первой в списке', () => {
     const btc = { coin: 'BTC', walletBalance: '0.5', usdValue: '30000', availableToWithdraw: '', equity: '0.5', totalPositionIM: '0' }
-    expect(resolveAvailableBalance('', [btc, usdt])).toBe('246.6521149')
+    expect(resolveAvailableBalance('', [btc, usdt])).toBe('242.0795149')
+  })
+
+  // Живой счёт 14.08.2026: позиции в просадке на −44.69, из-за чего equity (225.16) оказалась НИЖЕ
+  // занятой маржи (248.10) — формула по equity давала 0 и рубила вход по LDO как
+  // insufficient_margin. Биржа при этом показывала и реально давала 21.76 = walletBalance − IM:
+  // плавающий минус доступную маржу не съедает, а мы вычитали его дважды.
+  it('позиции в просадке: плавающий минус доступную маржу НЕ съедает', () => {
+    const drawdown = {
+      coin: 'USDT',
+      walletBalance: '269.85312124',
+      usdValue: '224.93079127',
+      availableToWithdraw: '',
+      equity: '225.16406124', // на 44.69 ниже кошелька — это нереализованный убыток
+      totalPositionIM: '248.09539367',
+      totalOrderIM: '0',
+    }
+    expect(resolveAvailableBalance('', [drawdown])).toBe('21.75772757')
   })
 })

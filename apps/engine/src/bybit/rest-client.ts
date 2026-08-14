@@ -243,9 +243,21 @@ export interface WalletBalance {
  * Из-за пустого поля вся цепочка вниз (pickNonEmptyEquity) подставляла вместо остатка ПОЛНЫЙ
  * депозит, и в админке «Available» совпадал с «Total equity», хотя $36 уже заняты под маржу.
  *
- * Считаем сами по формуле самой биржи: доступно = собственные средства − начальная маржа позиций
- * и выставленных ордеров. Данные для этого лежат в разрезе монеты, и они непустые.
- * Если и там пусто — возвращаем пустую строку: пусть решает вызывающий, врать числом нельзя.
+ * Считаем сами: доступно = БАЛАНС КОШЕЛЬКА − начальная маржа позиций и выставленных ордеров.
+ *
+ * ⚠️ Именно walletBalance, а НЕ equity. Разница — нереализованный PnL, и она стоила пропущенных
+ * сделок. Живой счёт 14.08.2026: walletBalance 269.85, equity 225.16 (минус 44.69 плавающего
+ * убытка), маржа под позициями 248.10. Наша формула по equity давала 0 и рубила вход по LDO как
+ * `insufficient_margin`, тогда как биржа показывала и реально давала **21.76** = 269.85 − 248.10.
+ * То есть плавающий минус по открытым позициям у Bybit доступную маржу НЕ съедает (её съедает
+ * реализованный убыток, а он уже сидит в walletBalance), а мы вычитали его дважды и в просадке
+ * переставали торговать вовсе — ровно тогда, когда сигналы и нужны.
+ *
+ * Плавающий ПЛЮС при этом не добавляем: он в доступный остаток у биржи тоже не идёт до фиксации,
+ * а ошибиться в меньшую сторону здесь дёшево (войдём меньшим объёмом), в большую — отказ 110007.
+ *
+ * Если непустых чисел нет вовсе — возвращаем пустую строку: пусть решает вызывающий, врать
+ * числом нельзя.
  */
 export function resolveAvailableBalance(reported: string, coins: readonly WalletCoinBalance[]): string {
   if (reported !== '') return reported
@@ -253,14 +265,14 @@ export function resolveAvailableBalance(reported: string, coins: readonly Wallet
   const settle = coins.find((c) => c.coin === 'USDT') ?? coins[0]
   if (!settle) return ''
 
-  const equity = settle.equity !== undefined && settle.equity !== '' ? new Decimal(settle.equity) : null
-  if (equity === null) return ''
+  const wallet = settle.walletBalance !== undefined && settle.walletBalance !== '' ? new Decimal(settle.walletBalance) : null
+  if (wallet === null) return ''
 
   const positionIm = settle.totalPositionIM !== undefined && settle.totalPositionIM !== '' ? new Decimal(settle.totalPositionIM) : new Decimal(0)
   const orderIm = settle.totalOrderIM !== undefined && settle.totalOrderIM !== '' ? new Decimal(settle.totalOrderIM) : new Decimal(0)
 
   // Ниже нуля доступного остатка не бывает: при перегрузе маржой биржа сама показывает 0.
-  return Decimal.max(0, equity.minus(positionIm).minus(orderIm)).toString()
+  return Decimal.max(0, wallet.minus(positionIm).minus(orderIm)).toString()
 }
 
 /** `GET /v5/position/list` (research §1/§14) — поля, нужные сайзингу/реконсиляции/UI. */
