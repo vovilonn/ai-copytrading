@@ -391,7 +391,16 @@ const PERCENT_NUM_RE = /\d+(?:[.,]\d+)?\s*%/g
 // Строка про ЦЕЛЬ с ценой: «Первый тейк по битку 63950», «цель по эфиру 1943». Порядковое слово
 // даёт номер ступени лесенки — по нему пайплайн понимает, что названа ОДНА цель из нескольких, и
 // закрывает долю, а не весь объём.
-const TP_GATE_RE = /тейк|цел[ьи]|таргет/i
+// 🎯 — полноценный маркер цели у этого автора: «По битку первая 🎯» не содержит ни слова «цель»,
+// ни «тейк», и строка молча не проходила гейт (живая потеря 23.08.2026, msg 221618).
+// «Следующие - 78800, 79900» — тоже цели, названные без слова «цель».
+const TP_GATE_RE = /тейк|цел[ьи]|таргет|следующ[а-яё]*|🎯/i
+
+/**
+ * Цель ВЗЯТА, а не назначена: «первая 🎯», «цель взята», «первый тейк есть». Отличается от
+ * назначения цели отсутствием НОВОЙ цены в строке — автор сообщает о факте, а не даёт уровень.
+ */
+const TP_HIT_RE = /🎯|цел[ьи]\s+(взят|есть|выполнен)|тейк\s+(взят|есть|выполнен)|(взят|выполнен)[а-яё]*\s+(перв|втор|трет)/i
 const TP_ORDINAL_RE = /(перв|втор|трет|четв[её]рт|пят)[а-яё]*/i
 const TP_ORDINALS = ['перв', 'втор', 'трет', 'четв', 'пят'] as const
 
@@ -411,13 +420,26 @@ function tpIndexOf(line: string): number | undefined {
   return index >= 0 ? index + 1 : undefined
 }
 
-/** Цель из строки: цена + (если названа) номер ступени. */
-function extractTpOpFromLine(line: string): DeltaOp | null {
+/**
+ * Цель из строки: цена + (если названа) номер ступени.
+ *
+ * `exclude` — число, которое в этой же строке уже забрал СТОП («цель 2435, стоп 2300»): без этого
+ * цена стопа уехала бы ещё и в цели. Раньше проблемы не было лишь потому, что строка отдавала
+ * ровно один op и до целей дело не доходило.
+ */
+function extractTpOpFromLine(line: string, exclude?: number): DeltaOp | null {
   if (!TP_GATE_RE.test(line)) return null
-  const numbers = parseNumbers(line.replace(PERCENT_NUM_RE, (m) => ' '.repeat(m.length)))
+  const numbers = parseNumbers(line.replace(PERCENT_NUM_RE, (m) => ' '.repeat(m.length))).filter((n) => n !== exclude)
   if (numbers.length === 0) return null
   const index = tpIndexOf(line)
   return { op: 'tp_set', targets: numbers.map((value) => ({ value, ...(index !== undefined ? { index } : {}) })) }
+}
+
+/** «Первая 🎯» — цель ВЗЯТА. Номер ступени, если назван («первая»/«вторая»). */
+function extractTpHitOpFromLine(line: string): DeltaOp | null {
+  if (!TP_HIT_RE.test(line)) return null
+  const index = tpIndexOf(line)
+  return { op: 'tp_hit', ...(index !== undefined ? { index } : {}) }
 }
 
 /** Выход из позиции: «закрываю Солану» — весь остаток; «фиксирую» без доли решает пайплайн. */
@@ -480,6 +502,124 @@ function extractSlOpFromLine(line: string): DeltaOp | null {
   return { op: 'sl_set', price: nearest.value }
 }
 
+/**
+ * СТРОКА-ПРОДОЛЖЕНИЕ: «По битку - 77500» после «По эфиру первая цель - 2435».
+ *
+ * Автор называет вид инструкции ОДИН раз и дальше перечисляет монеты с ценами. Такая строка не
+ * содержит ни «цель», ни «стоп» — гейт её не видел, и инструкция пропадала целиком (живая потеря
+ * 23.08.2026, msg 221615: первая цель по битку 77500 не доехала до биржи). Ровно это правило уже
+ * описано в промпте модели («an ordinal stated once carries over to the elliptical lines»), но до
+ * модели дело не доходило: сообщение считалось разобранным.
+ *
+ * Условие НАМЕРЕННО жёсткое — строка должна состоять ТОЛЬКО из монеты, чисел и служебных слов.
+ * «Биток пока подошёл к 64000» под него не подходит: там есть слова, которых в шаблоне нет, и
+ * такая строка уйдёт в общий гейт неполного покрытия (то есть к модели), а не станет приказом.
+ */
+const ELLIPSIS_FILLER_RE = /^(по|на|у|в|и|же|за|до|от|для)$/i
+
+function isEllipsisLine(line: string, ctx: ParseContext, carriedSymbol: string | null): boolean {
+  if (parseNumbers(line).length === 0) return false
+  const lineSymbols = symbolsInText(line, ctx)
+  if (lineSymbols.length > 1) return false
+  // Монеты в строке может не быть вовсе — тогда её даёт предыдущая строка («Первый тейк битка
+  // 63950 / Второй - 64500»). Без унаследованного символа приписывать инструкцию некому.
+  if (lineSymbols.length === 0 && carriedSymbol === null) return false
+
+  // Каждое слово строки обязано быть числом, монетой, порядковым словом или предлогом. Один
+  // «лишний» глагол — и это уже не продолжение перечня, а фраза («Биток пока подошёл к 64000»).
+  const words = line.split(/[^\p{L}\p{N}.,]+/u).filter((w) => w.replace(/[.,]/g, '').length > 0)
+  return words.every((word) => {
+    if (/^[\d.,]+$/.test(word)) return true
+    if (ELLIPSIS_FILLER_RE.test(word)) return true
+    if (TP_ORDINAL_RE.test(word)) return true
+    return ctx.resolveSymbol(normalize(word)) !== null
+  })
+}
+
+/**
+ * Проходит по строкам и собирает дельты. `initialSymbol` — символ, известный ИЗВНЕ (из ветки
+ * реплаев): с ним разбираются сообщения, где монета названа только в родителе.
+ */
+function collectLineIntents(
+  lines: readonly string[],
+  ctx: ParseContext,
+  lineGate: RegExp,
+  initialSymbol: string | null,
+): { intents: ParsedIntent[]; coveredLines: Set<string>; ambiguous: boolean } {
+  const intents: ParsedIntent[] = []
+  const coveredLines = new Set<string>()
+  // Символ ПРЕДЫДУЩЕЙ строки — для эллипсиса. Автор называет монету один раз и продолжает про неё
+  // же: «По эфиру первая цель - 2435 стоп на твх / По битку - 77500» и «По битку первая 🎯 /
+  // Следующие - 78800, 79900». Строка без монеты раньше просто пропадала (живые потери
+  // 23.08.2026 — msg 221615 и 221618: три инструкции по битку не дошли до биржи).
+  let carriedSymbol: string | null = initialSymbol
+  /** Вид инструкции предыдущей строки — его наследуют строки-продолжения (см. isEllipsisLine). */
+  let carriedOp: { kind: 'tp_set'; index?: number } | { kind: 'sl_set' } | null = null
+
+  for (const line of lines) {
+    if (!lineGate.test(line)) {
+      // Не гейт-строка: единственный шанс — продолжение предыдущей инструкции.
+      if (carriedOp === null || !isEllipsisLine(line, ctx, carriedSymbol)) continue
+      const symbol = symbolsInText(line, ctx)[0] ?? carriedSymbol!
+      const prices = parseNumbers(line)
+      // Номер ступени: назван в самой строке («Второй - 64500») либо унаследован от предыдущей.
+      const carriedIndex = carriedOp.kind === 'tp_set' ? carriedOp.index : undefined
+      const index = tpIndexOf(line) ?? carriedIndex
+      const op: DeltaOp =
+        carriedOp.kind === 'sl_set'
+          ? { op: 'sl_set', price: prices[0]! }
+          : { op: 'tp_set', targets: prices.map((value) => ({ value, ...(index !== undefined ? { index } : {}) })) }
+      coveredLines.add(line)
+      carriedSymbol = symbol
+      intents.push({ kind: 'delta', symbol, ops: [op] })
+      continue
+    }
+    // ДВЕ МОНЕТЫ В ОДНОЙ СТРОКЕ — не наш случай. «Закрываю солану и эфир полностью» раньше давало
+    // закрытие ТОЛЬКО соланы (брался первый коин), а эфир пропадал молча. Приписать инструкцию
+    // первой монете значит угадать, разобрать обе — тоже (может оказаться «солану закрываю, эфир
+    // держу»). Отдаём сообщение модели: она читает строку целиком.
+    const lineSymbols = symbolsInText(line, ctx)
+    if (lineSymbols.length > 1) return { intents: [], coveredLines, ambiguous: true }
+
+    // Монета своя, а нет своей — наследуем от предыдущей строки (эллипсис).
+    const symbol = lineSymbols[0] ?? carriedSymbol
+    if (symbol === null || symbol === undefined) continue
+    if (lineSymbols.length === 1) carriedSymbol = lineSymbols[0]!
+
+    // СТРОКА МОЖЕТ НЕСТИ НЕСКОЛЬКО ИНСТРУКЦИЙ. «По эфиру первая цель - 2435 стоп на твх» — это и
+    // цель, и перевод стопа; раньше брался ПЕРВЫЙ подошедший op, и цель 2435 терялась.
+    const slOp = extractSlOpFromLine(line)
+    // Цена, уже съеденная стопом, не должна уехать ещё и в цели («цель 2435, стоп 2300»).
+    const slPrice = slOp !== null && slOp.op === 'sl_set' ? slOp.price : undefined
+    const ops: DeltaOp[] = []
+    if (slOp !== null) ops.push(slOp)
+    const hitOp = extractTpHitOpFromLine(line)
+    if (hitOp !== null) ops.push(hitOp)
+    const tpOp = extractTpOpFromLine(line, slPrice)
+    if (tpOp !== null) ops.push(tpOp)
+    // Выход считаем только когда цели/стопа в строке нет: «фиксирую» рядом с целью — это про ту же
+    // цель, а не отдельное закрытие («первая цель - 2435, фиксирую» не должно закрывать долю ДВАЖДЫ).
+    if (ops.length === 0) {
+      const closeOp = extractCloseOpFromLine(line)
+      if (closeOp !== null) ops.push(closeOp)
+    }
+    if (ops.length === 0) continue
+    // Вид последней инструкции — для строк-продолжений ниже.
+    const tp = ops.find((o): o is Extract<DeltaOp, { op: 'tp_set' }> => o.op === 'tp_set')
+    const sl = ops.find((o): o is Extract<DeltaOp, { op: 'sl_set' }> => o.op === 'sl_set')
+    if (tp !== undefined) {
+      const index = tp.targets[0]?.index
+      carriedOp = { kind: 'tp_set', ...(index !== undefined ? { index } : {}) }
+    } else if (sl !== undefined) {
+      carriedOp = { kind: 'sl_set' }
+    }
+    coveredLines.add(line)
+    intents.push({ kind: 'delta', symbol, ops })
+  }
+
+  return { intents, coveredLines, ambiguous: false }
+}
+
 function tryDeltaSl(text: string, ctx: ParseContext): ParsedResult | null {
   // Правило разбирает ПОСТРОЧНЫЕ инструкции с тикером: стоп, цель, выход. Раньше гейт был только
   // на стоп — и сообщение «Около бу закрываю Солану / По битку ставлю стоп в бу / Первый тейк по
@@ -490,27 +630,15 @@ function tryDeltaSl(text: string, ctx: ParseContext): ParsedResult | null {
 
   const lines = text.split('\n')
   const gateLines = lines.filter((line) => LINE_GATE_RE.test(line))
-  const intents: ParsedIntent[] = []
 
   // Прямое извлечение: символ БЕРЁМ ТОЛЬКО со строки, где стоит sl/стоп (research §7 вывод —
   // не «первое коин-слово» из всего сообщения). Так "Sl 74\nМожет быть … по битку" (221445)
   // НЕ даёт ложный BTCUSDT: "битку" находится на второй строке, где нет sl/стоп-гейта.
-  for (const line of gateLines) {
-    // ДВЕ МОНЕТЫ В ОДНОЙ СТРОКЕ — не наш случай. «Закрываю солану и эфир полностью» раньше давало
-    // закрытие ТОЛЬКО соланы (брался первый коин), а эфир пропадал молча. Приписать инструкцию
-    // первой монете значит угадать, разобрать обе — тоже (может оказаться «солану закрываю, эфир
-    // держу»). Отдаём сообщение модели: она читает строку целиком.
-    if (symbolsInText(line, ctx).length > 1) return { route: 'ai', confidence: 0.4, intents: [], reason: 'ambiguous_symbol' }
-    const coin = extractCoins(line)[0]
-    if (coin === undefined) continue
-    const symbol = ctx.resolveSymbol(coin)
-    if (symbol === null || !ctx.isListed(symbol)) continue
-    // Порядок важен: строка «стоп в бу» может содержать и число цели — стоп забирает её первым
-    // (см. extractSlOpFromLine), а цель без стоп-маркера уходит в TP-ветку.
-    const op = extractSlOpFromLine(line) ?? extractTpOpFromLine(line) ?? extractCloseOpFromLine(line)
-    if (op === null) continue
-    intents.push({ kind: 'delta', symbol, ops: [op] })
-  }
+  // Разбор строк. Второй заход (ниже) повторяет его с символом из ветки реплаев — иначе
+  // сообщение, где монета названа только в родителе, теряло всё, кроме стопа.
+  const direct = collectLineIntents(lines, ctx, LINE_GATE_RE, null)
+  if (direct.ambiguous) return { route: 'ai', confidence: 0.4, intents: [], reason: 'ambiguous_symbol' }
+  let { intents, coveredLines } = direct
 
   if (intents.length === 0) {
     // Ни одна sl/стоп-строка не дала символ напрямую — идём вверх по ЦЕПОЧКЕ реплаев
@@ -518,10 +646,13 @@ function tryDeltaSl(text: string, ctx: ParseContext): ParsedResult | null {
     // но когда ветка разрешается (пример 221445 → reply 221443, структурный #SOLUSDT-сигнал),
     // это лучше, чем гадать по случайному коин-слову в другой строке).
     const parentSymbol = resolveSymbolFromReplyChain(ctx)
-    const anchorLine = gateLines[0]
-    if (parentSymbol !== null && anchorLine !== undefined) {
-      const op = extractSlOpFromLine(anchorLine)
-      if (op !== null) intents.push({ kind: 'delta', symbol: parentSymbol, ops: [op] })
+    if (parentSymbol !== null) {
+      // ПОЛНЫЙ разбор с символом из ветки, а не только стоп по первой строке: «Стоп на твх, первый
+      // таргет 73.5» в ответе на сигнал терял цель — reply-ветка знала лишь про extractSlOpFromLine.
+      const fromReply = collectLineIntents(lines, ctx, LINE_GATE_RE, parentSymbol)
+      if (fromReply.ambiguous) return { route: 'ai', confidence: 0.4, intents: [], reason: 'ambiguous_symbol' }
+      intents = fromReply.intents
+      coveredLines = fromReply.coveredLines
     }
   }
 
@@ -530,7 +661,60 @@ function tryDeltaSl(text: string, ctx: ParseContext): ParsedResult | null {
     // "DELTA_SL без тикера" (research §2 D, conf 0.4 → AI, нужен state/vision).
     return { route: 'ai', confidence: 0.4, intents: [] }
   }
-  return { route: 'execute', confidence: 0.75, intents }
+
+  // ОДИН ИНТЕНТ НА СИМВОЛ. Пайплайн дедуплицирует действия по (сообщение, тип, символ), поэтому
+  // две дельты одного вида по одной монете («Первый тейк битка 63950 / Второй - 64500») дошли бы
+  // до биржи ТОЛЬКО первой. Сливаем ops в порядке строк, а цели одного символа — в одну лесенку.
+  const merged = mergeIntentsBySymbol(intents)
+
+  // СТРАХОВКА ОТ ТИХОЙ ПОТЕРИ. Часть сообщения разобралась, а строка, которая ЯВНО выглядит
+  // инструкцией (торговый маркер плюс число или монета), не дала ничего — значит шаблон её формы
+  // не знает. Исполнить понятое и промолчать про остальное — ровно тот дефект, который стоил трёх
+  // потерянных целей 23.08.2026. Отдаём сообщение модели целиком: она читает его вместе с веткой
+  // реплаев, картинками и открытыми позициями. Детерминированные интенты передаём с собой — если
+  // модель окажется недоступна, реконсилер исполнит хотя бы их (pipeline.ts).
+  const uncovered = lines.filter((line) => {
+    if (coveredLines.has(line) || line.trim().length === 0) return false
+    const normalized = normalize(line)
+    // Торговый маркер И число: «Может быть финальный вынос по битку» — рассуждение без цифр, а
+    // инструкция у этого автора всегда несёт уровень («Sl 74», «Первый тейк 63950»).
+    return hasTradeMarker(normalized) && parseNumbers(line).length > 0
+  })
+  if (uncovered.length > 0) {
+    return { route: 'ai', confidence: 0.5, intents: merged, reason: 'partial_parse' }
+  }
+
+  return { route: 'execute', confidence: 0.75, intents: merged }
+}
+
+/**
+ * Сливает дельты одного символа в одну: ops идут в порядке строк, а несколько `tp_set` становятся
+ * ОДНОЙ лесенкой (иначе вторая цель того же символа не пережила бы дедупликацию пайплайна).
+ */
+function mergeIntentsBySymbol(intents: readonly ParsedIntent[]): ParsedIntent[] {
+  const bySymbol = new Map<string, Extract<ParsedIntent, { kind: 'delta' }>>()
+  const order: string[] = []
+  for (const intent of intents) {
+    if (intent.kind !== 'delta' || intent.symbol === null) continue
+    const existing = bySymbol.get(intent.symbol)
+    if (existing === undefined) {
+      bySymbol.set(intent.symbol, { ...intent, ops: [...intent.ops] })
+      order.push(intent.symbol)
+      continue
+    }
+    for (const op of intent.ops) {
+      const sameTp =
+        op.op === 'tp_set'
+          ? existing.ops.find((o): o is Extract<DeltaOp, { op: 'tp_set' }> => o.op === 'tp_set')
+          : undefined
+      if (op.op === 'tp_set' && sameTp !== undefined) {
+        sameTp.targets = [...sameTp.targets, ...op.targets]
+        continue
+      }
+      existing.ops.push(op)
+    }
+  }
+  return order.map((symbol) => bySymbol.get(symbol)!)
 }
 
 // ---------------------------------------------------------------------------

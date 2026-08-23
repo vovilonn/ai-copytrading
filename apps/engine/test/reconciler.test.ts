@@ -185,3 +185,49 @@ describe('reconcile — деградация (AI недоступен): ai=null 
   })
 })
 
+
+// Живой день 23.08.2026: у ai-прокси истёк OAuth-токен, и КАЖДОЕ сообщение, ушедшее в модель, не
+// делало ничего. С неполным покрытием (часть строк шаблон понял, часть нет) это означало бы потерю
+// в том числе понятой половины — например перевода стопа в безубыток.
+describe('reconcile — AI недоступен, но шаблон часть понял', () => {
+  const ctx = { channelId: 1962583820 }
+  const partial: ParsedResult = {
+    route: 'ai',
+    confidence: 0.5,
+    reason: 'partial_parse',
+    intents: [{ kind: 'delta', symbol: 'ETHUSDT', ops: [{ op: 'sl_breakeven' }] }],
+  }
+
+  it('исполняем понятое, а не роняем всё сообщение в needs_review', () => {
+    const decision = reconcile(partial, null, ctx)
+
+    expect(decision.outcome).toBe('executing')
+    expect(decision.method).toBe('auto')
+    expect(decision.reason).toBe('ai_unavailable_partial')
+    expect(decision.decided.map((d) => d.intent)).toEqual(partial.intents)
+  })
+
+  it('шаблон не понял ничего -> прежнее поведение: needs_review, ноль действий', () => {
+    const decision = reconcile({ route: 'ai', confidence: 0.4, intents: [] }, null, ctx)
+
+    expect(decision.outcome).toBe('needs_review')
+    expect(decision.reason).toBe('ai_unavailable')
+    expect(decision.decided).toHaveLength(0)
+  })
+
+  it('модель доступна и уверена -> её разбор главнее частичного шаблонного', () => {
+    const ai: ParsedResult = {
+      route: 'execute',
+      confidence: 0.95,
+      intents: [
+        { kind: 'delta', symbol: 'ETHUSDT', ops: [{ op: 'sl_breakeven' }] },
+        { kind: 'delta', symbol: 'BTCUSDT', ops: [{ op: 'tp_set', targets: [{ value: 78800 }] }] },
+      ],
+    }
+    const decision = reconcile(partial, ai, ctx)
+
+    expect(decision.outcome).toBe('executing')
+    expect(decision.method).toBe('ai')
+    expect(decision.decided).toHaveLength(2)
+  })
+})

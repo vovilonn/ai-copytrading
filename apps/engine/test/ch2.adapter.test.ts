@@ -258,14 +258,19 @@ describe('ch2.adapter — точечные проверки (task-3-brief.md)', 
     expect(eth?.kind === 'delta' && eth.ops).toEqual([{ op: 'sl_set', price: 1730 }])
   })
 
-  it('221421 "Sol Sl на твх \\nЛимитка не актуальна не задели \\nСледующие цели 75, 76.5" — sl_breakeven БЕЗ price (число цели не затягивается как цена SL)', () => {
+  it('221421 "Sol Sl на твх \\nЛимитка не актуальна не задели \\nСледующие цели 75, 76.5" — стоп в БУ БЕЗ price и цели отдельной дельтой', () => {
     const { result } = byId(221421)
     expect(result.route).toBe('execute')
-    expect(result.intents).toHaveLength(1)
-    const intent = result.intents[0]!
-    if (intent.kind !== 'delta') throw new Error('unreachable')
-    expect(intent.symbol).toBe('SOLUSDT')
-    expect(intent.ops).toEqual([{ op: 'sl_breakeven' }])
+    // Строка «Следующие цели 75, 76.5» раньше пропадала: символ назван только в ПЕРВОЙ строке, и
+    // правило требовало монету в самой строке. Теперь символ наследуется по эллипсису — это второй
+    // интент, а не потеря (23.08.2026: ровно так терялись цели по битку).
+    expect(result.intents).toEqual([
+      {
+        kind: 'delta',
+        symbol: 'SOLUSDT',
+        ops: [{ op: 'sl_breakeven' }, { op: 'tp_set', targets: [{ value: 75 }, { value: 76.5 }] }],
+      },
+    ])
   })
 
   it('221361 "Стоп на твх Eth" → delta ETHUSDT sl_breakeven (be-маркер без reply, тикер прямо в тексте)', () => {
@@ -437,14 +442,17 @@ describe('ch2.adapter — построчные инструкции: стоп, �
   const deltas = (text: string) =>
     parseCh2(ctxFor(text)).intents.filter((i): i is Extract<ParsedIntent, { kind: 'delta' }> => i.kind === 'delta')
 
-  it('все три строки дают свою инструкцию по своему символу', () => {
+  it('все три строки дают свою инструкцию — по одной дельте на символ', () => {
     const result = deltas('Около бу закрываю Солану\nПо битку ставлю стоп в бу на 63000\nПервый тейк по битку 63950')
 
-    expect(result).toHaveLength(3)
+    // Дельта на СИМВОЛ, а не на строку: пайплайн дедуплицирует действия по (сообщение, тип,
+    // символ), и две отдельные дельты по битку дошли бы до биржи только первой.
+    expect(result).toHaveLength(2)
     expect(result[0]).toMatchObject({ symbol: 'SOLUSDT', ops: [{ op: 'close_remainder' }] })
-    expect(result[1]?.symbol).toBe('BTCUSDT')
-    expect(result[1]?.ops[0]?.op).toBe('sl_breakeven')
-    expect(result[2]).toMatchObject({ symbol: 'BTCUSDT', ops: [{ op: 'tp_set', targets: [{ value: 63950, index: 1 }] }] })
+    expect(result[1]).toMatchObject({
+      symbol: 'BTCUSDT',
+      ops: [{ op: 'sl_breakeven' }, { op: 'tp_set', targets: [{ value: 63950, index: 1 }] }],
+    })
   })
 
   it('порядковое слово даёт номер ступени лесенки — по нему закроется доля, а не весь объём', () => {
@@ -708,6 +716,119 @@ describe('ch2.adapter — две монеты в одной строке раз�
     expect(result.intents).toEqual([
       { kind: 'delta', symbol: 'SOLUSDT', ops: [{ op: 'close_remainder' }] },
       { kind: 'delta', symbol: 'ETHUSDT', ops: [{ op: 'sl_breakeven' }] },
+    ])
+  })
+})
+
+// Живые потери 23.08.2026 (канал AACADEMY). Оба сообщения разобрались как «execute» с одной
+// инструкцией, модель не звалась — и три указания автора не доехали до биржи:
+//   msg 221615 «По эфиру первая цель - 2435 стоп на твх / По битку - 77500»
+//              → был ТОЛЬКО стоп по эфиру (цель 2435 и вся строка про биток пропали)
+//   msg 221618 «Третья цель Eth 2520 / По битку первая 🎯 / Следующие - 78800, 79900»
+//              → была ТОЛЬКО цель по эфиру (взятие цели и две новые цели по битку пропали)
+describe('ch2.adapter — строка несёт несколько инструкций, а соседняя наследует символ', () => {
+  function ctxFor(text: string): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 1, text, date: '2026-08-23T13:26:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+  const parse = (text: string) => parseCh2(ctxFor(text))
+
+  it('msg 221615: цель И стоп из одной строки + цель по битку из строки-продолжения', () => {
+    const result = parse('По эфиру первая цель - 2435 стоп на твх\nПо битку - 77500')
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([
+      { kind: 'delta', symbol: 'ETHUSDT', ops: [{ op: 'sl_breakeven' }, { op: 'tp_set', targets: [{ value: 2435, index: 1 }] }] },
+      { kind: 'delta', symbol: 'BTCUSDT', ops: [{ op: 'tp_set', targets: [{ value: 77500, index: 1 }] }] },
+    ])
+  })
+
+  it('msg 221618: 🎯 это взятая цель, «Следующие» — новые цели того же символа', () => {
+    const result = parse('Третья цель Eth 2520\nПо битку первая 🎯\nСледующие - 78800, 79900')
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([
+      { kind: 'delta', symbol: 'ETHUSDT', ops: [{ op: 'tp_set', targets: [{ value: 2520, index: 3 }] }] },
+      // Взятие цели и новые цели по битку — ОДНА дельта символа (иначе вторая не пережила бы
+      // дедупликацию действий по (сообщение, тип, символ) в пайплайне).
+      {
+        kind: 'delta',
+        symbol: 'BTCUSDT',
+        ops: [{ op: 'tp_hit', index: 1 }, { op: 'tp_set', targets: [{ value: 78800 }, { value: 79900 }] }],
+      },
+    ])
+  })
+
+  it('вид инструкции наследуется вместе с символом: перечень стопов', () => {
+    const result = parse('Стоп по эфиру 2300\nПо битку 74000')
+
+    expect(result.intents).toEqual([
+      { kind: 'delta', symbol: 'ETHUSDT', ops: [{ op: 'sl_set', price: 2300 }] },
+      { kind: 'delta', symbol: 'BTCUSDT', ops: [{ op: 'sl_set', price: 74000 }] },
+    ])
+  })
+
+  it('обычная фраза с монетой и числом продолжением НЕ считается', () => {
+    const result = parse('Первый тейк по битку 63950\nБиток пока подошел к 64000 и замер')
+
+    expect(result.intents).toEqual([
+      { kind: 'delta', symbol: 'BTCUSDT', ops: [{ op: 'tp_set', targets: [{ value: 63950, index: 1 }] }] },
+    ])
+  })
+
+  it('цена стопа не уезжает ещё и в цели: «цель 2435, стоп 2300»', () => {
+    const result = parse('По эфиру цель 2435, стоп 2300')
+
+    expect(result.intents).toEqual([
+      { kind: 'delta', symbol: 'ETHUSDT', ops: [{ op: 'sl_set', price: 2300 }, { op: 'tp_set', targets: [{ value: 2435 }] }] },
+    ])
+  })
+
+  it('строка с уровнем и торговым словом, которую шаблон не понял, отдаёт сообщение модели', () => {
+    const result = parse('Стоп на твх Eth\nПодтяну лимитку на 2300 если сходим')
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('partial_parse')
+    // Понятое передаётся с собой: если модель недоступна, реконсилер исполнит хотя бы это.
+    expect(result.intents).toEqual([{ kind: 'delta', symbol: 'ETHUSDT', ops: [{ op: 'sl_breakeven' }] }])
+  })
+})
+
+// Reply-ветка знала только про стоп: «Стоп на твх, первый таргет 73.5» в ответе на сигнал терял
+// цель — символ брался из ветки реплаев, но разбирался ровно один op первой строки.
+describe('ch2.adapter — символ из ветки реплаев не сужает разбор до стопа', () => {
+  function ctxWithParent(text: string, parentText: string): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 2, text, date: '2026-08-23T13:26:00Z', replyToMsgId: 1, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: (id: number) =>
+        id === 1
+          ? { id: 1, text: parentText, date: '2026-08-23T12:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null }
+          : null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('стоп И цель, символ взят у родителя', () => {
+    const result = parseCh2(ctxWithParent('Стоп на твх, первый таргет 73.5', '#SOLUSDT Long Entry price: 72-73'))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([
+      {
+        kind: 'delta',
+        symbol: 'SOLUSDT',
+        ops: [{ op: 'sl_breakeven' }, { op: 'tp_set', targets: [{ value: 73.5, index: 1 }] }],
+      },
     ])
   })
 })

@@ -138,7 +138,7 @@ export function reconcile(deterministic: ParsedResult, ai: ParsedResult | null, 
     case 'execute':
       return reconcileExecuteRoute(deterministic, ai, ctx)
     case 'ai':
-      return reconcileAiRoute(ai, ctx)
+      return reconcileAiRoute(deterministic, ai, ctx)
   }
 }
 
@@ -177,10 +177,22 @@ function reconcileExecuteRoute(det: ParsedResult, ai: ParsedResult | null, ctx: 
 }
 
 /** Шаблон НЕ совпал (deterministic.route==='ai') — §12 rule 2 + гейт §8/§11. */
-function reconcileAiRoute(ai: ParsedResult | null, ctx: ReconcileContext): Decision {
+function reconcileAiRoute(det: ParsedResult, ai: ParsedResult | null, ctx: ReconcileContext): Decision {
   if (ai === null) {
     // ДЕГРАДАЦИЯ (research §11): ai-proxy недоступен после исчерпания ретраев пайплайном.
-    // Сообщение НЕ теряется — needs_review, переобрабатываемо (см. p2-task4-report.md), 0 ордеров.
+    //
+    // Если шаблон ЧТО-ТО понял (маршрут 'ai' стоит из-за НЕПОЛНОГО покрытия — часть строк
+    // разобрана, часть нет), исполняем разобранное. Молчать в этом случае дороже: живой день
+    // 23.08.2026 — у прокси истёк OAuth-токен, и каждое сообщение с недопонятой строкой не сделало
+    // бы НИЧЕГО, включая понятую половину (перевод стопа в безубыток, например).
+    if (det.intents.length > 0) {
+      console.warn(
+        `[reconciler] AI недоступен (канал ${ctx.channelId}) — исполняем ${det.intents.length} инструкц. ` +
+          `детерминированного разбора; остальная часть сообщения не разобрана`,
+      )
+      return { outcome: 'executing', method: 'auto', decided: toDecided(det.intents), reason: 'ai_unavailable_partial' }
+    }
+    // Шаблон не понял ничего — исполнять нечего: needs_review, переобрабатываемо, 0 ордеров.
     console.error(`[reconciler] AI недоступен (канал ${ctx.channelId}) — сообщение уходит в needs_review, ai_unavailable`)
     return { outcome: 'needs_review', method: 'review', decided: [], reason: 'ai_unavailable' }
   }
