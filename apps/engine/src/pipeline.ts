@@ -754,6 +754,20 @@ interface HandlerResult {
 // (DRY), перенесён в reconciler.ts (нужен И там для сравнения det/ai при реконсиляции, И здесь для
 // заполнения actions.type/side/symbol) — см. импорт вверху файла.
 
+/**
+ * Цена, отличающая ступень лесенки от дубля: у входов и доборов она есть, у дельт — нет.
+ * Строкой, потому что сравнивается с JSONB-полем `actions.params->>'price'`.
+ */
+function intentPrice(intent: ParsedIntent): string | null {
+  switch (intent.kind) {
+    case 'add':
+    case 'limit_entry':
+      return intent.price !== undefined ? String(intent.price) : null
+    default:
+      return null
+  }
+}
+
 function intentParams(intent: ParsedIntent): unknown {
   switch (intent.kind) {
     case 'entry_signal':
@@ -795,6 +809,13 @@ async function processIntent(
   // Поэтому ключ — (сообщение, тип действия, символ): «поставить стоп по BTC» из этого сообщения
   // исполняется один раз, сколько бы раз его ни переразбирали, а дописанная строкой новая
   // инструкция («первый тейк по битку») видится как новая и исполняется.
+  //
+  // ...ПЛЮС ЦЕНА, если она у действия есть. Одно сообщение сплошь и рядом ставит ЛЕСЕНКУ ордеров
+  // по одному символу: «расставляю лимитки на уровни 76300, 74500, 72300» — это три разных
+  // ордера, а по ключу без цены выживал только первый (живой случай 25.08.2026, msg 221623:
+  // модель разобрала все три, до биржи дошла одна). Цена делает ступени различимыми и при этом
+  // не ломает идемпотентность: повторный разбор того же текста даёт те же цены.
+  const price = intentPrice(intent)
   const existing = await trx
     .selectFrom('actions')
     .select('id')
@@ -802,7 +823,13 @@ async function processIntent(
     .where((eb) =>
       eb.or([
         eb('action_index', '=', actionIndex),
-        eb.and([eb('type', '=', info.type), info.symbol === null ? eb('symbol', 'is', null) : eb('symbol', '=', info.symbol)]),
+        eb.and([
+          eb('type', '=', info.type),
+          info.symbol === null ? eb('symbol', 'is', null) : eb('symbol', '=', info.symbol),
+          price === null
+            ? sql<boolean>`true`
+            : sql<boolean>`(params ->> 'price') IS NOT DISTINCT FROM ${price}`,
+        ]),
       ]),
     )
     .executeTakeFirst()

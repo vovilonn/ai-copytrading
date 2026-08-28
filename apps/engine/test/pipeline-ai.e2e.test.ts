@@ -689,6 +689,57 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
   // Бот прочитал «твх 1.03» как стоп-лосс (биржа его отвергла — для лонга в минусе он выше рынка),
   // выход доливки на 1.03 не поставил вовсе, а «первый таргет» посчитал от ПЕРВОГО входа: 159.9,
   // то есть 16% реальной позиции.
+  // Живой случай 25.08.2026 (msg 221623): «снова расставляю лимитки на целые объёмы на уровни 76300,
+  // 74500, 72300». Модель разобрала все три доливки, но до биржи дошла ОДНА: семантический ключ
+  // дедупликации (сообщение, тип, символ) считал ступени лесенки дублями друг друга.
+  describe('pipeline — лесенка ордеров по одному символу не схлопывается в один', () => {
+    it('три лимитные доливки по BTC из одного сообщения дают ТРИ ордера', async () => {
+      await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+      await seedInstrument(db, 'BTCUSDT')
+      const { tradeId } = await seedOpenPosition(db, {
+        channelId: CH2_ID,
+        channelOrd: CH2_ORD,
+        symbol: 'BTCUSDT',
+        side: 'long',
+        entryPrice: '79000',
+        qty: '0.006',
+      })
+
+      mock.queue.push(
+        toolUseResponse(
+          baseOutput({
+            message_type: 'add_to_position',
+            confidence: 0.95,
+            actions: [76300, 74500, 72300].map((price) => ({
+              type: 'add' as const,
+              symbol: 'BTCUSDT',
+              side: 'long' as const,
+              order_type: 'limit' as const,
+              entry: { mode: 'price' as const, price },
+              evidence_source: 'text' as const,
+            })),
+          }),
+        ),
+      )
+
+      await processMessage(
+        db,
+        await insertMessage(db, { channelId: CH2_ID, text: 'Расставляю лимитки на уровни 76300, 74500, 72300' }),
+        deps,
+      )
+
+      const adds = await db
+        .selectFrom('orders')
+        .selectAll()
+        .where('trade_id', '=', tradeId)
+        .where('purpose', '=', 'add')
+        .orderBy('price', 'desc')
+        .execute()
+
+      expect(adds.map((o) => new Decimal(o.price ?? '0').toString())).toEqual(['76300', '74500', '72300'])
+    })
+  })
+
   describe('выход доливки на названной цене + лесенка от полного объёма', () => {
     async function seedWithAdd(entryQty: string, addQty: string) {
       await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
