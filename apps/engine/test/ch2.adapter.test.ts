@@ -832,3 +832,59 @@ describe('ch2.adapter — символ из ветки реплаев не су�
     ])
   })
 })
+
+// Живые пробелы 27–28.08.2026, оба сообщения осели в needs_review при недоступной модели.
+describe('ch2.adapter — русскоязычная лимитка и неоднозначный reply', () => {
+  function ctxFor(text: string, opts: { replyTo?: number; parentText?: string; open?: string[] } = {}): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: {
+        id: 2,
+        text,
+        date: '2026-08-28T10:18:00Z',
+        replyToMsgId: opts.replyTo ?? null,
+        groupedId: null,
+        media: null,
+        mediaFile: null,
+      },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      isListed,
+      getMessage: (id: number) =>
+        id === 1 && opts.parentText !== undefined
+          ? { id: 1, text: opts.parentText, date: '2026-08-27T12:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null }
+          : null,
+      openPositions: new Map(
+        (opts.open ?? []).map((symbol) => [symbol, { tradeId: 't-1', side: 'long' as const, openedByChannel: '1962583820' }]),
+      ),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('«Лимитка Лонг битка 78500» — русская форма лимитного входа, а не только Limit long', () => {
+    const result = parseCh2(ctxFor('Лимитка Лонг битка 78500'))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([{ kind: 'limit_entry', symbol: 'BTCUSDT', side: 'long', price: 78500 }])
+  })
+
+  it('«ставлю дополнительную лимитку Лонг 78500» БЕЗ монеты — в модель, а не в noise', () => {
+    const result = parseCh2(ctxFor('Так есть вероятность треугольной коррекции то ставлю дополнительную лимитку Лонг 78500'))
+
+    expect(result.route).toBe('ai')
+    expect(result.intents).toHaveLength(0)
+  })
+
+  it('родитель назвал две монеты, открыта одна -> дельта уходит ей', () => {
+    const parent = 'Пробили 79500 с текущих захожу Лонг битка на пол объема\nИ Лонг эфира на пол позиции'
+    const result = parseCh2(ctxFor('Стоп На твх', { replyTo: 1, parentText: parent, open: ['BTCUSDT'] }))
+
+    expect(result.intents).toEqual([{ kind: 'delta', symbol: 'BTCUSDT', ops: [{ op: 'sl_breakeven' }] }])
+  })
+
+  it('открыты обе названные монеты -> по-прежнему не гадаем, отдаём модели', () => {
+    const parent = 'Пробили 79500 с текущих захожу Лонг битка на пол объема\nИ Лонг эфира на пол позиции'
+    const result = parseCh2(ctxFor('Стоп На твх', { replyTo: 1, parentText: parent, open: ['BTCUSDT', 'ETHUSDT'] }))
+
+    expect(result.route).toBe('ai')
+  })
+})

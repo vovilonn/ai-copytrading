@@ -63,7 +63,15 @@ function resolveSymbolFromReplyChain(ctx: ParseContext): string | null {
     if (parent === null) return null
     const symbols = symbolsInText(parent.text, ctx)
     if (symbols.length === 1) return symbols[0]!
-    if (symbols.length > 1) return null // неоднозначно — не гадаем
+    if (symbols.length > 1) {
+      // НЕОДНОЗНАЧНОСТЬ РАЗРЕШАЮТ ОТКРЫТЫЕ ПОЗИЦИИ. Родитель назвал несколько монет («захожу Лонг
+      // битка… И Лонг эфира…»), но управлять можно только тем, что реально открыто: если из
+      // названных открыта РОВНО ОДНА, «Стоп На твх» относится к ней — гадания здесь нет.
+      // Живой случай 27.08.2026 (msg 221629): эфир к тому моменту был закрыт, оставался биток,
+      // а сообщение осело в needs_review и стоп не переехал.
+      const open = symbols.filter((symbol) => ctx.openPositions.has(symbol))
+      return open.length === 1 ? open[0]! : null
+    }
     currentId = parent.replyToMsgId
   }
   return null
@@ -230,8 +238,13 @@ function tryStructuredSignal(text: string, ctx: ParseContext): ParsedResult | nu
 //   2) символ, уже занятый лимиткой этого сообщения, рыночный сканер пропускает.
 // ---------------------------------------------------------------------------
 
-const LIMIT_GATE_RE = /\blimit\b/i
-const DIR_WORD_GATE_RE = /\b(long|short)\b/i
+// Гейты РУССКО-АНГЛИЙСКИЕ. Автор пишет и «Limit long btc 60850», и «ставлю дополнительную
+// лимитку Лонг 78500» — вторая форма не проходила гейт вообще (латинские \blimit\b и
+// \b(long|short)\b), и лимитный вход молча уезжал в модель. 28.08.2026 модель была недоступна —
+// сообщение осело в needs_review, ордер не выставлен (msg 221633).
+// `\b` не годится для кириллицы (он ASCII-only) — границу слева задаём lookbehind'ом.
+const LIMIT_GATE_RE = /\blimit\b|(?<![\p{L}\p{N}])(лимитк|лимитн|отложк)[а-яё]*/iu
+const DIR_WORD_GATE_RE = /\b(long|short)\b|(?<![\p{L}\p{N}])(лонг|шорт)[а-яё]*/iu
 
 /** Интент вместе с номером строки-источника — чтобы итоговый порядок совпадал с порядком в тексте. */
 interface EntryHit {
