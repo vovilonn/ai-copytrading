@@ -101,7 +101,14 @@ export function normalizeAiOutput(output: ExtractSignalOutput, ctx: NormalizeAiO
     anyUnknownSymbol,
     anyUnresolvedMapping,
     anyNotListed,
+    hasIntents: intents.length > 0,
   })
+  if (anyUnresolvedMapping && intents.length > 0) {
+    console.warn(
+      `[ai/normalize] часть действий модели не смапилась (исполняем ${intents.length} разобранных). ` +
+        'Обычно это «действие», которого нет: «лимитка остаётся так же» без цены.',
+    )
+  }
 
   const result: ParsedResult = { route, confidence: output.confidence, intents }
   const reason = resolveReason({ route, anyUnknownSymbol, needsHuman: output.needs_human, anyNotListed })
@@ -115,14 +122,30 @@ interface RouteInputs {
   anyUnknownSymbol: boolean
   anyUnresolvedMapping: boolean
   anyNotListed: boolean
+  /** Есть ли хоть один пригодный к исполнению intent — от этого зависит судьба несмапленных. */
+  hasIntents: boolean
 }
 
-/** execute, только если ВСЁ резолвилось однозначно; символ резолвлен, но не листингован — skip
- *  (та же семантика, что ch1.adapter.ts: не нужен человек, просто нельзя торговать); иначе ai
- *  (needs_review — двусмысленность требует внимания человека, research §11 "лучше пропустить
- *  исполнение, чем исполнить неверно"). */
+/**
+ * execute, только если ВСЁ резолвилось однозначно; символ резолвлен, но не листингован — skip
+ * (та же семантика, что ch1.adapter.ts: не нужен человек, просто нельзя торговать); иначе ai
+ * (needs_review — двусмысленность требует внимания человека, research §11 "лучше пропустить
+ * исполнение, чем исполнить неверно").
+ *
+ * ⚠️ ОДНО НЕСМАПЛЕННОЕ ДЕЙСТВИЕ НЕ ВЫБРАСЫВАЕТ ОСТАЛЬНЫЕ. Живой случай 31.08.2026 (msg 221638):
+ * «Эфир не достал до лимитки / С текущих пробую взять Лонг на пол позиции / И на пол позиции
+ * лимитка остается так же». Модель вернула ДВА действия: рыночный вход по ETHUSDT (разобран
+ * идеально) и «лимитка остаётся так же» с `entry.mode='price'`, но `price=null` — то есть НЕ
+ * действие вовсе, а констатация. Второе не смапилось, и из-за него в needs_review ушло всё
+ * сообщение: вход не открылся, а следом «Цели 2495, 2540, 2590» скипнулись как no_open_position.
+ *
+ * Поэтому несмапленное действие роняет маршрут только тогда, когда исполнять ВООБЩЕ нечего.
+ * Сомнения САМОЙ модели (needs_human, symbol=UNKNOWN) по-прежнему уводят сообщение к человеку:
+ * там не наша неполнота разбора, а её собственная неуверенность.
+ */
 function resolveRoute(inputs: RouteInputs): Route {
-  if (inputs.needsHuman || inputs.anyUnknownSymbol || inputs.anyUnresolvedMapping) return 'ai'
+  if (inputs.needsHuman || inputs.anyUnknownSymbol) return 'ai'
+  if (inputs.anyUnresolvedMapping && !inputs.hasIntents) return 'ai'
   if (inputs.anyNotListed) return 'skip'
   return 'execute'
 }

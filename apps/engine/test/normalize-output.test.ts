@@ -450,3 +450,64 @@ describe('normalize-output — стоп/цели/риск автора не те
     expect(result.intents).toEqual([{ kind: 'market_entry', symbol: 'BTCUSDT', side: 'long' }])
   })
 })
+
+// Живой случай 31.08.2026 (msg 221638): «Эфир не достал до лимитки / С текущих пробую взять Лонг на
+// пол позиции / И на пол позиции лимитка остается так же». Модель вернула ДВА действия: рыночный
+// вход по ETHUSDT (разобран идеально) и «лимитка остаётся так же» с entry.mode='price', price=null.
+// Второе не смапилось — и из-за него в needs_review ушло ВСЁ сообщение: вход не открылся, а следом
+// «Цели 2495, 2540, 2590» скипнулись как no_open_position.
+describe('normalizeAiOutput — несмапленное действие не выбрасывает разобранные', () => {
+  const isListed = () => true
+
+  function output(actions: unknown[]): ExtractSignalOutput {
+    return {
+      understood: true,
+      message_type: 'entry_signal',
+      confidence: 0.92,
+      needs_human: false,
+      summary: 'тест',
+      actions: actions as ExtractSignalOutput['actions'],
+    }
+  }
+
+  const goodOpen = {
+    type: 'open',
+    symbol: 'ETHUSDT',
+    side: 'long',
+    order_type: 'market',
+    entry: { mode: 'marker', marker: 'current_price', price: null, low: null, high: null },
+    evidence_source: 'text',
+  }
+  // «лимитка остаётся так же»: лимитный вход, у которого НЕТ цены — действия здесь нет вовсе,
+  // это констатация про уже стоящий ордер (ровно то, что вернула модель 31.08.2026).
+  const unmappable = {
+    type: 'open',
+    symbol: 'ETHUSDT',
+    side: 'long',
+    order_type: 'limit',
+    entry: { mode: 'price', price: null, marker: 'none', low: null, high: null },
+    evidence_source: 'text',
+  }
+
+  it('часть действий смапилась -> исполняем их, а не роняем сообщение в needs_review', () => {
+    const result = normalizeAiOutput(output([goodOpen, unmappable]), { isListed })
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([{ kind: 'market_entry', symbol: 'ETHUSDT', side: 'long' }])
+  })
+
+  it('не смапилось НИЧЕГО -> прежнее поведение: в модель/к человеку', () => {
+    const result = normalizeAiOutput(output([unmappable]), { isListed })
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('ai_unresolved_marker')
+    expect(result.intents).toHaveLength(0)
+  })
+
+  it('сомнение САМОЙ модели (needs_human) по-прежнему уводит к человеку, даже с разобранным действием', () => {
+    const result = normalizeAiOutput({ ...output([goodOpen]), needs_human: true }, { isListed })
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('needs_human')
+  })
+})

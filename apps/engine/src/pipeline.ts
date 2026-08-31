@@ -318,7 +318,16 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
 
     await trx
       .updateTable('messages')
-      .set({ status: 'executed', normalized_text: normalizedText, method, ai_summary: aiSummary, updated_at: now })
+      .set({
+        status: 'executed',
+        // Причина видна и у ИСПОЛНЕННОГО сообщения: «исполнили разобранное, часть не смапилась»
+        // и «модель была недоступна, отработал шаблон» — это не ошибка, но оператор должен знать.
+        status_reason: decision.reason ?? null,
+        normalized_text: normalizedText,
+        method,
+        ai_summary: aiSummary,
+        updated_at: now,
+      })
       .where('id', '=', message.id)
       .execute()
     await emitMessageProcessed(trx, message)
