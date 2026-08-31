@@ -462,7 +462,8 @@ describe('normalizeAiOutput — несмапленное действие не �
   function output(actions: unknown[]): ExtractSignalOutput {
     return {
       understood: true,
-      message_type: 'entry_signal',
+      message_type: 'entry',
+      image_used: false,
       confidence: 0.92,
       needs_human: false,
       summary: 'тест',
