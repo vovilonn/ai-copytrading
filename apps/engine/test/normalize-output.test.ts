@@ -265,7 +265,9 @@ describe('normalizeAiOutput', () => {
       }),
     )
 
-    expect(result.intents).toEqual([{ kind: 'add', symbol: 'BTCUSDT', price: 60000 }])
+    // Сторона переносится: без неё лимитную доливку по символу БЕЗ позиции нельзя превратить в
+    // отложенный вход (живой случай 01.09.2026 — такие ордера пропадали как no_open_position).
+    expect(result.intents).toEqual([{ kind: 'add', symbol: 'BTCUSDT', price: 60000, side: 'long' }])
   })
 
   it('modify_tp с числовыми целями -> tp_set', () => {

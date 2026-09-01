@@ -235,7 +235,17 @@ function mapAddAction(action: ExtractSignalAction): ParsedIntent | null {
   if (action.symbol === 'UNKNOWN') return null
 
   const price = action.entry?.mode === 'price' ? (action.entry.price ?? undefined) : undefined
-  return { kind: 'add', symbol: action.symbol, ...(price !== undefined ? { price } : {}) }
+  // Сторона ТЕРЯЛАСЬ. У доливки в открытую позицию она и не нужна (берётся из позиции), но когда
+  // позиции ещё нет — «Ещё лимитки добавил» на монету, которой в портфеле нет, — без стороны
+  // невозможно превратить доливку в лимитный вход, и ордер пропадал (живой случай 01.09.2026:
+  // DOGE 0.0803 и LINK 10.94 скипнулись как no_open_position, хотя модель прислала side='long').
+  const side = toSide(action.side)
+  return {
+    kind: 'add',
+    symbol: action.symbol,
+    ...(price !== undefined ? { price } : {}),
+    ...(side !== null ? { side } : {}),
+  }
 }
 
 // ---------------------------------------------------------------------------

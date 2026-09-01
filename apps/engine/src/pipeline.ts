@@ -753,10 +753,11 @@ interface HandlerResult {
   symbol?: string
   /**
    * Действие оказалось не тем, чем выглядело в тексте: «Limit long Eth 1895» по УЖЕ открытому
-   * эфиру — это доливка, а не новый вход (см. resolveBusySymbol). Тип строки actions переписываем
-   * на фактический, иначе в UI и в журнале останется 'open' у ордера с purpose='add'.
+   * эфиру — это доливка, а не новый вход (см. resolveBusySymbol), а «ещё лимитки добавил» по
+   * символу без позиции — наоборот, обычный отложенный вход. Тип строки actions переписываем на
+   * фактический, иначе в UI и в журнале останется 'open' у ордера с purpose='add' (или наоборот).
    */
-  rewrittenType?: 'add'
+  rewrittenType?: 'add' | 'open'
 }
 
 // classifyIntent(intent) (symbol/side/type ActionType) — единственный источник этой классификации
@@ -1797,6 +1798,28 @@ async function handleAdd(
     .where(sql<boolean>`size <> 0`)
     .executeTakeFirst()
   if (!position || position.trade_id === null || position.side === null) {
+    // ЛИМИТКЕ ПОЗИЦИЯ НЕ НУЖНА. «Ещё лимитки добавил» на монету, которой в портфеле пока нет, —
+    // это обычный отложенный ВХОД: ордер повисит и сам откроет позицию, когда цену задénет.
+    // Живой случай 01.09.2026 (msg 221642): DOGE 0.0803 и LINK 10.94 ушли в no_open_position,
+    // хотя автор просто расставил лимитки. Зеркальное правило к resolveBusySymbol, где лимитка по
+    // ЗАНЯТОМУ символу становится доливкой.
+    if (intent.price !== undefined && intent.side !== undefined) {
+      console.log(
+        `[pipeline] msg ${base.message.tgMessageId} ${intent.symbol}: доливки не во что делать — ` +
+          `позиции нет, ставим лимитный вход по ${intent.price}`,
+      )
+      const opened = await handleOpen(trx, base, actionIndex, actionId, {
+        symbol: intent.symbol,
+        side: intent.side,
+        orderType: 'limit',
+        entryPrice: new Decimal(intent.price),
+        priceFromSignal: true,
+        tps: [],
+      })
+      return { ...opened, rewrittenType: 'open' }
+    }
+    // Рыночная «доливка» без позиции — другое дело: цена входа автора нам неизвестна, а входить
+    // по рынку «вдогонку» значит покупать не там, где покупал он.
     return { skipReason: 'no_open_position' }
   }
 

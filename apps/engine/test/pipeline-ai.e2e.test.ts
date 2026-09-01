@@ -740,6 +740,64 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
     })
   })
 
+  // Живой случай 01.09.2026 (msg 221642): «Ещё лимитки добавил» + скрин с отложенными ордерами.
+  // Модель прислала два `add` с ценами и стороной (DOGE 0.0803, LINK 10.94), но позиций по этим
+  // монетам не было — обе доливки ушли в no_open_position. Лимитке позиция не нужна: это обычный
+  // отложенный вход, он сам откроет позицию, когда цену заденет.
+  describe('доливка без позиции: лимитка становится отложенным входом', () => {
+    function addResponse(price: number, orderType: 'limit' | 'market') {
+      return toolUseResponse(
+        baseOutput({
+          message_type: 'add_to_position',
+          confidence: 0.95,
+          actions: [
+            {
+              type: 'add' as const,
+              symbol: 'BTCUSDT',
+              side: 'long' as const,
+              order_type: orderType,
+              ...(orderType === 'limit' ? { entry: { mode: 'price' as const, price } } : {}),
+              evidence_source: 'both' as const,
+            },
+          ],
+        }),
+      )
+    }
+
+    it('лимитная доливка без позиции -> отложенный вход, а не no_open_position', async () => {
+      await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+      await seedInstrument(db, 'BTCUSDT')
+      mock.queue.push(addResponse(60000, 'limit'))
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Ещё лимитки добавил' }), deps)
+
+      const entry = await db
+        .selectFrom('orders')
+        .selectAll()
+        .where('symbol', '=', 'BTCUSDT')
+        .where('purpose', '=', 'entry')
+        .executeTakeFirstOrThrow()
+      expect(entry.order_type).toBe('limit')
+      expect(new Decimal(entry.price ?? '0').toString()).toBe('60000')
+
+      const action = await db.selectFrom('actions').selectAll().where('symbol', '=', 'BTCUSDT').executeTakeFirstOrThrow()
+      expect(action.status).toBe('executed')
+      expect(action.type).toBe('open') // действие называется тем, чем является
+    })
+
+    it('РЫНОЧНАЯ доливка без позиции по-прежнему скипается: догонять цену автора вслепую нельзя', async () => {
+      await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+      await seedInstrument(db, 'BTCUSDT')
+      mock.queue.push(addResponse(0, 'market'))
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Добираю биток' }), deps)
+
+      const action = await db.selectFrom('actions').selectAll().where('symbol', '=', 'BTCUSDT').executeTakeFirstOrThrow()
+      expect(action.status).toBe('skipped')
+      expect(action.skip_reason).toBe('no_open_position')
+    })
+  })
+
   describe('выход доливки на названной цене + лесенка от полного объёма', () => {
     async function seedWithAdd(entryQty: string, addQty: string) {
       await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
