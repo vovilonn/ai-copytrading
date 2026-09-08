@@ -270,6 +270,38 @@ describe('normalizeAiOutput', () => {
     expect(result.intents).toEqual([{ kind: 'add', symbol: 'BTCUSDT', price: 60000, side: 'long' }])
   })
 
+  // «С текущих» — это цена, названная словом. Без этого признака доливка по символу БЕЗ позиции
+  // неотличима от рассказа о чужом доборе и скипается (живой случай 08.09.2026, msg 221679).
+  it('add «с текущих» -> add intent с atMarket', () => {
+    const result = normalizeAiOutput(
+      output({
+        message_type: 'add_to_position',
+        actions: [
+          action({
+            type: 'add',
+            symbol: 'XRPUSDT',
+            side: 'long',
+            order_type: 'market',
+            entry: { mode: 'market', marker: 'current_price' },
+          }),
+        ],
+      }),
+    )
+
+    expect(result.intents).toEqual([{ kind: 'add', symbol: 'XRPUSDT', side: 'long', atMarket: true }])
+  })
+
+  it('add без цены и без «с текущих» -> atMarket НЕ ставится (догонять нечего)', () => {
+    const result = normalizeAiOutput(
+      output({
+        message_type: 'add_to_position',
+        actions: [action({ type: 'add', symbol: 'XRPUSDT', side: 'long', order_type: 'market' })],
+      }),
+    )
+
+    expect(result.intents).toEqual([{ kind: 'add', symbol: 'XRPUSDT', side: 'long' }])
+  })
+
   it('modify_tp с числовыми целями -> tp_set', () => {
     const result = normalizeAiOutput(
       output({

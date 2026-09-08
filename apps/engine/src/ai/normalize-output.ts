@@ -240,11 +240,16 @@ function mapAddAction(action: ExtractSignalAction): ParsedIntent | null {
   // невозможно превратить доливку в лимитный вход, и ордер пропадал (живой случай 01.09.2026:
   // DOGE 0.0803 и LINK 10.94 скипнулись как no_open_position, хотя модель прислала side='long').
   const side = toSide(action.side)
+  // «С ТЕКУЩИХ» — это цена, просто названная словом. Тот же признак, по которому детерминированный
+  // CH2 (tryEntries) отличает вход по рынку от абстрактного «долил»: сказано входить ПО РЫНКУ
+  // СЕЙЧАС. order_type сюда не годится — модель ставит 'market' и рассказу о прошлом доборе.
+  const atMarket = action.entry?.mode === 'market' || action.entry?.marker === 'current_price'
   return {
     kind: 'add',
     symbol: action.symbol,
     ...(price !== undefined ? { price } : {}),
     ...(side !== null ? { side } : {}),
+    ...(atMarket ? { atMarket: true } : {}),
   }
 }
 

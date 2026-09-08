@@ -77,7 +77,10 @@ export type ParsedIntent =
   // вместо него свой синтетический. Теперь: стоп автора — приоритетнее нашего защитного (risk/protective-sl.ts).
   | { kind: 'limit_entry'; symbol: string; side: Side; price: number; sl?: number; tps?: number[]; riskPct?: number } // B
   | { kind: 'market_entry'; symbol: string; side: Side; sl?: number; tps?: number[]; riskPct?: number } // C
-  | { kind: 'add'; symbol: string; price?: number; side?: Side } // доливка (реш. #6)
+  // Доливка (реш. #6). side/atMarket нужны не самой доливке (сторона известна из позиции, цена —
+  // из рынка), а случаю, когда позиции по символу НЕТ: тогда это вход, и его надо чем-то выставить.
+  // atMarket — автор входит по рынку ПРЯМО СЕЙЧАС («ещё раз с текущих»), а не «где-то долил».
+  | { kind: 'add'; symbol: string; price?: number; side?: Side; atMarket?: boolean }
   | { kind: 'delta'; symbol: string | null; ops: DeltaOp[]; targetTradeId?: string } // R3/R4/D/E
 
 // Ф2 (задача 2, normalize-output.ts) добавила 3 варианта поверх Ф1-набора — AI-канал (CH2)

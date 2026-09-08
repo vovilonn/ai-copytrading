@@ -261,6 +261,7 @@ describeLive('golden set CH2 — precision/recall извлечения actions (
           normalizedText: goldenCase.text,
           mediaIds: goldenCase.mediaFile ? [goldenCase.mediaFile] : [],
           replyParentId,
+          replyChainSymbol: null,
           openPositionsHash: hashOpenPositions(openPositions),
           promptVersion: PROMPT_VERSION,
         })

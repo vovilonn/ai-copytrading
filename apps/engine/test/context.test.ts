@@ -62,13 +62,13 @@ async function seedMessage(params: { text?: string; replyToMsgId?: number | null
   return { messageId: row.id, tgMessageId }
 }
 
-async function seedAction(params: { messageId: string; symbol: string; side: Side }): Promise<string> {
+async function seedAction(params: { messageId: string; symbol: string; side: Side; actionIndex?: number }): Promise<string> {
   const row = await db
     .insertInto('actions')
     .values({
       message_id: params.messageId,
       channel_id: CHANNEL_ID,
-      action_index: 0,
+      action_index: params.actionIndex ?? 0,
       type: 'open',
       side: params.side,
       symbol: params.symbol,
@@ -297,6 +297,31 @@ describe('buildContext — reply-parent текст', () => {
 
     expect(built.replyChainSymbol).toBeUndefined()
     expect(built.replyParentText).toBe('Sl btc 60000, Sl Eth 1800')
+  })
+
+  // Живой случай 08.09.2026 (msg 221679): «Ещё раз с текущих» ← «Стоп на твх / Первый тэйк - 1.414»
+  // ← «Xrp long». Слова «XRP» нет ни в родителе, ни выше: символ родителя движок вычитал СО
+  // СКРИНШОТА. Текстовый поиск по ветке давал пусто, модель честно вернула symbol=UNKNOWN, вход
+  // потерялся. Второй источник символа — то, чем это сообщение для движка уже оказалось.
+  it('текст ветки молчит, но движок УЖЕ разобрал символ предка -> он и есть символ ветки', async () => {
+    const root = await seedMessage({ text: 'Стоп на твх\nПервый тэйк - 1.414' })
+    await seedAction({ messageId: root.messageId, symbol: 'XRPUSDT', side: 'long' })
+    const child = await seedMessage({ text: 'Ещё раз с текущих', replyToMsgId: root.tgMessageId })
+
+    const built = await buildContext(db, { id: child.messageId, channelId: CHANNEL_ID, replyToMsgId: root.tgMessageId })
+
+    expect(built.replyChainSymbol).toBe('XRPUSDT')
+  })
+
+  it('предок разобран на НЕСКОЛЬКО символов -> подсказки нет (та же осторожность, что и с текстом)', async () => {
+    const root = await seedMessage({ text: 'Стоп на твх' })
+    await seedAction({ messageId: root.messageId, symbol: 'XRPUSDT', side: 'long' })
+    await seedAction({ messageId: root.messageId, symbol: 'BTCUSDT', side: 'long', actionIndex: 1 })
+    const child = await seedMessage({ text: 'Ещё раз с текущих', replyToMsgId: root.tgMessageId })
+
+    const built = await buildContext(db, { id: child.messageId, channelId: CHANNEL_ID, replyToMsgId: root.tgMessageId })
+
+    expect(built.replyChainSymbol).toBeUndefined()
   })
 
   it('цикл в данных (сообщение отвечает само себе) не вешает сборку контекста', async () => {

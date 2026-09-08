@@ -67,28 +67,40 @@ export async function buildContext(db: Kysely<DB>, message: BuildContextMessage)
 
   const result: BuiltAiContext = { openPositions, images, openPositionsHash: hashOpenPositions(openPositions) }
   const [parent, ...ancestors] = replyChain
-  if (parent !== undefined) result.replyParentText = parent
-  if (ancestors.length > 0) result.replyChain = ancestors
+  if (parent !== undefined) result.replyParentText = parent.text
+  if (ancestors.length > 0) result.replyChain = ancestors.map((entry) => entry.text)
   const chainSymbol = resolveChainSymbol(replyChain)
   if (chainSymbol !== undefined) result.replyChainSymbol = chainSymbol
   return result
 }
 
 /**
- * Символ ветки — ПЕРВЫЙ предок (снизу вверх), где символ вообще назван, и назван ОДНОЗНАЧНО.
- * Несколько разных символов у ближайшего такого предка («Sl btc.. Sl Eth..») означают, что
- * подсказывать нечего: модель разберётся по текстам ветки и картинке лучше, чем мы угадаем.
- * Резолв — чистый алиас (isListed здесь недоступен и не нужен: это подсказка, а не гейт).
+ * Символ ветки — ПЕРВЫЙ предок (снизу вверх), по которому символ вообще известен, и известен
+ * ОДНОЗНАЧНО. Несколько разных символов у ближайшего такого предка («Sl btc.. Sl Eth..») означают,
+ * что подсказывать нечего: модель разберётся по текстам ветки и картинке лучше, чем мы угадаем.
+ *
+ * «Известен» — это ДВА источника, и текст лишь первый из них. Автор называет монету один раз, а
+ * дальше ведёт сделку репликами вообще без слов-тикеров, причём и та первая монета вполне может
+ * быть названа не текстом, а картинкой: живой случай 08.09.2026 (msg 221679 «Ещё раз с текущих»)
+ * — вся ветка («Стоп на твх / Первый тэйк - 1.414» ← «Xrp long») текстом символа не даёт, потому
+ * что XRP в родителе движок вычитал со скриншота. Второй источник — то, ЧЕМ это сообщение для
+ * движка уже оказалось: actions.symbol предка. Это не догадка, а наш собственный разобранный
+ * результат, и он сильнее любой эвристики по открытым позициям.
+ *
+ * Резолв текста — чистый алиас (isListed здесь недоступен и не нужен: это подсказка, а не гейт).
  */
-function resolveChainSymbol(chain: readonly string[]): string | undefined {
-  for (const text of chain) {
+function resolveChainSymbol(chain: readonly ReplyChainEntry[]): string | undefined {
+  for (const entry of chain) {
     const found = new Set<string>()
-    for (const coin of extractCoins(text)) {
+    for (const coin of extractCoins(entry.text)) {
       const symbol = resolveSymbol(coin, () => true)
       if (symbol !== null) found.add(symbol)
     }
     if (found.size === 1) return [...found][0]
     if (found.size > 1) return undefined
+    // Текст предка молчит — спрашиваем движок, чем это сообщение для него оказалось.
+    if (entry.resolvedSymbols.length === 1) return entry.resolvedSymbols[0]
+    if (entry.resolvedSymbols.length > 1) return undefined
   }
   return undefined
 }
@@ -198,8 +210,14 @@ async function loadOpenedTgMessageId(db: Kysely<DB>, tradeId: string): Promise<n
  */
 const MAX_REPLY_CHAIN_HOPS = 6
 
-async function loadReplyChain(db: Kysely<DB>, channelId: number, replyToMsgId: number | null): Promise<string[]> {
-  const texts: string[] = []
+/** Предок в ветке: его текст И символы, которые движок по нему уже разобрал (см. resolveChainSymbol). */
+interface ReplyChainEntry {
+  text: string
+  resolvedSymbols: string[]
+}
+
+async function loadReplyChain(db: Kysely<DB>, channelId: number, replyToMsgId: number | null): Promise<ReplyChainEntry[]> {
+  const rows: { id: string; text: string }[] = []
   const seen = new Set<number>()
   let currentId = replyToMsgId
   for (let hop = 0; currentId !== null && hop < MAX_REPLY_CHAIN_HOPS; hop++) {
@@ -209,15 +227,42 @@ async function loadReplyChain(db: Kysely<DB>, channelId: number, replyToMsgId: n
     // без фильтра по каналу можно было бы найти чужое сообщение с тем же numeric id.
     const row = await db
       .selectFrom('messages')
-      .select(['text', 'reply_to_msg_id'])
+      .select(['id', 'text', 'reply_to_msg_id'])
       .where('channel_id', '=', channelId)
       .where('tg_message_id', '=', currentId)
       .executeTakeFirst()
     if (!row) break
-    texts.push(row.text)
+    rows.push({ id: row.id, text: row.text })
     currentId = row.reply_to_msg_id
   }
-  return texts
+  if (rows.length === 0) return []
+
+  const symbolsByMessage = await loadResolvedSymbols(db, rows.map((row) => row.id))
+  return rows.map((row) => ({ text: row.text, resolvedSymbols: [...(symbolsByMessage.get(row.id) ?? [])] }))
+}
+
+/**
+ * Символы разобранных действий этих сообщений. Статус действия НЕ фильтруем: skipped-действие
+ * тоже говорит, о какой монете было сообщение, — а именно это здесь и нужно (исполнилось оно или
+ * нет, к теме ветки отношения не имеет). Целиком не разобранные сообщения несут symbol=null и в
+ * выборку не попадают.
+ */
+async function loadResolvedSymbols(db: Kysely<DB>, messageIds: readonly string[]): Promise<Map<string, Set<string>>> {
+  const rows = await db
+    .selectFrom('actions')
+    .select(['message_id', 'symbol'])
+    .where('message_id', 'in', [...messageIds])
+    .where('symbol', 'is not', null)
+    .execute()
+
+  const byMessage = new Map<string, Set<string>>()
+  for (const row of rows) {
+    if (row.symbol === null) continue
+    const set = byMessage.get(row.message_id) ?? new Set<string>()
+    set.add(row.symbol)
+    byMessage.set(row.message_id, set)
+  }
+  return byMessage
 }
 
 // ---------------------------------------------------------------------------

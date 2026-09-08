@@ -16,6 +16,7 @@ describe('cacheKey', () => {
     normalizedText: 'стоп на твх',
     mediaIds: ['a', 'b'],
     replyParentId: 221419,
+    replyChainSymbol: null,
     openPositionsHash: 'hash-1',
     promptVersion: 'extract_signal.v1',
   }
@@ -46,6 +47,15 @@ describe('cacheKey', () => {
     const noReply = cacheKey({ ...base, replyParentId: null })
     expect(noReply).not.toBe(cacheKey(base))
     expect(noReply).not.toBe(cacheKey({ ...base, replyParentId: 999 }))
+  })
+
+  // Символ ветки едет в промпт ([reply_thread_symbol]) и берётся в том числе из разобранных
+  // действий предков — то есть у ОДНОГО И ТОГО ЖЕ родителя может появиться позже. Перезапуск
+  // такого сообщения обязан спросить модель заново, а не выдать прежний symbol=UNKNOWN.
+  it('разный replyChainSymbol -> разный ключ', () => {
+    const known = cacheKey({ ...base, replyChainSymbol: 'XRPUSDT' })
+    expect(known).not.toBe(cacheKey(base))
+    expect(known).not.toBe(cacheKey({ ...base, replyChainSymbol: 'BTCUSDT' }))
   })
 
   it('результат — hex sha256 (64 символа)', () => {
@@ -86,6 +96,7 @@ describe('getCached / putCached (round-trip, copytrade_test)', () => {
       normalizedText: 'нет в кэше ' + Math.random(),
       mediaIds: [],
       replyParentId: null,
+      replyChainSymbol: null,
       openPositionsHash: 'h',
       promptVersion: 'extract_signal.v1',
     })
@@ -98,6 +109,7 @@ describe('getCached / putCached (round-trip, copytrade_test)', () => {
       normalizedText: '2🎯',
       mediaIds: ['media-1'],
       replyParentId: null,
+      replyChainSymbol: null,
       openPositionsHash: 'h-sol',
       promptVersion: 'extract_signal.v1',
     })
@@ -114,6 +126,7 @@ describe('getCached / putCached (round-trip, copytrade_test)', () => {
       normalizedText: 'фикс половину',
       mediaIds: [],
       replyParentId: 221447,
+      replyChainSymbol: null,
       openPositionsHash: 'h-btc',
       promptVersion: 'extract_signal.v1',
     })

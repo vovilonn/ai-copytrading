@@ -796,6 +796,48 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
       expect(action.status).toBe('skipped')
       expect(action.skip_reason).toBe('no_open_position')
     })
+
+    // Живой случай 08.09.2026 (msg 221679): «Ещё раз с текущих» в ответ на ветку по XRP, позицию
+    // за час до этого выбило в безубытке. «С текущих» — это цена, названная словом: автор входит
+    // по той же живой цене, что и мы, догонять нечего.
+    it('«с текущих» без позиции -> вход ПО РЫНКУ, а не no_open_position', async () => {
+      await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+      await seedInstrument(db, 'BTCUSDT')
+      mock.queue.push(
+        toolUseResponse(
+          baseOutput({
+            message_type: 'add_to_position',
+            confidence: 0.95,
+            actions: [
+              {
+                type: 'add' as const,
+                symbol: 'BTCUSDT',
+                side: 'long' as const,
+                order_type: 'market' as const,
+                entry: { mode: 'market' as const, marker: 'current_price' as const },
+                evidence_source: 'text' as const,
+              },
+            ],
+          }),
+        ),
+      )
+
+      // Рыночный вход без источника цены — fail-closed (mark_price_unavailable), как и market_entry.
+      const depsWithMark: PipelineDeps = { ...deps, getMarkPrice: async () => '60000' }
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Ещё раз с текущих' }), depsWithMark)
+
+      const entry = await db
+        .selectFrom('orders')
+        .selectAll()
+        .where('symbol', '=', 'BTCUSDT')
+        .where('purpose', '=', 'entry')
+        .executeTakeFirstOrThrow()
+      expect(entry.order_type).toBe('market')
+
+      const action = await db.selectFrom('actions').selectAll().where('symbol', '=', 'BTCUSDT').executeTakeFirstOrThrow()
+      expect(action.status).toBe('executed')
+      expect(action.type).toBe('open')
+    })
   })
 
   describe('выход доливки на названной цене + лесенка от полного объёма', () => {

@@ -453,6 +453,7 @@ async function runAiBranch(
       normalizedText,
       mediaIds,
       replyParentId: message.replyToMsgId,
+      replyChainSymbol: aiContext.replyChainSymbol ?? null,
       openPositionsHash: aiContext.openPositionsHash,
       promptVersion: PROMPT_VERSION,
     })
@@ -1798,19 +1799,22 @@ async function handleAdd(
     .where(sql<boolean>`size <> 0`)
     .executeTakeFirst()
   if (!position || position.trade_id === null || position.side === null) {
-    // ЛИМИТКЕ ПОЗИЦИЯ НЕ НУЖНА. «Ещё лимитки добавил» на монету, которой в портфеле пока нет, —
-    // это обычный отложенный ВХОД: ордер повисит и сам откроет позицию, когда цену задénет.
-    // Живой случай 01.09.2026 (msg 221642): DOGE 0.0803 и LINK 10.94 ушли в no_open_position,
-    // хотя автор просто расставил лимитки. Зеркальное правило к resolveBusySymbol, где лимитка по
-    // ЗАНЯТОМУ символу становится доливкой.
-    if (intent.price !== undefined && intent.side !== undefined) {
+    const side = intent.side
+    // ДОЛИВКЕ НУЖНА ПОЗИЦИЯ, ВХОДУ — НЕТ. Автор доливается в СВОЮ позицию; наша по тому же символу
+    // могла закрыться раньше (стоп в безубытке) или не открыться вовсе. Тогда его «добавил» для
+    // нас — обычный ВХОД, и вопрос ровно один: чем этот вход выставить.
+    if (side !== undefined && intent.price !== undefined) {
+      // Названа цена → отложенный вход. «Ещё лимитки добавил» на монету, которой в портфеле пока
+      // нет: ордер повисит и сам откроет позицию, когда цену заденет. Живой случай 01.09.2026
+      // (msg 221642): DOGE 0.0803 и LINK 10.94 ушли в no_open_position. Зеркальное правило к
+      // resolveBusySymbol, где лимитка по ЗАНЯТОМУ символу становится доливкой.
       console.log(
         `[pipeline] msg ${base.message.tgMessageId} ${intent.symbol}: доливки не во что делать — ` +
           `позиции нет, ставим лимитный вход по ${intent.price}`,
       )
       const opened = await handleOpen(trx, base, actionIndex, actionId, {
         symbol: intent.symbol,
-        side: intent.side,
+        side,
         orderType: 'limit',
         entryPrice: new Decimal(intent.price),
         priceFromSignal: true,
@@ -1818,8 +1822,23 @@ async function handleAdd(
       })
       return { ...opened, rewrittenType: 'open' }
     }
-    // Рыночная «доливка» без позиции — другое дело: цена входа автора нам неизвестна, а входить
-    // по рынку «вдогонку» значит покупать не там, где покупал он.
+    if (side !== undefined && intent.atMarket === true) {
+      // Сказано «с текущих» → вход по рынку ПРЯМО СЕЙЧАС. Цена не названа, но она и не нужна:
+      // автор берёт по той же живой цене, что и мы, догонять нечего. Живой случай 08.09.2026
+      // (msg 221679 «Ещё раз с текущих» после того, как XRP выбило в безубытке) — вход потерялся
+      // целиком. Ровно то же правило, что у детерминированного CH2 (tryEntries): «ещё один лонг»
+      // по СВОБОДНОМУ символу — не добор, а вход.
+      const spec = await specFromMarketEntry(base, { kind: 'market_entry', symbol: intent.symbol, side })
+      if ('skipReason' in spec) return spec
+      console.log(
+        `[pipeline] msg ${base.message.tgMessageId} ${intent.symbol}: доливки не во что делать — ` +
+          `позиции нет, входим по рынку (${spec.entryPrice.toString()})`,
+      )
+      const opened = await handleOpen(trx, base, actionIndex, actionId, spec)
+      return { ...opened, rewrittenType: 'open' }
+    }
+    // Ни цены, ни «с текущих» — только рассказ о доборе («долил ещё»). Цена входа автора нам
+    // неизвестна, а входить по рынку вдогонку значит покупать не там, где покупал он.
     return { skipReason: 'no_open_position' }
   }
 

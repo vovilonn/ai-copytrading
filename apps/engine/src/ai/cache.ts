@@ -22,6 +22,14 @@ export interface CacheKeyParams {
   mediaIds: readonly string[]
   /** tg_message_id родителя по reply, если есть; null — сообщение не является ответом. */
   replyParentId: number | null
+  /**
+   * Символ ветки, вычисленный движком (context.ts::resolveChainSymbol), — он ЕДЕТ В ПРОМПТ
+   * ([reply_thread_symbol]) и потому обязан быть в ключе. Из replyParentId он не следует: движок
+   * берёт его в том числе из УЖЕ РАЗОБРАННЫХ действий предков, а те появляются позже самого
+   * родителя. Без этого поля перезапуск сообщения после того, как ветка стала понятна, честно
+   * доставал бы из кэша прежний ответ с symbol=UNKNOWN.
+   */
+  replyChainSymbol: string | null
   /** sha256-хэш компактного снимка открытых позиций (см. context.ts::hashOpenPositions) —
    *  уже посчитанный хэш, а не сырой снимок (снимок собирается один раз в buildContext). */
   openPositionsHash: string
@@ -39,6 +47,7 @@ export function cacheKey(params: CacheKeyParams): string {
     params.normalizedText,
     JSON.stringify(sortedMediaIds),
     params.replyParentId === null ? '' : String(params.replyParentId),
+    params.replyChainSymbol ?? '',
     params.openPositionsHash,
     params.promptVersion,
   ].join(FIELD_SEP)
