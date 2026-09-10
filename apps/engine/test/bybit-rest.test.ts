@@ -189,6 +189,28 @@ describe('BybitRestClient — идемпотентные/ошибочные retC
     expect(result).toEqual({ ok: true, idempotent: true })
   })
 
+  // Живой инцидент 10.09.2026 (msg 221699): снятие стопа у ОТМЕНЯЕМОЙ лимитки — это trading-stop
+  // stopLoss='0', а позиции по символу нет, менять нечего. Bybit отвечает 34040 "not modified",
+  // и вход по рынку падал в needs_review из-за уборки, которая уже была не нужна.
+  it('setTradingStop: retCode 34040 (нечего менять) → {ok:true, idempotent:true}, не бросает', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    const result = await withMockFetch(
+      (async () => mockResponse({ retCode: 34040, retMsg: 'not modified', result: {} })) as typeof fetch,
+      () => client.setTradingStop({ symbol: 'BTCUSDT', positionIdx: 0, tpslMode: 'Full', stopLoss: '0' }),
+    )
+    expect(result).toEqual({ ok: true, idempotent: true })
+  })
+
+  it('setTradingStop: прочий ненулевой retCode по-прежнему бросает', async () => {
+    const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
+    await expect(
+      withMockFetch(
+        (async () => mockResponse({ retCode: 10001, retMsg: 'params error', result: {} })) as typeof fetch,
+        () => client.setTradingStop({ symbol: 'BTCUSDT', positionIdx: 0, tpslMode: 'Full', stopLoss: '70000' }),
+      ),
+    ).rejects.toMatchObject({ retCode: 10001 })
+  })
+
   it('createOrder: retCode 110072 (дубль orderLinkId) → {ok:true, idempotent:true}, не бросает', async () => {
     const client = new BybitRestClient({ apiKey: 'k', apiSecret: 's', network: 'testnet' })
     const result = await withMockFetch(

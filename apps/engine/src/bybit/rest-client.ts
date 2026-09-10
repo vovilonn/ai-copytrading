@@ -87,6 +87,13 @@ const POSITION_MODE_NOT_MODIFIED_RETCODE = 110025
 // orderLinkId закономерно вернул бы именно этот код). Трактуем как идемпотентный успех отмены —
 // поздняя/повторная отмена уже пропавшего ордера не должна ронять cancelOrder и клинить свип/делту.
 const ORDER_NOT_EXISTS_RETCODE = 110001
+// "not modified" у `/v5/position/trading-stop` — запрос НИЧЕГО не изменил, потому что желаемое
+// состояние уже выполнено: снимаем стоп (stopLoss='0'), а стопа нет; ставим ту же цену, что уже
+// стоит. Идемпотентный успех — как 110043 у setLeverage. Код подтверждён живым вызовом на проде
+// 10.09.2026: trading-stop stopLoss='0' по символу БЕЗ позиции → retCode=34040 retMsg="not
+// modified". «Нет позиции вовсе» этим кодом не маскируется: попытка ПОСТАВИТЬ стоп там, где
+// позиции нет, отвечает другой ошибкой, а не "not modified".
+const TRADING_STOP_NOT_MODIFIED_RETCODE = 34040
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -943,22 +950,32 @@ export class BybitRestClient {
     return { ok: true }
   }
 
-  /** `POST /v5/position/trading-stop` (research §4/§5) — SL (Full) / частичный TP (Partial). */
-  async setTradingStop(params: SetTradingStopParams): Promise<{ ok: true }> {
-    await this.signedPost('/v5/position/trading-stop', {
-      category: 'linear',
-      symbol: params.symbol,
-      positionIdx: params.positionIdx ?? 0,
-      tpslMode: params.tpslMode ?? 'Full',
-      stopLoss: params.stopLoss,
-      takeProfit: params.takeProfit,
-      slTriggerBy: params.slTriggerBy,
-      tpTriggerBy: params.tpTriggerBy,
-      tpSize: params.tpSize,
-      slSize: params.slSize,
-      tpOrderType: params.tpOrderType,
-      tpLimitPrice: params.tpLimitPrice,
-    })
-    return { ok: true }
+  /**
+   * `POST /v5/position/trading-stop` (research §4/§5) — SL (Full) / частичный TP (Partial).
+   * retCode 34040 "not modified" — идемпотентный успех: см. TRADING_STOP_NOT_MODIFIED_RETCODE.
+   */
+  async setTradingStop(params: SetTradingStopParams): Promise<{ ok: true; idempotent?: boolean }> {
+    try {
+      await this.signedPost('/v5/position/trading-stop', {
+        category: 'linear',
+        symbol: params.symbol,
+        positionIdx: params.positionIdx ?? 0,
+        tpslMode: params.tpslMode ?? 'Full',
+        stopLoss: params.stopLoss,
+        takeProfit: params.takeProfit,
+        slTriggerBy: params.slTriggerBy,
+        tpTriggerBy: params.tpTriggerBy,
+        tpSize: params.tpSize,
+        slSize: params.slSize,
+        tpOrderType: params.tpOrderType,
+        tpLimitPrice: params.tpLimitPrice,
+      })
+      return { ok: true }
+    } catch (err) {
+      if (err instanceof BybitApiError && err.retCode === TRADING_STOP_NOT_MODIFIED_RETCODE) {
+        return { ok: true, idempotent: true }
+      }
+      throw err
+    }
   }
 }
