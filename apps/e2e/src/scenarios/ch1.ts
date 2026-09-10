@@ -156,11 +156,11 @@ export const ch1Guards: Scenario = {
 
 export const ch1Busy: Scenario = {
   id: 'ch1-busy',
-  title: 'Повторный сигнал по занятому символу',
+  title: 'Повторный сигнал по занятому символу — добор',
   slot: 1,
   symbols: ['SOLUSDT'],
   tags: ['ch1', 'guards'],
-  note: 'Символ занят внутри канала (symbol_ownership) — второй вход обязан уйти в skipped(symbol_busy), не удваивая позицию.',
+  note: 'Символ занят СВОЕЙ же сделкой канала — повторный вход становится добором (одна сделка, вторая нога), а не вторым входом.',
   steps: [
     {
       title: 'Первый вход',
@@ -172,11 +172,12 @@ export const ch1Busy: Scenario = {
       },
     },
     {
-      title: 'Тот же сигнал повторно',
+      title: 'Тот же сигнал повторно -> добор',
       post: async (ctx) => ({ text: await entrySignal(ctx, { symbol: 'SOLUSDT', ticker: 'SOL', side: 'LONG' }) }),
       expect: {
         status: 'executed',
-        actions: [{ type: 'open', status: 'skipped', symbol: 'SOLUSDT', skipReason: 'symbol_busy' }],
+        actions: [{ type: 'add', status: 'executed', symbol: 'SOLUSDT' }],
+        exchange: { symbol: 'SOLUSDT', position: 'long' },
       },
     },
     {

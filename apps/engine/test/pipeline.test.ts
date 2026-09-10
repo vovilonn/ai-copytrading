@@ -1465,7 +1465,12 @@ describe('pipeline — новый вход по занятому символу'
     expect(trades).toHaveLength(1)
   })
 
-  it('позиция ОТКРЫТА, пришёл повторный РЫНОЧНЫЙ сигнал -> по-прежнему symbol_busy (защита от дубля)', async () => {
+  // Живой случай 10.09.2026 (msg 221691 «Xrp long с текущих»): накануне автор зафиксировал
+  // половину XRP и написал «если вынос вверх дадут то дольюсь». Обещанный добор ушёл в
+  // symbol_busy — позиция осталась вдвое меньше авторской. Позиция по (каналу, символу) наша
+  // собственная, повтор входа в неё = добор; от повторной обработки ТОГО ЖЕ сообщения защищает
+  // идемпотентность, а не этот скип.
+  it('позиция ОТКРЫТА, пришёл повторный РЫНОЧНЫЙ сигнал -> добор по рынку, а не symbol_busy', async () => {
     const channelId = nextChannelId++
     await seedCh2(channelId, 'ETHUSDT')
     const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', getMarkPrice: markAt('1900'), aiEnabled: false }
@@ -1474,8 +1479,29 @@ describe('pipeline — новый вход по занятому символу'
     await processMessage(db, await insertMessage(channelId, 2, 'eth long с текущих'), localDeps)
 
     const second = await actionFor(channelId, 2)
-    expect(second.status).toBe('skipped')
-    expect(second.skip_reason).toBe('symbol_busy')
+    expect(second.status).toBe('executed')
+    expect(second.type).toBe('add')
+    const add = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).where('purpose', '=', 'add').executeTakeFirstOrThrow()
+    expect(add.order_type).toBe('market')
+    // Сделка одна: добор — это НОГА существующей сделки, а не вторая сделка по символу.
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades).toHaveLength(1)
+  })
+
+  // Тот же сигнал, пришедший ДВАЖДЫ ОДНИМ сообщением (переобработка), по-прежнему исполняется один
+  // раз — это и есть настоящая защита от дубля.
+  it('ПОВТОРНАЯ обработка того же сообщения -> ордер один (идемпотентность, а не skip)', async () => {
+    const channelId = nextChannelId++
+    await seedCh2(channelId, 'ETHUSDT')
+    const localDeps: PipelineDeps = { executionPort: createExecutionPort('dry_run'), network: 'testnet', equity: '10000', getMarkPrice: markAt('1900'), aiEnabled: false }
+
+    const message = await insertMessage(channelId, 1, 'eth long с текущих')
+    await processMessage(db, message, localDeps)
+    await processMessage(db, message, localDeps)
+
+    const entries = await db.selectFrom('orders').selectAll().where('channel_id', '=', channelId).execute()
+    expect(entries.filter((o) => o.purpose === 'entry')).toHaveLength(1)
+    expect(entries.filter((o) => o.purpose === 'add')).toHaveLength(0)
   })
 
   it('вход в ПРОТИВОПОЛОЖНУЮ сторону -> side_conflict, а не молчаливый symbol_busy', async () => {
