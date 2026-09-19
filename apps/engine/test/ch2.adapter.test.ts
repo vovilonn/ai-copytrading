@@ -591,6 +591,18 @@ describe('ch2.adapter — рыночный вход и лимитки в ОДН�
     expect(result.confidence).toBe(0.8)
     expect(result.intents).toHaveLength(3)
   })
+
+  // Живой случай 19.09.2026 (msg 221765): цена лимитки — «2» из «1/2 объема». Защитный стоп от
+  // этой цены (1.82) оказался выше рынка XRP (1.42), и биржа отвергла ордер кодом 10001.
+  it('доля объёма («1/2 объема», «50%») — не цена лимитки', () => {
+    const result = parseCh2(ctxWith('Limit long Xrp 1.37 1/2 объема\nLimit long doge 0.085 1/2 объема\nLimit long btc 60850 50%'))
+
+    expect(result.intents).toEqual([
+      { kind: 'limit_entry', symbol: 'XRPUSDT', side: 'long', price: 1.37 },
+      { kind: 'limit_entry', symbol: 'DOGEUSDT', side: 'long', price: 0.085 },
+      { kind: 'limit_entry', symbol: 'BTCUSDT', side: 'long', price: 60850 },
+    ])
+  })
 })
 
 // Живой случай 09.08.2026 (msg 221572, канал AACADEMY): автор ведёт позицию цепочкой терсных

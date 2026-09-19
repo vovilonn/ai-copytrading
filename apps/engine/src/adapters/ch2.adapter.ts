@@ -246,6 +246,12 @@ function tryStructuredSignal(text: string, ctx: ParseContext): ParsedResult | nu
 const LIMIT_GATE_RE = /\blimit\b|(?<![\p{L}\p{N}])(лимитк|лимитн|отложк)[а-яё]*/iu
 const DIR_WORD_GATE_RE = /\b(long|short)\b|(?<![\p{L}\p{N}])(лонг|шорт)[а-яё]*/iu
 
+// Доля объёма входа стоит в строке ПОСЛЕ цены — «Limit long Xrp 1.37 1/2 объема» — и правило
+// «последнее число — цена» забирало её себе. Живой случай 19.09.2026 (msg 221765): лимитка XRP
+// по «2» при рынке 1.42, защитный стоп от этой цены лёг выше рынка, биржа отвергла ордер (10001).
+// Проценты («… 50%») вырезаются тем же приёмом — PERCENT_NUM_RE.
+const FRACTION_NUM_RE = /\d+\s*\/\s*\d+/g
+
 /** Интент вместе с номером строки-источника — чтобы итоговый порядок совпадал с порядком в тексте. */
 interface EntryHit {
   line: number
@@ -308,7 +314,7 @@ function scanLimitEntries(lines: readonly string[], ctx: ParseContext): EntrySca
     for (const segment of line.split(' + ')) {
       const side = extractSide(segment)
       const coin = extractCoins(segment)[0]
-      const numbers = parseNumbers(segment)
+      const numbers = parseNumbers(segment.replace(FRACTION_NUM_RE, ' ').replace(PERCENT_NUM_RE, ' '))
       if (side === null || coin === undefined || numbers.length === 0) continue
       const symbol = ctx.resolveSymbol(coin)
       if (symbol === null || !ctx.isListed(symbol)) continue
