@@ -175,3 +175,45 @@ describe('COIN_ALIASES — падежи целиком', () => {
     },
   )
 })
+
+// Живой случай 22.09.2026 (msg 221780): «1000pepe limit long 0.0046 1/2 объема + limit long btc
+// 84600» дал ТОЛЬКО биток — монеты знал лишь закрытый список из пяти алиасов, и строка про pepe
+// потерялась молча. Дамп канала показывает тот же провал ещё у полутора десятков монет, которые
+// автор называет голым тикером (inj, jup, ldo, arb, pyth, tia, near, ondo, apt…).
+describe('extractCoins/resolveSymbol — голый тикер сверяется с КАТАЛОГОМ инструментов', () => {
+  const CATALOG = new Set(['BTCUSDT', 'ETHUSDT', 'INJUSDT', '1000PEPEUSDT', '1000BONKUSDT', 'SUSDT', 'CUSDT', '4USDT', 'HIGHUSDT'])
+  const listed = (symbol: string): boolean => CATALOG.has(symbol)
+
+  it('«1000pepe» -> 1000PEPEUSDT', () => {
+    expect(extractCoins('1000pepe limit long  0.0046 1/2 объема', listed)).toEqual(['1000PEPE'])
+    expect(resolveSymbol('1000pepe', listed)).toBe('1000PEPEUSDT')
+  })
+
+  it('монета без множителя в тексте («pepe») резолвится в листингованную 1000PEPE', () => {
+    expect(resolveSymbol('pepe', listed)).toBe('1000PEPEUSDT')
+    expect(extractCoins('limit long pepe 0.0046', listed)).toEqual(['1000PEPE'])
+  })
+
+  it('тикер, которого нет в алиасах, но есть в каталоге («inj»)', () => {
+    expect(extractCoins('inj long с текущих', listed)).toEqual(['INJ'])
+  })
+
+  it('алиасы и хэштеги работают как раньше', () => {
+    expect(extractCoins('битка и эфира', listed)).toEqual(['BTC', 'ETH'])
+    expect(resolveSymbol('#eth/usdt', listed)).toBe('ETHUSDT')
+  })
+
+  it('короткие слова и чистые числа монетой не считаются, даже если такой тикер есть', () => {
+    // «Sol long c текущих» (живой текст) не должен давать CUSDT, «4» из цены — 4USDT.
+    expect(extractCoins('long c текущих 4', listed)).toHaveLength(0)
+    expect(extractCoins('84600', listed)).toHaveLength(0)
+  })
+
+  it('структурные слова разбора монетой не считаются', () => {
+    expect(extractCoins('limit long high risk', listed)).toHaveLength(0)
+  })
+
+  it('без каталога поведение прежнее — только алиасы', () => {
+    expect(extractCoins('1000pepe limit long 0.0046')).toHaveLength(0)
+  })
+})

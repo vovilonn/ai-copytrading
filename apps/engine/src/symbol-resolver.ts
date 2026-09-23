@@ -43,15 +43,66 @@ const COIN_ALIASES: ReadonlyArray<{ symbol: string; pattern: RegExp }> = [
 const HASHTAG_RE = /#([a-z0-9]+)(?:\/usdt)?/
 
 /**
+ * ГОЛЫЙ ТИКЕР СВЕРЯЕТСЯ С КАТАЛОГОМ ИНСТРУМЕНТОВ.
+ *
+ * COIN_ALIASES выше — закрытый список из пяти монет, а биржа листингует сотни. Всё, что автор
+ * называет просто тикером, для разбора не существовало: живой случай 22.09.2026 (msg 221780)
+ * «1000pepe limit long 0.0046 … + limit long btc 84600» выставил ТОЛЬКО биток, строка про pepe
+ * исчезла молча — ни ордера, ни skip, ни следа в UI. Дамп канала показывает тот же провал ещё у
+ * полутора десятков монет (inj, jup, ldo, arb, pyth, tia, near, ondo, apt, link…).
+ *
+ * Поэтому слово, не попавшее в алиасы, проверяется по КАТАЛОГУ активной сети (тот же `isListed`,
+ * которым резолвер и так пользуется). Каталог — источник правды: выдумать монету, которой нет в
+ * листинге, эта ветка не может.
+ *
+ * Три ограничителя против ложных монет (замерены на 658 реальных сообщениях обоих каналов):
+ *  1) только латиница и хотя бы одна буква — кириллица идёт через алиасы, а «84600» и «4» из цены
+ *     не должны становиться тикером 4USDT;
+ *  2) не короче трёх символов — иначе «Sol long c текущих» дало бы CUSDT, «волна b» — BUSDT,
+ *     а «us»/«re» из ссылок — USUSDT/REUSDT;
+ *  3) структурные слова разбора (limit/long/stop/high/risk…) монетой не считаются, даже если
+ *     тикер с таким именем существует.
+ */
+const LOT_PREFIXES = ['1000', '10000', '1000000'] as const
+const MIN_TICKER_LEN = 3
+const LATIN_TICKER_RE = /^[a-z0-9]+$/
+const HAS_LETTER_RE = /[a-z]/
+const NOT_A_COIN = new Set([
+  'limit', 'long', 'short', 'relong', 'stop', 'take', 'profit', 'loss', 'entry', 'exit',
+  'buy', 'sell', 'high', 'low', 'risk', 'open', 'close', 'market', 'spot', 'usdt', 'usd',
+])
+
+/**
+ * Слово -> имя монеты из каталога, либо null. Мем-монеты биржа листингует с множителем
+ * (1000PEPE, 10000SATS, 1000000BABYDOGE), а автор пишет «pepe» — поэтому после точного совпадения
+ * пробуем те же префиксы.
+ */
+function catalogCoin(word: string, isListed: (symbol: string) => boolean): string | null {
+  if (word.length < MIN_TICKER_LEN) return null
+  if (!LATIN_TICKER_RE.test(word) || !HAS_LETTER_RE.test(word)) return null
+  if (NOT_A_COIN.has(word)) return null
+
+  const ticker = word.toUpperCase()
+  if (isListed(`${ticker}USDT`)) return ticker
+  for (const prefix of LOT_PREFIXES) {
+    if (isListed(`${prefix}${ticker}USDT`)) return `${prefix}${ticker}`
+  }
+  return null
+}
+
+/**
  * Ищет символ-кандидат в тексте: сначала стем-мап (кириллица/тикер-слова §9),
  * иначе хэштег #TICKER(/USDT)?. Листинг здесь не проверяется — это забота
  * resolveSymbol().
  */
-function resolveSymbolCandidate(raw: string): string | null {
+function resolveSymbolCandidate(raw: string, isListed?: (symbol: string) => boolean): string | null {
   const t = normalize(raw)
   for (const word of tokenizeWords(t)) {
     const alias = COIN_ALIASES.find((a) => a.pattern.test(word))
     if (alias) return `${alias.symbol}USDT`
+    // Алиасов на все монеты биржи нет и быть не может — голый тикер сверяем с каталогом.
+    const fromCatalog = isListed ? catalogCoin(word, isListed) : null
+    if (fromCatalog !== null) return `${fromCatalog}USDT`
   }
   const m = HASHTAG_RE.exec(t)
   const ticker = m?.[1]
@@ -66,7 +117,7 @@ function resolveSymbolCandidate(raw: string): string | null {
  * research §8: символ есть в дампе, но снят с листинга/недоступен).
  */
 export function resolveSymbol(raw: string, isListed: (symbol: string) => boolean): string | null {
-  const symbol = resolveSymbolCandidate(raw)
+  const symbol = resolveSymbolCandidate(raw, isListed)
   return symbol !== null && isListed(symbol) ? symbol : null
 }
 
@@ -103,12 +154,13 @@ export function extractSide(text: string): 'long' | 'short' | null {
  * Фильтрация по контексту (уместно ли это упоминание как символ сделки) —
  * забота адаптера канала (задача 3), не этой функции.
  */
-export function extractCoins(text: string): string[] {
+export function extractCoins(text: string, isListed?: (symbol: string) => boolean): string[] {
   const t = normalize(text)
   const coins: string[] = []
   for (const word of tokenizeWords(t)) {
     const alias = COIN_ALIASES.find((a) => a.pattern.test(word))
-    if (alias && !coins.includes(alias.symbol)) coins.push(alias.symbol)
+    const coin = alias?.symbol ?? (isListed ? catalogCoin(word, isListed) : null)
+    if (coin !== null && coin !== undefined && !coins.includes(coin)) coins.push(coin)
   }
   return coins
 }

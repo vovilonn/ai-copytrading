@@ -360,7 +360,7 @@ function warnUncoveredSymbols(message: PipelineMessage, decided: ReadonlyArray<{
   const uncovered = new Map<string, string>()
   for (const line of message.text.split('\n')) {
     if (line.trim().length === 0) continue
-    for (const coin of extractCoins(line)) {
+    for (const coin of extractCoins(line, ctx.isListed)) {
       const symbol = ctx.resolveSymbol(coin)
       if (symbol === null || !ctx.isListed(symbol) || covered.has(symbol) || uncovered.has(symbol)) continue
       uncovered.set(symbol, line.trim())

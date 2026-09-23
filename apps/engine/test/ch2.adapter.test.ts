@@ -25,18 +25,14 @@ function loadFixture(): FixtureMessage[] {
     .map((line) => JSON.parse(line) as FixtureMessage)
 }
 
-// research §8: все 29 символов дампа CH1 торгуются и на testnet, и на mainnet, за исключением
-// GRASS/EIGEN (там нет в CH2). В CH2-дампе всего 5 монет (BTC/ETH/SOL/XRP/DOGE) — все
-// листингованы на обеих сетях, поэтому isListed ≡ true (research §0: "isListed = всё торгуется").
-const isListed = (): boolean => true
-
-/**
- * ctx.resolveSymbol по контракту (research §10) — ЧИСТОЕ разрешение алиаса, без гейта по
- * листингу (листинг адаптер проверяет отдельно через ctx.isListed). Тот же приём, что и в
- * ch1.adapter.test.ts: существующий resolveSymbol(raw, isListed) объединяет оба шага, здесь
- * передаём always-true, чтобы получить только резолюцию алиаса.
- */
-const alwaysListed = () => true
+// КАТАЛОГ КОНЕЧЕН, как на бирже. Раньше здесь стояло `isListed ≡ true` («в дампе всё
+// торгуется») — безобидное упрощение, пока монеты узнавались по пяти алиасам. С тех пор как
+// резолвер сверяет ГОЛЫЙ ТИКЕР с каталогом (symbol-resolver.ts), «листингован кто угодно» — это
+// уже другой мир: в нём монетой становится любое латинское слово, и «Next - 75.7» в родителе
+// ветки даёт вторую монету NEXTUSDT, которой на бирже нет. Поэтому тут список: монеты дампа CH2
+// (BTC/ETH/SOL/XRP/DOGE) плюс те, что нужны точечным тестам.
+const CATALOG = new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'LINKUSDT', 'INJUSDT', '1000PEPEUSDT'])
+const isListed = (symbol: string): boolean => CATALOG.has(symbol)
 
 function buildContext(messages: FixtureMessage[]): (message: FixtureMessage) => ParseContext {
   const byId = new Map(messages.map((m) => [m.id, m]))
@@ -51,7 +47,7 @@ function buildContext(messages: FixtureMessage[]): (message: FixtureMessage) => 
       media: message.media,
       mediaFile: message.mediaFile,
     },
-    resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+    resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
     isListed,
     getMessage: (id: number) => {
       const found = byId.get(id)
@@ -311,7 +307,7 @@ describe('ch2.adapter — свободный текст доходит до AI (
     return {
       channelId: '4322601605',
       message: { id: 1, text, date: '2026-07-13T15:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: () => null,
       openPositions: new Map(),
@@ -353,7 +349,7 @@ describe('ch2.adapter — цена стопа берётся у маркера, 
     return {
       channelId: '4322601605',
       message: { id: 1, text, date: '2026-07-13T00:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: () => null,
       openPositions: new Map(),
@@ -385,7 +381,7 @@ describe('ch2.adapter — «ещё один» по занятому символ
     return {
       channelId: '1962583820',
       message: { id: 1, text, date: '2026-07-29T20:04:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: () => null,
       openPositions: new Map(
@@ -432,7 +428,7 @@ describe('ch2.adapter — построчные инструкции: стоп, �
     return {
       channelId: '1962583820',
       message: { id: 1, text, date: '2026-08-02T20:14:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: () => null,
       openPositions: new Map(),
@@ -484,7 +480,7 @@ describe('ch2.adapter — доля против полного выхода', ()
     return {
       channelId: '1962583820',
       message: { id: 1, text, date: '2026-08-05T10:04:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: () => null,
       openPositions: new Map(),
@@ -524,7 +520,7 @@ describe('ch2.adapter — рыночный вход и лимитки в ОДН�
     return {
       channelId: '1962583820',
       message: { id: 1, text, date: '2026-08-06T08:26:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: () => null,
       openPositions: new Map(
@@ -614,7 +610,7 @@ describe('ch2.adapter — символ берётся из ЦЕПОЧКИ реп
     return {
       channelId: '1962583820',
       message: { id: 999, text, date: '2026-08-09T15:43:00Z', replyToMsgId, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: (id: number) => {
         const found = chain[id]
@@ -675,7 +671,7 @@ describe('ch2.adapter — «остаток удерживаю» это НЕ вы
     return {
       channelId: '1962583820',
       message: { id: 1, text, date: '2026-08-13T10:44:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: () => null,
       openPositions: new Map(),
@@ -706,7 +702,7 @@ describe('ch2.adapter — две монеты в одной строке раз�
     return {
       channelId: '1962583820',
       message: { id: 1, text, date: '2026-08-13T10:00:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: () => null,
       openPositions: new Map(),
@@ -743,7 +739,7 @@ describe('ch2.adapter — строка несёт несколько инстр�
     return {
       channelId: '1962583820',
       message: { id: 1, text, date: '2026-08-23T13:26:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: () => null,
       openPositions: new Map(),
@@ -820,7 +816,7 @@ describe('ch2.adapter — символ из ветки реплаев не су�
     return {
       channelId: '1962583820',
       message: { id: 2, text, date: '2026-08-23T13:26:00Z', replyToMsgId: 1, groupedId: null, media: null, mediaFile: null },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: (id: number) =>
         id === 1
@@ -859,7 +855,7 @@ describe('ch2.adapter — русскоязычная лимитка и неод�
         media: null,
         mediaFile: null,
       },
-      resolveSymbol: (raw: string) => resolveSymbol(raw, alwaysListed),
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
       isListed,
       getMessage: (id: number) =>
         id === 1 && opts.parentText !== undefined
@@ -898,5 +894,37 @@ describe('ch2.adapter — русскоязычная лимитка и неод�
     const result = parseCh2(ctxFor('Стоп На твх', { replyTo: 1, parentText: parent, open: ['BTCUSDT', 'ETHUSDT'] }))
 
     expect(result.route).toBe('ai')
+  })
+})
+
+// Живой случай 22.09.2026 (msg 221780): бот выставил только лимитку по битку, строка про
+// 1000pepe исчезла молча — ни ордера, ни skip, ни следа в UI.
+describe('ch2.adapter — монета, названная голым тикером, берётся из каталога', () => {
+  function ctxWith(text: string): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 221780, text, date: '2026-09-22T10:36:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  it('«1000pepe limit long 0.0046 1/2 объема + limit long btc 84600» → ОБЕ лимитки', () => {
+    const result = parseCh2(ctxWith('1000pepe limit long  0.0046 1/2 объема\n+ limit long btc 84600 1/2 объема'))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([
+      { kind: 'limit_entry', symbol: '1000PEPEUSDT', side: 'long', price: 0.0046 },
+      { kind: 'limit_entry', symbol: 'BTCUSDT', side: 'long', price: 84600 },
+    ])
+  })
+
+  it('монета вне каталога не выдумывается', () => {
+    const result = parseCh2(ctxWith('limit long wif 0.5'))
+
+    expect(result.intents).toHaveLength(0)
   })
 })

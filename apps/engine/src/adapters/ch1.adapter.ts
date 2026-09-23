@@ -224,7 +224,7 @@ function clauses(text: string): string[] {
 function mentionsForeignCoinWord(text: string, ctx: ParseContext, hashtagSymbols: ReadonlySet<string>): boolean {
   for (const clause of clauses(text)) {
     if (extractOps(clause).length === 0) continue
-    for (const coin of extractCoins(clause)) {
+    for (const coin of extractCoins(clause, ctx.isListed)) {
       const symbol = ctx.resolveSymbol(coin)
       if (symbol === null || !ctx.isListed(symbol) || hashtagSymbols.has(symbol)) continue
       return true

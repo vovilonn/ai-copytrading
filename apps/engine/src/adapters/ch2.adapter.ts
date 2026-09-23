@@ -90,7 +90,7 @@ function symbolsInText(text: string, ctx: ParseContext): string[] {
     const symbol = ctx.resolveSymbol(hashtagMatch[1]!)
     if (symbol !== null && ctx.isListed(symbol)) found.add(symbol)
   }
-  for (const coin of extractCoins(text)) {
+  for (const coin of extractCoins(text, ctx.isListed)) {
     const symbol = ctx.resolveSymbol(coin)
     if (symbol !== null && ctx.isListed(symbol)) found.add(symbol)
   }
@@ -146,7 +146,7 @@ function hasTradeMarker(t: string): boolean {
 /** Монета в тексте: коин-слово (extractCoins) или структурный хэштег #TICKERUSDT. */
 function hasCoin(text: string, ctx: ParseContext): boolean {
   if (CLEAN_HASHTAG_RE.test(text)) return true
-  return extractCoins(text).some((coin) => ctx.resolveSymbol(coin) !== null)
+  return extractCoins(text, ctx.isListed).some((coin) => ctx.resolveSymbol(coin) !== null)
 }
 
 function fallback(text: string, ctx: ParseContext): ParsedResult {
@@ -313,7 +313,7 @@ function scanLimitEntries(lines: readonly string[], ctx: ParseContext): EntrySca
     // "Limit long btc 60850 + limit long btc 60000" -> 2 сегмента.
     for (const segment of line.split(' + ')) {
       const side = extractSide(segment)
-      const coin = extractCoins(segment)[0]
+      const coin = extractCoins(segment, ctx.isListed)[0]
       const numbers = parseNumbers(segment.replace(FRACTION_NUM_RE, ' ').replace(PERCENT_NUM_RE, ' '))
       if (side === null || coin === undefined || numbers.length === 0) continue
       const symbol = ctx.resolveSymbol(coin)
@@ -368,7 +368,7 @@ function scanMarketEntries(lines: readonly string[], ctx: ParseContext, claimed:
   const wantsAdd = ADD_INTENT_RE.test(text)
   const seen = new Set<string>(claimed)
   // syms = ВСЕ коины в тексте (research §2 C): "Перезахожу в Лонги Sol Eth btc" -> [SOL,ETH,BTC].
-  for (const coin of extractCoins(text)) {
+  for (const coin of extractCoins(text, ctx.isListed)) {
     const symbol = ctx.resolveSymbol(coin)
     if (symbol === null || !ctx.isListed(symbol)) continue
     if (seen.has(symbol)) {
