@@ -928,3 +928,59 @@ describe('ch2.adapter — монета, названная голым тикер
     expect(result.intents).toHaveLength(0)
   })
 })
+
+// Живой случай 28.09.2026 (msg 221800): три лимитки, из них доставлены только две.
+//
+//     0.0041 1/2 объема лимит на доливку Pepe   <- пропала молча
+//     1/2 объема limit long Xrp - 1.454
+//     1/2 объема limit long doge - 0.0912
+//
+// У доливки направление не называют — оно у позиции, которая уже открыта. Сканер лимиток требовал
+// слово long/лонг В САМОЙ строке и молча выбрасывал сегмент, а слово «лимит» (без «лимитка») ещё и
+// не проходило гейт правила.
+describe('ch2.adapter — лимитная доливка без слова направления', () => {
+  function ctxWith(text: string, open: string[] = []): ParseContext {
+    return {
+      channelId: '1962583820',
+      message: { id: 221800, text, date: '2026-09-28T03:32:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+      resolveSymbol: (raw: string) => resolveSymbol(raw, isListed),
+      isListed,
+      getMessage: () => null,
+      openPositions: new Map(open.map((symbol) => [symbol, { tradeId: 't-1', side: 'long' as const, openedByChannel: '1962583820' }])),
+      lastTouchedSymbol: null,
+    }
+  }
+
+  const LIVE_TEXT = '0.0041 1/2 объема лимит на доливку Pepe\n1/2 объема limit long Xrp - 1.454\n1/2 объема limit long doge - 0.0912'
+
+  it('направление доливки берётся у ОТКРЫТОЙ позиции — все три лимитки на месте', () => {
+    const result = parseCh2(ctxWith(LIVE_TEXT, ['1000PEPEUSDT']))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([
+      { kind: 'limit_entry', symbol: '1000PEPEUSDT', side: 'long', price: 0.0041 },
+      { kind: 'limit_entry', symbol: 'XRPUSDT', side: 'long', price: 1.454 },
+      { kind: 'limit_entry', symbol: 'DOGEUSDT', side: 'long', price: 0.0912 },
+    ])
+  })
+
+  it('«лимит» без «лимитки» — тоже лимитный ордер', () => {
+    const result = parseCh2(ctxWith('Лимит на доливку Pepe 0.0041', ['1000PEPEUSDT']))
+
+    expect(result.intents).toEqual([{ kind: 'limit_entry', symbol: '1000PEPEUSDT', side: 'long', price: 0.0041 }])
+  })
+
+  it('позиции нет, направления нет — сообщение уходит МОДЕЛИ, а не исполняется наполовину', () => {
+    const result = parseCh2(ctxWith(LIVE_TEXT))
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('partial_entry_parse')
+  })
+
+  it('обычная фраза с монетой и числом соседнюю лимитку не ломает', () => {
+    const result = parseCh2(ctxWith('Limit long Eth - 1895\nБиток пока стоит у 60000'))
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([{ kind: 'limit_entry', symbol: 'ETHUSDT', side: 'long', price: 1895 }])
+  })
+})

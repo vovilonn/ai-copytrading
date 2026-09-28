@@ -243,7 +243,9 @@ function tryStructuredSignal(text: string, ctx: ParseContext): ParsedResult | nu
 // \b(long|short)\b), и лимитный вход молча уезжал в модель. 28.08.2026 модель была недоступна —
 // сообщение осело в needs_review, ордер не выставлен (msg 221633).
 // `\b` не годится для кириллицы (он ASCII-only) — границу слева задаём lookbehind'ом.
-const LIMIT_GATE_RE = /\blimit\b|(?<![\p{L}\p{N}])(лимитк|лимитн|отложк)[а-яё]*/iu
+// «лимит» — отдельное слово, а не только «лимитка/лимитную»: автор пишет и «лимит на доливку
+// Pepe» (msg 221800, 28.09.2026). Стем `лимит[а-яё]*` покрывает обе формы разом.
+const LIMIT_GATE_RE = /\blimit\b|(?<![\p{L}\p{N}])(лимит|отложк)[а-яё]*/iu
 const DIR_WORD_GATE_RE = /\b(long|short)\b|(?<![\p{L}\p{N}])(лонг|шорт)[а-яё]*/iu
 
 // Доля объёма входа стоит в строке ПОСЛЕ цены — «Limit long Xrp 1.37 1/2 объема» — и правило
@@ -266,6 +268,8 @@ interface EntryScan {
   consumed: Set<number>
   /** Сколько символов сканер намеренно пропустил как уже занятые другим правилом. */
   suppressed: number
+  /** Строки-ордера, у которых не хватило данных на интент (напр. неизвестно направление). */
+  missed: number
 }
 
 function tryEntries(text: string, ctx: ParseContext): ParsedResult | null {
@@ -284,7 +288,9 @@ function tryEntries(text: string, ctx: ParseContext): ParsedResult | null {
   // модели: она видит его целиком, а не по одной строке. `suppressed` — это НЕ потеря: символ
   // уже вошёл лимиткой этого же сообщения («Limit long Eth 1895 / с текущих тоже беру eth»).
   const halfParsed =
-    (limit.gated && limit.hits.length === 0) || (market.gated && market.hits.length === 0 && market.suppressed === 0)
+    (limit.gated && limit.hits.length === 0) ||
+    limit.missed > 0 ||
+    (market.gated && market.hits.length === 0 && market.suppressed === 0)
   const hits = [...limit.hits, ...market.hits].sort((a, b) => a.line - b.line)
 
   if (hits.length === 0) {
@@ -300,8 +306,10 @@ function tryEntries(text: string, ctx: ParseContext): ParsedResult | null {
 }
 
 function scanLimitEntries(lines: readonly string[], ctx: ParseContext): EntryScan {
-  const scan: EntryScan = { gated: false, hits: [], consumed: new Set(), suppressed: 0 }
-  if (!LIMIT_GATE_RE.test(lines.join('\n')) || !DIR_WORD_GATE_RE.test(lines.join('\n'))) return scan
+  const scan: EntryScan = { gated: false, hits: [], consumed: new Set(), suppressed: 0, missed: 0 }
+  // Направление берётся либо из слов сообщения, либо у открытой позиции (см. ниже, доливка его не
+  // называет) — поэтому гейта направления достаточно любого из двух источников.
+  if (!LIMIT_GATE_RE.test(lines.join('\n')) || !(DIR_WORD_GATE_RE.test(lines.join('\n')) || ctx.openPositions.size > 0)) return scan
   scan.gated = true
 
   lines.forEach((line, index) => {
@@ -312,12 +320,24 @@ function scanLimitEntries(lines: readonly string[], ctx: ParseContext): EntrySca
     // Сплит по ` + ` (несколько ордеров в одной строке, research §2 B):
     // "Limit long btc 60850 + limit long btc 60000" -> 2 сегмента.
     for (const segment of line.split(' + ')) {
-      const side = extractSide(segment)
       const coin = extractCoins(segment, ctx.isListed)[0]
       const numbers = parseNumbers(segment.replace(FRACTION_NUM_RE, ' ').replace(PERCENT_NUM_RE, ' '))
-      if (side === null || coin === undefined || numbers.length === 0) continue
+      if (coin === undefined || numbers.length === 0) continue
       const symbol = ctx.resolveSymbol(coin)
       if (symbol === null || !ctx.isListed(symbol)) continue
+
+      // НАПРАВЛЕНИЕ ДОЛИВКИ НЕ НАЗЫВАЮТ — оно у позиции. «0.0041 1/2 объема лимит на доливку Pepe»
+      // (msg 221800, 28.09.2026) не несёт ни long, ни лонг: доливают то, что уже открыто. Раньше
+      // сегмент без слова направления просто выбрасывался — молча, как и полагается самой дорогой
+      // ошибке этого адаптера. Открытая позиция по символу — не догадка, а факт нашего же журнала.
+      const side = extractSide(segment) ?? ctx.openPositions.get(symbol)?.side ?? null
+      if (side === null) {
+        // Строка ГОВОРИТ про лимитку, называет монету и цену, но направления нет нигде — ни в
+        // словах, ни в позиции. Исполнить остальные строки и промолчать про эту нельзя: отдаём
+        // сообщение модели целиком (та же логика, что у halfParsed в tryEntries).
+        if (LIMIT_GATE_RE.test(segment)) scan.missed += 1
+        continue
+      }
       const price = numbers[numbers.length - 1]! // последнее число в сегменте — цена (research §2 B)
       scan.hits.push({ line: index, intent: { kind: 'limit_entry', symbol, side, price } })
       scan.consumed.add(index)
@@ -352,7 +372,7 @@ const ADD_INTENT_RE = /(?:ещ[её]\s+(?:один|одну|раз)|добир|�
  * @param claimed символы, уже вошедшие лимиткой этого же сообщения: второй вход по ним не нужен.
  */
 function scanMarketEntries(lines: readonly string[], ctx: ParseContext, claimed: ReadonlySet<string>): EntryScan {
-  const scan: EntryScan = { gated: false, hits: [], consumed: new Set(), suppressed: 0 }
+  const scan: EntryScan = { gated: false, hits: [], consumed: new Set(), suppressed: 0, missed: 0 }
   const text = lines.join('\n')
   if (!MARKET_ENTRY_GATE_RE.test(text)) return scan
   scan.gated = true
