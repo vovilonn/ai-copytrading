@@ -1534,3 +1534,41 @@ describe('pipeline — новый вход по занятому символу'
     expect(new Decimal(position.size).greaterThan(0)).toBe(true)
   })
 })
+
+// Пересчёт защитного стопа после доливки (см. private-ws.ts::planProtectiveSlRefresh) держится на
+// одном признаке: ЧЕЙ стоп стоит на позиции. Ошибись в нём — и бот начнёт двигать авторский
+// уровень риска либо, наоборот, оставит свой у цены первого входа (живой случай TR-1120).
+describe('pipeline — trades.protective_sl: чей стоп стоит на сделке', () => {
+  it('автор стопа не дал → стоп наш, признак поднят', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'BTCUSDT', adapterId: 'ch2-freeform', maxLeverage: '10', defaultLeverage: '10' })
+    const localDeps: PipelineDeps = { ...deps, getMarkPrice: async () => '100', aiEnabled: false }
+    const message = await insertMessage(channelId, 1, 'С текущих long btc')
+    await processMessage(db, message, localDeps)
+
+    const trade = await db.selectFrom('trades').select(['protective_sl', 'status']).where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    expect(trade.protective_sl).toBe(true)
+  })
+
+  it('стоп из сигнала автора → признак опущен, такой стоп мы не двигаем', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT' })
+    const localDeps: PipelineDeps = { executionPort: deps.executionPort, network: 'testnet', equity: '1000', aiEnabled: false }
+    const message = await insertMessage(channelId, 2, '#ATOM/USDT 📈LONG\n\nДиапазон входа: 100 - 100$\nSL: 90$\n\nРиск: 1%')
+    await processMessage(db, message, localDeps)
+
+    const trade = await db.selectFrom('trades').select('protective_sl').where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    expect(trade.protective_sl).toBe(false)
+  })
+
+  it('автор прислал свой стоп позже («стоп 95») → сделка перестаёт быть нашей по стопу', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'BTCUSDT', adapterId: 'ch2-freeform', maxLeverage: '10', defaultLeverage: '10' })
+    const localDeps: PipelineDeps = { ...deps, getMarkPrice: async () => '100', aiEnabled: false }
+    await processMessage(db, await insertMessage(channelId, 3, 'С текущих long btc'), localDeps)
+    await processMessage(db, await insertMessage(channelId, 4, 'Стоп по битку 95'), localDeps)
+
+    const trade = await db.selectFrom('trades').select('protective_sl').where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    expect(trade.protective_sl).toBe(false)
+  })
+})

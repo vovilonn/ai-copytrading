@@ -77,3 +77,76 @@ export function protectiveSl(params: ProtectiveSlParams): Decimal | null {
   const entry = new Decimal(params.entry)
   return params.side === 'long' ? entry.mul(new Decimal(1).minus(d)) : entry.mul(new Decimal(1).plus(d))
 }
+
+/**
+ * ЗАЩИТНЫЙ СТОП ПЕРЕЕЗЖАЕТ ВСЛЕД ЗА СРЕДНЕЙ ЦЕНОЙ ПОЗИЦИИ.
+ *
+ * Стоп, посчитанный при входе, привязан к цене ТОГО входа. После доливки средняя цена уезжает, а
+ * стоп остаётся — и оба следствия плохи:
+ *
+ *  - долили НИЖЕ (обычный случай «добираю на проливе»): стоп стоит в паре процентов под ценой
+ *    доливки и накрывает уже удвоенный объём. Живой случай 29.09.2026 (TR-1120, 1000PEPE): вход
+ *    0.00444 → стоп 0.004064; доливка 0.0041 в 01:07, в 04:32 стоп забрал все 328300 (−68.67$);
+ *  - долили ВЫШЕ: средняя и цена ЛИКВИДАЦИИ поднялись, а старый стоп остался ниже ликвидации —
+ *    то есть перестал быть стопом вовсе, биржа закроет позицию раньше него.
+ *
+ * Обе беды лечит одно и то же: пересчитать стоп той же формулой от НОВОЙ средней. Относительная
+ * дистанция (1/lev − mmr − buf) при этом сохраняется, а значит сохраняется и инвариант «стоп
+ * срабатывает раньше ликвидации» — он выполняется по построению при любой средней.
+ *
+ * Возвращает `null`, когда двигать не нужно или НЕЛЬЗЯ:
+ *  - разница с текущим стопом меньше шага цены (на биржу идти незачем);
+ *  - новый стоп оказался бы по ту сторону рынка (позиция уже глубоко в минусе): выставить его
+ *    значит закрыть позицию сейчас же по рынку — это не защита, а внеплановый выход. Оставляем
+ *    прежний стоп, решение о таком выходе — не арифметика, а человек.
+ *
+ * Только для НАШЕГО стопа (trades.protective_sl): авторский двигать нельзя, это его решение о риске.
+ */
+export interface RefreshedProtectiveSlParams {
+  /** Средняя цена позиции ПОСЛЕ доливки (positions.avg_price / entryPrice из пуша). */
+  avgPrice: Numeric
+  side: Side
+  lev: Numeric
+  mmr: Numeric
+  /** Стоп, который стоит на позиции сейчас. */
+  currentSl: Numeric | null
+  /** Живая цена — гейт «новый стоп не должен оказаться за рынком». */
+  markPrice: Numeric | null
+  /** Шаг цены инструмента: и округление, и порог «двигать/не двигать». */
+  tickSize?: Numeric
+  buf?: Numeric
+}
+
+export function refreshedProtectiveSl(params: RefreshedProtectiveSlParams): Decimal | null {
+  const avg = new Decimal(params.avgPrice)
+  const lev = new Decimal(params.lev)
+  if (!avg.gt(0) || !lev.gt(0)) return null
+
+  const tick = new Decimal(params.tickSize ?? 0)
+  const raw = protectiveSl({ entry: avg, side: params.side, lev, mmr: params.mmr, ...(params.buf !== undefined ? { buf: params.buf } : {}) })
+  if (raw === null) return null
+
+  // Округляем В СТОРОНУ БЕЗОПАСНОСТИ: лонгу — вниз, шорту — вверх, чтобы округление не подтянуло
+  // стоп ближе к рынку (и не сделало дистанцию до ликвидации меньше расчётной).
+  const next = tick.gt(0)
+    ? params.side === 'long'
+      ? floorTo(tick, raw)
+      : floorTo(tick, raw).plus(raw.mod(tick).isZero() ? 0 : tick)
+    : raw
+  if (!next.gt(0)) return null
+
+  // ПЕРЕСТАВЛЯЕМ СУЩЕСТВУЮЩИЙ стоп, а не ставим новый. Стопа на позиции нет — значит его сняли
+  // намеренно (оператор/автор: «везде без стопа»), и возвращать его доливкой мы не вправе.
+  const current = params.currentSl === null ? null : new Decimal(params.currentSl)
+  if (current === null || !current.gt(0)) return null
+  if (next.minus(current).abs().lte(tick)) return null
+
+  if (params.markPrice !== null) {
+    const mark = new Decimal(params.markPrice)
+    // Стоп по ту сторону рынка биржа либо отвергнет, либо исполнит немедленно.
+    const beyondMarket = params.side === 'long' ? next.gte(mark) : next.lte(mark)
+    if (beyondMarket) return null
+  }
+
+  return next
+}

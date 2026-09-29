@@ -864,3 +864,109 @@ describe('applyPositionPush — скоуп атрибуции по канала�
     expect(row.trade_id).toBe(tradeId)
   })
 })
+
+// Живой случай 29.09.2026 (TR-1120, 1000PEPE): защитный стоп посчитан от первого входа (0.00444 →
+// 0.004064), доливка по 0.0041 удвоила позицию, стоп остался на месте — и выбил весь объём.
+// Стоп обязан переезжать за средней ценой, и делать это надо ИМЕННО здесь: лимитная доливка
+// исполняется через сутки-двое после того, как пайплайн о ней забыл, а ещё есть ручные доборы
+// оператора прямо на бирже — все они приходят одним и тем же пушем позиции.
+describe('applyPositionPush — защитный стоп пересчитывается после доливки', () => {
+  const SYMBOL = 'PEPEUSDT'
+
+  function mockRest(): { rest: BybitPrivateWsRestClient; stops: { symbol: string; stopLoss?: string }[] } {
+    const stops: { symbol: string; stopLoss?: string }[] = []
+    return {
+      rest: {
+        cancelAll: async () => ({ ok: true as const }),
+        setTradingStop: vi.fn(async (params: { symbol: string; stopLoss?: string }) => {
+          stops.push({ symbol: params.symbol, ...(params.stopLoss !== undefined ? { stopLoss: params.stopLoss } : {}) })
+          return { ok: true as const }
+        }),
+      },
+      stops,
+    }
+  }
+
+  async function seedInstrument(symbol: string): Promise<void> {
+    await sql`
+      INSERT INTO instruments (symbol, network, base_coin, status, qty_step, min_qty, tick_size, min_notional, max_leverage, leverage_step, mmr, refreshed_at)
+      VALUES (${symbol}, 'testnet', 'PEPE', 'Trading', '1', '1', '0.01', '5', '50', '0.01', '0.005', now())
+      ON CONFLICT (symbol, network) DO UPDATE SET mmr = EXCLUDED.mmr
+    `.execute(db)
+  }
+
+  async function setupProtectedTrade(symbol: string, protective: boolean): Promise<string> {
+    const { tradeId } = await setupTrade(symbol, 'long')
+    await db.updateTable('trades').set({ leverage: '10', protective_sl: protective }).where('id', '=', tradeId).execute()
+    return tradeId
+  }
+
+  it('доливка опустила среднюю → стоп переставлен на бирже той же формулой', async () => {
+    await seedInstrument(SYMBOL)
+    await setupProtectedTrade(SYMBOL, true)
+    const { rest, stops } = mockRest()
+
+    // Вход: 100 штук по 100, наш стоп 91 (= 100 × 0.91 при плече 10).
+    await applyPositionPush(
+      db,
+      buildPositionPush({ symbol: SYMBOL, side: 'Buy', size: '100', entryPrice: '100', markPrice: '100', stopLoss: '91', leverage: '10', seq: 1 }),
+      rest,
+      undefined,
+      'testnet',
+    )
+    expect(stops).toEqual([]) // стоп уже там, где надо — на биржу не ходим
+
+    // Доливка: 100 штук по 90 → средняя 95, стоп должен уехать на 95 × 0.91 = 86.45.
+    await applyPositionPush(
+      db,
+      buildPositionPush({ symbol: SYMBOL, side: 'Buy', size: '200', entryPrice: '95', markPrice: '96', stopLoss: '91', leverage: '10', seq: 2 }),
+      rest,
+      undefined,
+      'testnet',
+    )
+
+    expect(stops).toEqual([{ symbol: SYMBOL, stopLoss: '86.45' }])
+  })
+
+  it('АВТОРСКИЙ стоп не трогаем', async () => {
+    const symbol = 'AUTHORUSDT'
+    await seedInstrument(symbol)
+    await setupProtectedTrade(symbol, false)
+    const { rest, stops } = mockRest()
+
+    await applyPositionPush(
+      db,
+      buildPositionPush({ symbol, side: 'Buy', size: '100', entryPrice: '100', markPrice: '100', stopLoss: '95', leverage: '10', seq: 1 }),
+      rest,
+      undefined,
+      'testnet',
+    )
+    await applyPositionPush(
+      db,
+      buildPositionPush({ symbol, side: 'Buy', size: '200', entryPrice: '95', markPrice: '96', stopLoss: '95', leverage: '10', seq: 2 }),
+      rest,
+      undefined,
+      'testnet',
+    )
+
+    expect(stops).toEqual([])
+  })
+
+  it('сделка под ручным управлением оператора — не трогаем', async () => {
+    const symbol = 'MANUALUSDT'
+    await seedInstrument(symbol)
+    const tradeId = await setupProtectedTrade(symbol, true)
+    await db.updateTable('trades').set({ manual_override: true }).where('id', '=', tradeId).execute()
+    const { rest, stops } = mockRest()
+
+    await applyPositionPush(
+      db,
+      buildPositionPush({ symbol, side: 'Buy', size: '200', entryPrice: '95', markPrice: '96', stopLoss: '91', leverage: '10', seq: 1 }),
+      rest,
+      undefined,
+      'testnet',
+    )
+
+    expect(stops).toEqual([])
+  })
+})

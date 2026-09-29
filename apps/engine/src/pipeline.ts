@@ -1755,6 +1755,10 @@ async function handleOpen(
       initial_size: sizeResult.qty.toString(),
       leverage: leverage.toString(),
       opened_at: now,
+      // ЧЕЙ СТОП СТОИТ НА ПОЗИЦИИ. Свой (выведенный из плеча) мы обязаны переставлять вслед за
+      // средней ценой после доливок — иначе он остаётся у цены первого входа и выносит весь
+      // выросший объём (живой случай 29.09.2026, TR-1120). Авторский не трогаем никогда.
+      protective_sl: intent.signalSl === undefined,
     })
     .where('id', '=', trade.tradeId)
     .execute()
@@ -1946,6 +1950,15 @@ async function handleAdd(
  * Ничего не делает, если целей нет вовсе (вход был без них) — выдумывать цели за автора не наша
  * задача, это работа сигнала.
  */
+/**
+ * Автор назвал стоп сам («стоп 70000», «стоп в бу») — дальше он его и ведёт. Снимаем признак
+ * «стоп наш»: пересчитывать авторский уровень вслед за средней ценой позиции нельзя, это его
+ * решение о риске, а не наша арифметика (см. private-ws.ts::planProtectiveSlRefresh).
+ */
+async function markStopAsAuthors(trx: Kysely<DB>, tradeId: string): Promise<void> {
+  await trx.updateTable('trades').set({ protective_sl: false, updated_at: new Date() }).where('id', '=', tradeId).execute()
+}
+
 async function rebalanceTpLadder(
   trx: Kysely<DB>,
   base: IntentBase,
@@ -2105,6 +2118,7 @@ async function handleDelta(
           break
         }
         await base.deps.executionPort.setStopLoss(trx, { ...orderCtx, price: position.avg_price, qty: remaining.toString() })
+        await markStopAsAuthors(trx, position.trade_id)
         executedOps++
         break
       }
@@ -2116,6 +2130,7 @@ async function handleDelta(
           break
         }
         await base.deps.executionPort.setStopLoss(trx, { ...orderCtx, price: op.price.toString(), qty: remaining.toString() })
+        await markStopAsAuthors(trx, position.trade_id)
         executedOps++
         break
       }

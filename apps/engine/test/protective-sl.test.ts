@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { Decimal } from 'decimal.js'
 import { computeLeverage, liqPrice } from '../src/risk/leverage.js'
-import { leverageWithoutSl, protectiveSl } from '../src/risk/protective-sl.js'
+import { leverageWithoutSl, protectiveSl, refreshedProtectiveSl } from '../src/risk/protective-sl.js'
 
 // Защитный стоп для входа БЕЗ стопа («Long BTC с текущих»). Денежное свойство системы: позиция на
 // плече не должна ни секунды висеть без защиты, а сам стоп обязан срабатывать РАНЬШЕ ликвидации —
@@ -93,5 +93,61 @@ describe('leverageWithoutSl — плечо, когда стопа нет', () =>
   it('никогда не меньше 1', () => {
     const lev = leverageWithoutSl({ defaultLev: '0', channelMaxLev: '20', instrMaxLev: '100', leverageStep: STEP })
     expect(lev.gte(new Decimal(1))).toBe(true)
+  })
+})
+
+// Живой случай 29.09.2026 (TR-1120, 1000PEPE): вход 0.00444 → защитный стоп 0.004064; доливка по
+// 0.0041 удвоила позицию, а стоп остался на месте — в 0.9% под ценой доливки — и выбил ВЕСЬ объём
+// (−68.67$). Защитный стоп обязан переезжать вслед за средней ценой позиции.
+describe('refreshedProtectiveSl — стоп переезжает за средней ценой после доливки', () => {
+  const BASE = { side: 'long' as const, lev: '10', mmr: MMR, tickSize: '0.000001' }
+
+  it('доливка НИЖЕ входа опускает стоп (живой случай pepe)', () => {
+    const moved = refreshedProtectiveSl({
+      ...BASE,
+      avgPrice: '0.00426322', // средняя после доливки 0.0041 к входу 0.00444
+      currentSl: '0.004064', // посчитан от ПЕРВОГО входа
+      markPrice: '0.00421',
+    })
+
+    expect(moved).not.toBeNull()
+    // Та же формула, что и при открытии: d = 1/lev − mmr − buf = 9% от средней.
+    expect(moved!.toFixed(6)).toBe(new Decimal('0.00426322').mul('0.91').toDP(6, Decimal.ROUND_DOWN).toFixed(6))
+    expect(moved!.lt('0.004064')).toBe(true)
+  })
+
+  it('доливка ВЫШЕ входа поднимает стоп: иначе он окажется за ценой ликвидации', () => {
+    const moved = refreshedProtectiveSl({ ...BASE, avgPrice: '110', currentSl: '91.5', markPrice: '112', tickSize: '0.01' })
+
+    expect(moved).not.toBeNull()
+    expect(moved!.gt('91.5')).toBe(true)
+  })
+
+  it('средняя не изменилась — стоп не трогаем (нет ордера на биржу)', () => {
+    const sl = protectiveSl({ entry: '100', side: 'long', lev: '10', mmr: MMR })!
+    expect(refreshedProtectiveSl({ ...BASE, avgPrice: '100', currentSl: sl.toString(), markPrice: '101', tickSize: '0.01' })).toBeNull()
+  })
+
+  it('новый стоп оказался бы ВЫШЕ рынка — не двигаем (это закрыло бы позицию немедленно)', () => {
+    // Позиция глубоко в минусе: средняя 110, рынок 95 — пересчитанный стоп 100.6 выше рынка.
+    expect(refreshedProtectiveSl({ ...BASE, avgPrice: '110', currentSl: '91.5', markPrice: '95', tickSize: '0.01' })).toBeNull()
+  })
+
+  it('шорт: зеркально — стоп выше средней и должен остаться выше рынка', () => {
+    const moved = refreshedProtectiveSl({ ...BASE, side: 'short', avgPrice: '90', currentSl: '109', markPrice: '89', tickSize: '0.01' })
+
+    expect(moved).not.toBeNull()
+    expect(moved!.lt('109')).toBe(true)
+    expect(moved!.gt('89')).toBe(true)
+  })
+
+  it('стопа на позиции НЕТ — не ставим его заново (его сняли намеренно)', () => {
+    expect(refreshedProtectiveSl({ ...BASE, avgPrice: '100', currentSl: null, markPrice: '101', tickSize: '0.01' })).toBeNull()
+    expect(refreshedProtectiveSl({ ...BASE, avgPrice: '100', currentSl: '0', markPrice: '101', tickSize: '0.01' })).toBeNull()
+  })
+
+  it('без средней цены или без плеча пересчёта нет', () => {
+    expect(refreshedProtectiveSl({ ...BASE, avgPrice: '0', currentSl: '1', markPrice: '1' })).toBeNull()
+    expect(refreshedProtectiveSl({ ...BASE, lev: '0', avgPrice: '100', currentSl: '91', markPrice: '101' })).toBeNull()
   })
 })

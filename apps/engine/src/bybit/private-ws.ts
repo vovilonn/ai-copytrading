@@ -36,6 +36,8 @@ import { recalcTradeMoney } from '../state/recalc-trade.js'
 import { emitPositionUpsert } from '../pipeline.js'
 import { attributeExecution } from './sync/attribute.js'
 import { isEngineOrderLinkId } from '../execution/order-link-id.js'
+import { getInstrument } from '../instruments.js'
+import { refreshedProtectiveSl } from '../risk/protective-sl.js'
 import type { BybitRestClient } from './rest-client.js'
 
 // 'demo' — Bybit DEMO TRADING (p3-task6-demo): приватный WS demo проверен вживую (auth success)
@@ -287,7 +289,8 @@ export function mapOrderStatus(raw: string): OrderStatus {
 
 /** Узкий срез BybitRestClient — только cancelAll (R8: снять висящие TP/SL при полном закрытии),
  *  тот же приём сужения типа мока, что и BybitAdapterRestClient в execution/bybit.adapter.ts. */
-export type BybitPrivateWsRestClient = Pick<BybitRestClient, 'cancelAll'>
+export type BybitPrivateWsRestClient = Pick<BybitRestClient, 'cancelAll'> &
+  Partial<Pick<BybitRestClient, 'setTradingStop'>>
 
 interface SymbolAttribution {
   channelId: number
@@ -402,6 +405,9 @@ export async function applyPositionPush(
   push: PositionPush,
   rest: BybitPrivateWsRestClient,
   channelIds?: readonly number[],
+  /** Сеть аккаунта — нужна, чтобы взять mmr и шаг цены инструмента для пересчёта защитного стопа.
+   *  Не задана (старые вызовы/тесты) — стоп не пересчитывается, остальное поведение прежнее. */
+  network?: Network,
 ): Promise<boolean> {
   // Ретрай — на случай, что транзакция pipeline ещё не закоммитила symbol_ownership (см. resolveWithRetry).
   const attribution = await resolveWithRetry(() => attributeSymbol(db, push.symbol, channelIds))
@@ -416,7 +422,9 @@ export async function applyPositionPush(
   let notifyNeeded = false
   let shouldCancelAll = false
 
-  await db.transaction().execute(async (trx) => {
+  // Транзакция ВОЗВРАЩАЕТ план переноса стопа (а не пишет во внешнюю переменную): сетевой вызов
+  // делается после коммита, а тип результата остаётся честным.
+  const slRefresh = await db.transaction().execute(async (trx): Promise<ProtectiveSlRefresh | null> => {
     if (push.seq !== null) {
       // Водяной знак (§14): пуш СТРОГО СТАРШЕ уже сохранённого seq — переупорядочен реконнектом,
       // применять нельзя (откатил бы состояние назад).
@@ -437,7 +445,7 @@ export async function applyPositionPush(
         .where('channel_id', '=', channelId)
         .where('symbol', '=', push.symbol)
         .executeTakeFirst()
-      if (current && current.bybit_seq !== null && push.seq < current.bybit_seq) return
+      if (current && current.bybit_seq !== null && push.seq < current.bybit_seq) return null
     }
 
     // ⚠️ ПЛОСКИЙ ПУШ НЕ ОЗНАЧАЕТ ЗАКРЫТИЕ, ЕСЛИ МЫ НИКОГДА НЕ ВИДЕЛИ ОТКРЫТОЙ ПОЗИЦИИ.
@@ -507,7 +515,7 @@ export async function applyPositionPush(
     // Гейт выше мог ПОДАВИТЬ апдейт (пришёл устаревший фрейм, пока мы ждали блокировку строки).
     // Тогда и всё остальное делать нельзя: `hadOpenPosition` прочитан ДО апдейта, и на его
     // основании мы бы закрыли сделку и сняли защиту с ЖИВОЙ позиции по данным из прошлого.
-    if (applied.rows.length === 0) return
+    if (applied.rows.length === 0) return null
 
     await emitPositionUpsert(trx, channelId, push.symbol)
     notifyNeeded = true
@@ -545,7 +553,38 @@ export async function applyPositionPush(
 
       shouldCancelAll = true
     }
+
+    // ЗАЩИТНЫЙ СТОП ПЕРЕЕЗЖАЕТ ЗА СРЕДНЕЙ ЦЕНОЙ. Место выбрано не случайно: сюда приходит ЛЮБОЕ
+    // изменение позиции — рыночная доливка пайплайна, лимитная (она исполняется через сутки, когда
+    // пайплайн о ней давно забыл) и ручной добор оператора прямо на бирже. Решение принимается по
+    // факту с биржи, а не по намерению в сообщении.
+    if (!isFlat && tradeId && network !== undefined && push.entryPrice !== null && side !== null) {
+      return planProtectiveSlRefresh(trx, { tradeId, symbol: push.symbol, side, push, network })
+    }
+    return null
   })
+
+  if (slRefresh !== null && tradeId !== null && rest.setTradingStop) {
+    // Сетевой вызов — вне транзакции (тот же приём, что cancelAll ниже). Отказ биржи не должен
+    // валить обработку пуша: зеркало позиции уже обновлено, стоп попробуем перенести на следующем.
+    const { stopLoss, previous } = slRefresh
+    try {
+      await rest.setTradingStop({ symbol: push.symbol, positionIdx: 0, tpslMode: 'Full', stopLoss: stopLoss.toString() })
+      await db
+        .updateTable('orders')
+        .set({ price: stopLoss.toString(), qty: push.size, updated_at: new Date() })
+        .where('trade_id', '=', tradeId)
+        .where('purpose', '=', 'sl')
+        .where('status', 'in', ['created', 'pending_submit', 'submitted'])
+        .execute()
+      console.log(
+        `[private-ws] ${push.symbol}: средняя цена позиции ${push.entryPrice} — защитный стоп ` +
+          `${previous ?? '—'} -> ${stopLoss.toString()} (объём ${push.size})`,
+      )
+    } catch (err) {
+      console.error(`[private-ws] не удалось перенести защитный стоп по ${push.symbol}:`, err)
+    }
+  }
 
   if (shouldCancelAll) {
     // R8: снять висящие TP/SL-остатки символа. Вне транзакции — сетевой вызов биржи не держит
@@ -554,6 +593,48 @@ export async function applyPositionPush(
   }
 
   return notifyNeeded
+}
+
+interface ProtectiveSlRefresh {
+  stopLoss: Decimal
+  /** Стоп, который стоял до переноса, — только для лога. */
+  previous: string | null
+}
+
+/**
+ * Нужно ли переставить НАШ защитный стоп после того, как позиция изменилась, и куда.
+ *
+ * `null` — двигать нечего или нельзя: стоп авторский (`trades.protective_sl=false`), сделку ведёт
+ * оператор руками (`manual_override`), инструмент без mmr, либо сам пересчёт сказал «не надо»
+ * (см. refreshedProtectiveSl: разница меньше шага цены, новый стоп за рынком).
+ */
+async function planProtectiveSlRefresh(
+  trx: Kysely<DB>,
+  params: { tradeId: string; symbol: string; side: Side; push: PositionPush; network: Network },
+): Promise<ProtectiveSlRefresh | null> {
+  const trade = await trx
+    .selectFrom('trades')
+    .select(['leverage', 'protective_sl', 'manual_override'])
+    .where('id', '=', params.tradeId)
+    .executeTakeFirst()
+  if (!trade || !trade.protective_sl || trade.manual_override) return null
+
+  const instrument = await getInstrument(trx, params.symbol, params.network)
+  if (!instrument || instrument.mmr === null) return null
+
+  const lev = params.push.leverage ?? trade.leverage
+  if (lev === null) return null
+
+  const stopLoss = refreshedProtectiveSl({
+    avgPrice: params.push.entryPrice ?? '0',
+    side: params.side,
+    lev,
+    mmr: instrument.mmr,
+    currentSl: params.push.stopLoss,
+    markPrice: params.push.markPrice,
+    tickSize: instrument.tickSize,
+  })
+  return stopLoss === null ? null : { stopLoss, previous: params.push.stopLoss }
 }
 
 /**
@@ -896,7 +977,8 @@ export class BybitPrivateWs {
       case 'position':
         for (const item of frame.data) {
           const push = toPositionPush(item)
-          if (push && (await applyPositionPush(this.opts.db, push, this.opts.rest, this.opts.channelIds))) notifyNeeded = true
+          if (push && (await applyPositionPush(this.opts.db, push, this.opts.rest, this.opts.channelIds, this.opts.network)))
+            notifyNeeded = true
         }
         break
       case 'execution':

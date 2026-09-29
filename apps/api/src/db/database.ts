@@ -189,6 +189,9 @@ export interface DB {
     // больше не двигает SL/TP этой сделки. Обе с DEFAULT false ⇒ Generated<> (см. messages выше).
     needs_review: Generated<boolean>
     manual_override: Generated<boolean>
+    // На позиции стоит НАШ защитный стоп, а не авторский (010_protective_sl): только такой стоп
+    // пересчитывается от новой средней цены после доливки. DEFAULT false ⇒ Generated<>.
+    protective_sl: Generated<boolean>
   }
   trade_legs: {
     id: Generated<string>
