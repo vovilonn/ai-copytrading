@@ -468,6 +468,11 @@ export async function applyPositionPush(
       .where('symbol', '=', push.symbol)
       .executeTakeFirst()
     const hadOpenPosition = mirrored !== undefined && !new Decimal(mirrored.size).isZero()
+    // ДОЛИВКА — это РОСТ позиции. Любое другое изменение (перенос стопа, частичная фиксация,
+    // первый вход) защитный стоп пересчитывать не должно: живой случай 02.10.2026 — оператор
+    // попросил стоп в безубыток, дельта его поставила, биржа прислала пуш с новым стопом, и
+    // пересчёт тут же вернул свой уровень, затерев просьбу человека.
+    const grewByAdd = hadOpenPosition && mirrored !== undefined && new Decimal(push.size).gt(mirrored.size)
 
     const applied = await sql<{ channel_id: number }>`
       INSERT INTO positions (
@@ -554,11 +559,11 @@ export async function applyPositionPush(
       shouldCancelAll = true
     }
 
-    // ЗАЩИТНЫЙ СТОП ПЕРЕЕЗЖАЕТ ЗА СРЕДНЕЙ ЦЕНОЙ. Место выбрано не случайно: сюда приходит ЛЮБОЕ
-    // изменение позиции — рыночная доливка пайплайна, лимитная (она исполняется через сутки, когда
-    // пайплайн о ней давно забыл) и ручной добор оператора прямо на бирже. Решение принимается по
-    // факту с биржи, а не по намерению в сообщении.
-    if (!isFlat && tradeId && network !== undefined && push.entryPrice !== null && side !== null) {
+    // ЗАЩИТНЫЙ СТОП ПЕРЕЕЗЖАЕТ ЗА СРЕДНЕЙ ЦЕНОЙ ПОСЛЕ ДОЛИВКИ. Место выбрано не случайно: сюда
+    // приходит любой РОСТ позиции — рыночная доливка пайплайна, лимитная (она исполняется через
+    // сутки, когда пайплайн о ней давно забыл) и ручной добор оператора прямо на бирже. Решение
+    // принимается по факту с биржи, а не по намерению в сообщении.
+    if (grewByAdd && tradeId && network !== undefined && push.entryPrice !== null && side !== null) {
       return planProtectiveSlRefresh(trx, { tradeId, symbol: push.symbol, side, push, network })
     }
     return null

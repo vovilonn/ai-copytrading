@@ -970,3 +970,67 @@ describe('applyPositionPush — защитный стоп пересчитыва
     expect(stops).toEqual([])
   })
 })
+
+// Живой случай 02.10.2026: оператор попросил стоп в безубыток по 1000PEPE. Дельта поставила его
+// (0.004297), биржа прислала пуш позиции с новым стопом — и пересчёт защитного стопа ТУТ ЖЕ
+// вернул его на свой уровень 0.003931. Пересчёт обязан срабатывать на ДОЛИВКЕ (позиция выросла),
+// а не на любом изменении позиции: перенос стопа размера не меняет.
+describe('applyPositionPush — пересчёт стопа только когда позиция ВЫРОСЛА', () => {
+  const SYMBOL = 'GROWUSDT'
+
+  function mockRest(): { rest: BybitPrivateWsRestClient; stops: { stopLoss?: string }[] } {
+    const stops: { stopLoss?: string }[] = []
+    return {
+      rest: {
+        cancelAll: async () => ({ ok: true as const }),
+        setTradingStop: vi.fn(async (params: { stopLoss?: string }) => {
+          stops.push({ ...(params.stopLoss !== undefined ? { stopLoss: params.stopLoss } : {}) })
+          return { ok: true as const }
+        }),
+      },
+      stops,
+    }
+  }
+
+  async function seed(symbol: string): Promise<void> {
+    await sql`
+      INSERT INTO instruments (symbol, network, base_coin, status, qty_step, min_qty, tick_size, min_notional, max_leverage, leverage_step, mmr, refreshed_at)
+      VALUES (${symbol}, 'testnet', 'GROW', 'Trading', '1', '1', '0.01', '5', '50', '0.01', '0.005', now())
+      ON CONFLICT (symbol, network) DO UPDATE SET mmr = EXCLUDED.mmr
+    `.execute(db)
+    const { tradeId } = await setupTrade(symbol, 'long')
+    await db.updateTable('trades').set({ leverage: '10', protective_sl: true }).where('id', '=', tradeId).execute()
+  }
+
+  it('стоп перенесли руками (размер тот же) — пересчёт молчит', async () => {
+    await seed(SYMBOL)
+    const { rest, stops } = mockRest()
+    const push = (stopLoss: string, seq: number) =>
+      buildPositionPush({ symbol: SYMBOL, side: 'Buy', size: '100', entryPrice: '100', markPrice: '101', stopLoss, leverage: '10', seq })
+
+    await applyPositionPush(db, push('91', 1), rest, undefined, 'testnet')
+    // Оператор поставил безубыток — позиция не менялась, объём тот же.
+    await applyPositionPush(db, push('100', 2), rest, undefined, 'testnet')
+
+    expect(stops).toEqual([])
+  })
+
+  it('частичная фиксация (позиция УМЕНЬШИЛАСЬ) — тоже молчит', async () => {
+    const symbol = 'SHRINKUSDT'
+    await seed(symbol)
+    const { rest, stops } = mockRest()
+
+    await applyPositionPush(
+      db,
+      buildPositionPush({ symbol, side: 'Buy', size: '100', entryPrice: '100', markPrice: '101', stopLoss: '91', leverage: '10', seq: 1 }),
+      rest, undefined, 'testnet',
+    )
+    await applyPositionPush(
+      db,
+      buildPositionPush({ symbol, side: 'Buy', size: '50', entryPrice: '100', markPrice: '101', stopLoss: '91', leverage: '10', seq: 2 }),
+      rest, undefined, 'testnet',
+    )
+
+    expect(stops).toEqual([])
+  })
+})
