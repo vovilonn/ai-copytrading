@@ -151,7 +151,21 @@ function hasCoin(text: string, ctx: ParseContext): boolean {
 
 function fallback(text: string, ctx: ParseContext): ParsedResult {
   const noise: ParsedResult = { route: 'noise', confidence: 0, intents: [] }
-  if (text.trim().length === 0) return noise // медиа-only/сервисные сообщения — разбирать нечего
+  const hasMedia = ctx.message.media !== null || ctx.message.mediaFile !== null
+  const vision: ParsedResult = { route: 'ai', confidence: 0, intents: [], reason: 'unknown_format', needsVision: true }
+
+  // КАРТИНКА БЕЗ ПОДПИСИ — ТОЖЕ СООБЩЕНИЕ. Автор объявляет вход скрином позиции: 14.10.2026
+  // (msg 222043) пришёл скрин «BTCUSDT Long 1.0 @ 81 773.3, 20x» и отдельным постом «Папа
+  // вернулся 📈» — сделка была видна только на картинке. Раньше здесь стоял безусловный
+  // `return noise`: гейт ниже (монета ИЛИ торговый маркер) на ПУСТОМ тексте не может сработать в
+  // принципе, поэтому такие посты гасились, ни разу не дойдя до модели, — при полностью рабочем
+  // vision-тракте (needsVision/картинки в промпте/image_used).
+  //
+  // Цена измерена, а не на глаз: за 15 месяцев канала (1703 сообщения) медиа-only ровно 74 —
+  // около пяти вызовов модели в месяц. Пустое сообщение БЕЗ медиа (сервисные посты) остаётся
+  // бесплатным noise. CH1 так и устроен с самого начала (ch1.adapter.ts::fallback) — расхождение
+  // было здесь.
+  if (text.trim().length === 0) return hasMedia ? vision : noise
 
   // normalize() обязательна: без неё «тэйк» не совпадёт с «тейк», а регистр убьёт половину маркеров.
   const t = normalize(text)
@@ -159,14 +173,7 @@ function fallback(text: string, ctx: ParseContext): ParsedResult {
   if (NOISE_KEYWORDS_RE.test(t)) return noise // обзор/анонс/рефка
 
   if (hasCoin(text, ctx) || hasTradeMarker(t)) {
-    const hasMedia = ctx.message.media !== null || ctx.message.mediaFile !== null
-    return {
-      route: 'ai',
-      confidence: 0,
-      intents: [],
-      reason: 'unknown_format',
-      ...(hasMedia ? { needsVision: true } : {}),
-    }
+    return hasMedia ? vision : { route: 'ai', confidence: 0, intents: [], reason: 'unknown_format' }
   }
   return noise // «привет, как дела», «да, согласен полностью» — в модель не тащим
 }

@@ -546,3 +546,116 @@ describe('normalizeAiOutput — несмапленное действие не �
     expect(result.reason).toBe('needs_human')
   })
 })
+
+// ---------------------------------------------------------------------------
+// СКРИН ПОЗИЦИИ БЕЗ ПОДПИСИ. Автор объявляет вход картинкой: msg 222043 (14.10.2026) — скрин
+// «BTCUSDT Long 1.0 @ 81 773.3, 20x» и ни слова текста. Модель такой вход теперь возвращает
+// (prompt.ts), а нормализация обязана пометить его fromSnapshot: по картинке нельзя отличить
+// «вошёл только что» от «показываю старую позицию», и ниже по течению (handleOpen) такой вход
+// не доливает в уже открытую позицию.
+// ---------------------------------------------------------------------------
+describe('normalizeAiOutput — вход со скрина (mediaOnly)', () => {
+  const screenshotEntry = action({
+    type: 'open',
+    symbol: 'BTCUSDT',
+    side: 'long',
+    order_type: 'market',
+    entry: { mode: 'marker', marker: 'current_price' },
+    leverage: 20,
+    evidence_source: 'image',
+  })
+
+  it('сообщение без текста -> market_entry помечен fromSnapshot', () => {
+    const result = normalizeAiOutput(output({ message_type: 'entry', image_used: true, actions: [screenshotEntry] }), {
+      mediaOnly: true,
+    })
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([{ kind: 'market_entry', symbol: 'BTCUSDT', side: 'long', fromSnapshot: true }])
+    expect(result.needsVision).toBe(true)
+  })
+
+  it('лимитный вход со скрина — тоже fromSnapshot', () => {
+    const result = normalizeAiOutput(
+      output({
+        message_type: 'entry',
+        image_used: true,
+        actions: [
+          action({
+            type: 'open',
+            symbol: 'ETHUSDT',
+            side: 'long',
+            order_type: 'limit',
+            entry: { mode: 'price', price: 2356 },
+            evidence_source: 'image',
+          }),
+        ],
+      }),
+      { mediaOnly: true },
+    )
+
+    expect(result.intents).toEqual([{ kind: 'limit_entry', symbol: 'ETHUSDT', side: 'long', price: 2356, fromSnapshot: true }])
+  })
+
+  // Текст есть — значит есть и приказ: «беру биток с текущих» со скрином в придачу остаётся
+  // обычным входом и доливается по общим правилам.
+  it('тот же вход при НЕпустом тексте -> обычный market_entry без метки', () => {
+    const result = normalizeAiOutput(output({ message_type: 'entry', image_used: true, actions: [screenshotEntry] }), {
+      mediaOnly: false,
+    })
+
+    expect(result.intents).toEqual([{ kind: 'market_entry', symbol: 'BTCUSDT', side: 'long' }])
+  })
+
+  // Живой случай из прогона истории: msg 222008 (11.10.2026) — скрин результата «+17.85%» через
+  // две минуты после текстового «Sol Eth половину фикс», который бот УЖЕ исполнил. Модель читает
+  // такую картинку как «закрыть половину SOL и ETH» — исполнив, бот закрыл бы вторую половину.
+  it('картинка без подписи просит НЕ вход (фикс доли) -> needs_review, ноль действий', () => {
+    const result = normalizeAiOutput(
+      output({
+        message_type: 'close_partial',
+        image_used: true,
+        actions: [
+          action({ type: 'close', symbol: 'SOLUSDT', evidence_source: 'image', close_amount: { mode: 'fraction', value: 0.5 } }),
+          action({ type: 'close', symbol: 'ETHUSDT', evidence_source: 'image', close_amount: { mode: 'fraction', value: 0.5 } }),
+        ],
+      }),
+      { mediaOnly: true },
+    )
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('snapshot_needs_review')
+    expect(result.intents).toEqual([])
+  })
+
+  it('та же картинка С ТЕКСТОМ -> обычный partial_close, гейт не срабатывает', () => {
+    const result = normalizeAiOutput(
+      output({
+        message_type: 'close_partial',
+        image_used: true,
+        actions: [action({ type: 'close', symbol: 'SOLUSDT', evidence_source: 'both', close_amount: { mode: 'fraction', value: 0.5 } })],
+      }),
+      { mediaOnly: false },
+    )
+
+    expect(result.route).toBe('execute')
+    expect(result.intents).toEqual([{ kind: 'delta', symbol: 'SOLUSDT', ops: [{ op: 'partial_close', fraction: 0.5 }] }])
+  })
+
+  // Доливка — тоже действие над УЖЕ открытой позицией, и по картинке не видно, не исполнил ли её
+  // бот накануне по тексту. Картинка без подписи может только ОТКРЫТЬ то, чего у нас нет.
+  it('доливка, увиденная на картинке без подписи -> к оператору, а не вслепую в позицию', () => {
+    const result = normalizeAiOutput(
+      output({
+        message_type: 'add_to_position',
+        image_used: true,
+        actions: [action({ type: 'add', symbol: 'BTCUSDT', side: 'long', evidence_source: 'image' })],
+      }),
+      { mediaOnly: true },
+    )
+
+    expect(result.route).toBe('ai')
+    expect(result.reason).toBe('snapshot_needs_review')
+    expect(result.intents).toEqual([])
+  })
+})

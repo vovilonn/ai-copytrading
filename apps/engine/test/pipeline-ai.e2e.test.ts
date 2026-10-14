@@ -167,7 +167,7 @@ let tgIdSeq = 700_000
 
 async function insertMessage(
   db: Kysely<DB>,
-  params: { channelId: number; text: string; replyToMsgId?: number | null; tgMessageId?: number },
+  params: { channelId: number; text: string; replyToMsgId?: number | null; tgMessageId?: number; mediaKind?: string },
 ): Promise<PipelineMessage> {
   const tgMessageId = params.tgMessageId ?? tgIdSeq++
   const msgTs = new Date()
@@ -180,8 +180,8 @@ async function insertMessage(
       grouped_id: null,
       is_topic_message: false,
       text: params.text,
-      has_media: false,
-      media_kind: null,
+      has_media: params.mediaKind !== undefined,
+      media_kind: params.mediaKind ?? null,
       msg_ts: msgTs,
       raw: JSON.stringify({ id: tgMessageId, text: params.text }),
       status: 'received',
@@ -196,7 +196,7 @@ async function insertMessage(
     replyToMsgId: params.replyToMsgId ?? null,
     groupedId: null,
     text: params.text,
-    mediaKind: null,
+    mediaKind: params.mediaKind ?? null,
     msgTs,
   }
 }
@@ -1089,6 +1089,137 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
     const cancelled = await db.selectFrom('orders').selectAll().where('order_link_id', '=', 'TEST-PENDING-ADD-1').executeTakeFirstOrThrow()
     expect(cancelled.status).toBe('cancelled')
     expect(cancelled.cancelled_at).not.toBeNull()
+  })
+
+  // ─────────────────────────────────────────────────────────────────────────────────────────
+  // ВХОД СО СКРИНА ПОЗИЦИИ (сообщение без подписи).
+  //
+  // 14.10.2026 автор выложил скрин «BTCUSDT Long 1.0 @ 81 773.3, 20x» и ни слова текста — бот
+  // не завёл по нему ни одного действия: CH2 гасил медиа-only в noise ещё до модели. Теперь такие
+  // сообщения доходят до AI, но исполняются ОСТОРОЖНЕЕ текстового приказа: скрин сообщает
+  // СОСТОЯНИЕ счёта автора, и по нему не отличить «вошёл только что» от «показываю старую позицию».
+  // ─────────────────────────────────────────────────────────────────────────────────────────
+  const screenshotEntry: ExtractSignalAction = {
+    type: 'open',
+    symbol: 'BTCUSDT',
+    side: 'long',
+    order_type: 'market',
+    entry: { mode: 'marker', marker: 'current_price' },
+    leverage: 20,
+    evidence_source: 'image',
+  }
+  const screenshotOutput = () =>
+    toolUseResponse(
+      baseOutput({
+        message_type: 'entry',
+        image_used: true,
+        confidence: 0.95,
+        summary: 'Скрин позиции BTCUSDT Long 1.0 @ 81773.3, 20x.',
+        actions: [screenshotEntry],
+      }),
+    )
+  const depsWithMark: PipelineDeps = { ...deps, getMarkPrice: async () => '81900' }
+
+  it('скрин позиции по СВОБОДНОМУ символу -> вход открывается (раньше сообщение гасилось в noise)', async () => {
+    await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+    await seedInstrument(db, 'BTCUSDT')
+    mock.queue.push(screenshotOutput())
+
+    const message = await insertMessage(db, { channelId: CH2_ID, text: '', mediaKind: 'MessageMediaPhoto' })
+    await processMessage(db, message, depsWithMark)
+
+    expect(mock.requests).toHaveLength(1) // картинка без подписи дошла до модели
+    const row = await messageRow(db, message.id)
+    expect(row.status).toBe('executed')
+    expect(row.method).toBe('ai')
+
+    const actions = await actionsFor(db, message.id)
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({ type: 'open', symbol: 'BTCUSDT', side: 'long', status: 'executed' })
+
+    const entry = await db.selectFrom('orders').selectAll().where('channel_id', '=', CH2_ID).where('purpose', '=', 'entry').executeTakeFirstOrThrow()
+    expect(entry.order_type).toBe('market')
+  })
+
+  it('тот же скрин по символу с УЖЕ ОТКРЫТОЙ позицией -> не доливает вслепую, а зовёт оператора', async () => {
+    await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+    await seedInstrument(db, 'BTCUSDT')
+    await seedOpenPosition(db, { channelId: CH2_ID, channelOrd: CH2_ORD, symbol: 'BTCUSDT', side: 'long', entryPrice: '60000', qty: '1' })
+    mock.queue.push(screenshotOutput())
+
+    const message = await insertMessage(db, { channelId: CH2_ID, text: '', mediaKind: 'MessageMediaPhoto' })
+    await processMessage(db, message, depsWithMark)
+
+    const actions = await actionsFor(db, message.id)
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({ symbol: 'BTCUSDT', status: 'skipped', skip_reason: 'snapshot_position_exists' })
+
+    // Ни доливки, ни второй сделки: позиция осталась ровно той, что была.
+    const adds = await db.selectFrom('orders').selectAll().where('channel_id', '=', CH2_ID).where('purpose', '=', 'add').execute()
+    expect(adds).toHaveLength(0)
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', CH2_ID).execute()
+    expect(trades).toHaveLength(1)
+    // Саммари модели сохранено — оператор видит, что было на скрине, прямо в карточке сообщения.
+    const row = await messageRow(db, message.id)
+    expect(row.ai_summary).toBe('Скрин позиции BTCUSDT Long 1.0 @ 81773.3, 20x.')
+  })
+
+  // Скрин-ИТОГ (результат сделки) — не приказ. msg 222008 (11.10.2026): картинка «+17.85%» через
+  // две минуты после текстового «Sol Eth половину фикс», который бот уже исполнил. Исполнить её
+  // значит закрыть ВТОРУЮ половину позиции.
+  it('скрин без подписи просит фикс доли -> needs_review, ни одного ордера', async () => {
+    await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+    await seedInstrument(db, 'BTCUSDT')
+    await seedOpenPosition(db, { channelId: CH2_ID, channelOrd: CH2_ORD, symbol: 'BTCUSDT', side: 'long', entryPrice: '60000', qty: '1' })
+    mock.queue.push(
+      toolUseResponse(
+        baseOutput({
+          message_type: 'close_partial',
+          image_used: true,
+          confidence: 0.95,
+          summary: 'Карточка результата: зафиксирована половина BTCUSDT.',
+          actions: [
+            { type: 'close', symbol: 'BTCUSDT', side: 'long', close_amount: { mode: 'fraction', value: 0.5 }, evidence_source: 'image' },
+          ],
+        }),
+      ),
+    )
+
+    const message = await insertMessage(db, { channelId: CH2_ID, text: '', mediaKind: 'MessageMediaPhoto' })
+    await processMessage(db, message, depsWithMark)
+
+    const row = await messageRow(db, message.id)
+    expect(row.status).toBe('needs_review')
+    expect(row.status_reason).toBe('snapshot_needs_review')
+
+    const actions = await actionsFor(db, message.id)
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({ status: 'needs_review', skip_reason: 'snapshot_needs_review' })
+
+    // Позиция не тронута: закрывающих ордеров нет вовсе.
+    const closes = await db.selectFrom('orders').selectAll().where('channel_id', '=', CH2_ID).where('purpose', 'in', ['close', 'tp']).execute()
+    expect(closes).toHaveLength(0)
+    const trade = await db.selectFrom('trades').selectAll().where('channel_id', '=', CH2_ID).executeTakeFirstOrThrow()
+    expect(new Decimal(trade.size).toString()).toBe('1')
+  })
+
+  // Обратная сторона того же инварианта: осторожность включает КАРТИНКА БЕЗ ПОДПИСИ, а не
+  // открытая позиция. Текстовый приказ «ещё раз с текущих» по-прежнему доливает — его автор
+  // написал словами, и двусмысленности в нём нет.
+  it('тот же вход, но С ТЕКСТОМ -> обычная доливка в открытую позицию', async () => {
+    await seedChannel(db, { id: CH2_ID, ord: CH2_ORD, adapterId: 'ch2-freeform' })
+    await seedInstrument(db, 'BTCUSDT')
+    await seedOpenPosition(db, { channelId: CH2_ID, channelOrd: CH2_ORD, symbol: 'BTCUSDT', side: 'long', entryPrice: '60000', qty: '1' })
+    mock.queue.push(screenshotOutput())
+
+    const message = await insertMessage(db, { channelId: CH2_ID, text: 'Ещё раз беру биток с текущих', mediaKind: 'MessageMediaPhoto' })
+    await processMessage(db, message, depsWithMark)
+
+    const actions = await actionsFor(db, message.id)
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({ type: 'add', symbol: 'BTCUSDT', status: 'executed' })
+    const adds = await db.selectFrom('orders').selectAll().where('channel_id', '=', CH2_ID).where('purpose', '=', 'add').execute()
+    expect(adds).toHaveLength(1)
   })
 })
 

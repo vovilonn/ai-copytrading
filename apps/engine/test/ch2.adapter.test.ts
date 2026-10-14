@@ -99,20 +99,22 @@ describe('ch2.adapter — агрегат покрытия на 100 реальн�
 
   // Раньше здесь стояло 28..34: всё, что не попало в узкий AI_LEXICON_RE, молча уходило в noise —
   // и модель не вызывалась даже на «SOL long» и «вход с текущих BTC long, риск 2%». Теперь непонятое
-  // с монетой ИЛИ торговым маркером уходит в AI (фолбэк, как в CH1). Замер на этой же фикстуре: 46.
+  // с монетой ИЛИ торговым маркером уходит в AI (фолбэк, как в CH1). Замер на этой же фикстуре: 46,
+  // а с тех пор как в модель пошли и медиа-only посты (скрин позиции = вход) — 53.
   // Верхняя граница сторожит ЦЕНУ: если доля AI поползёт вверх — значит гейт стал пропускать болтовню.
-  it('AI (route ai) — фолбэк непонятого: 46 из 100 (было 34, всё остальное молча гасилось в noise)', () => {
+  it('AI (route ai) — фолбэк непонятого: 53 из 100 (34 до фолбэка, 46 до разбора картинок)', () => {
     const ai = results.filter((r) => r.result.route === 'ai').length
-    expect(ai).toBeGreaterThanOrEqual(42)
-    expect(ai).toBeLessThanOrEqual(50)
+    expect(ai).toBeGreaterThanOrEqual(49)
+    expect(ai).toBeLessThanOrEqual(57)
   })
 
-  // Бесплатно отсекается только то, где разбирать нечего: пустые медиа-посты, обзоры/анонсы,
-  // советы («можно…», «лучше…») и болтовня без монеты и без торговых слов.
-  it('NOISE — 18 из 100: бесплатно гасится болтовня, но не сигналы', () => {
+  // Бесплатно отсекается только то, где разбирать нечего: обзоры/анонсы, советы («можно…»,
+  // «лучше…») и болтовня без монеты и без торговых слов. Пустые медиа-посты сюда больше НЕ входят:
+  // подпись пуста ещё не значит, что сообщение пустое — сигнал бывает нарисован на картинке.
+  it('NOISE — 11 из 100: бесплатно гасится болтовня, но не сигналы и не картинки', () => {
     const noise = results.filter((r) => r.result.route === 'noise').length
-    expect(noise).toBeGreaterThanOrEqual(15)
-    expect(noise).toBeLessThanOrEqual(22)
+    expect(noise).toBeGreaterThanOrEqual(8)
+    expect(noise).toBeLessThanOrEqual(15)
   })
 
   it('route — ровно один из четырёх для каждого сообщения', () => {
@@ -213,12 +215,28 @@ describe('ch2.adapter — точечные проверки (task-3-brief.md)', 
     }
   })
 
-  it('медиа-only без текста → route noise (221378-381, 221391, 221392, 221411)', () => {
+  // БЫЛО НАОБОРОТ: эти семь постов проверялись на route noise — «подписи нет, разбирать нечего».
+  // Живой случай 14.10.2026 показал, чего это стоит: автор выложил скрин «BTCUSDT Long 1.0 @
+  // 81 773.3» без единого слова, и бот не завёл по нему ни одного действия. Теперь картинка без
+  // подписи идёт в модель (needsVision), а пустое сообщение БЕЗ картинки остаётся бесплатным noise.
+  it('медиа-only без текста → route ai + needsVision (221378-381, 221391, 221392, 221411)', () => {
     for (const id of [221378, 221379, 221380, 221381, 221391, 221392, 221411]) {
       const { message, result } = byId(id)
       expect(message.text.trim(), `msg ${id} должен быть пустым в фикстуре`).toBe('')
-      expect(result.route, `msg ${id}`).toBe('noise')
+      expect(message.media, `msg ${id} должен быть с медиа`).not.toBeNull()
+      expect(result.route, `msg ${id}`).toBe('ai')
+      expect(result.needsVision, `msg ${id}`).toBe(true)
+      expect(result.intents, `msg ${id} — шаблон не должен выдумывать intent`).toEqual([])
     }
+  })
+
+  it('пустое сообщение БЕЗ медиа → noise (сервисные посты: звать модель не на что)', () => {
+    const empty = parseCh2({
+      ...makeContext(fixture[0]!),
+      message: { id: 1, text: '', date: '2026-10-14T16:36:00Z', replyToMsgId: null, groupedId: null, media: null, mediaFile: null },
+    })
+    expect(empty.route).toBe('noise')
+    expect(empty.needsVision).toBeUndefined()
   })
 
   // E1 (research §7): символ дельты — reply-parent, а НЕ первое коин-слово во ВСЁМ сообщении.

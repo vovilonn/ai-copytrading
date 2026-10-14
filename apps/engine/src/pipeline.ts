@@ -502,6 +502,9 @@ async function runAiBranch(
 
     const aiParsed = normalizeAiOutput(output, {
       isListed: (symbol: string) => instruments.get(symbol)?.status === 'Trading',
+      // Подписи нет — всё, что модель «прочитала», она увидела на картинке (скрин позиции):
+      // такие входы помечаются fromSnapshot и не доливают в уже открытую позицию (handleOpen).
+      mediaOnly: message.text.trim().length === 0,
     })
 
     await trx
@@ -1225,6 +1228,13 @@ interface OpenSpec {
   tps: number[]
   /** Риск автора. Учитывается ТОЛЬКО вместе с авторским стопом — см. handleOpen. */
   riskPct?: number
+  /**
+   * Вход вычитан СО СКРИНА сообщения без подписи (shared/domain.ts: fromSnapshot). Скрин позиции
+   * — это состояние счёта автора, а не приказ: по нему не отличить «только что вошёл» от
+   * «показываю то, в чём сижу давно». Поэтому на занятом символе такой вход не доливает, а зовёт
+   * оператора (см. handleOpen).
+   */
+  fromSnapshot?: boolean
 }
 
 function specFromEntrySignal(intent: Extract<ParsedIntent, { kind: 'entry_signal' }>): OpenSpec {
@@ -1256,6 +1266,7 @@ function specFromLimitEntry(intent: Extract<ParsedIntent, { kind: 'limit_entry' 
     ...(intent.sl !== undefined ? { signalSl: new Decimal(intent.sl) } : {}),
     tps: intent.tps ?? [],
     ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct } : {}),
+    ...(intent.fromSnapshot === true ? { fromSnapshot: true } : {}),
   }
 }
 
@@ -1280,6 +1291,7 @@ async function specFromMarketEntry(
     ...(intent.sl !== undefined ? { signalSl: new Decimal(intent.sl) } : {}),
     tps: intent.tps ?? [],
     ...(intent.riskPct !== undefined ? { riskPct: intent.riskPct } : {}),
+    ...(intent.fromSnapshot === true ? { fromSnapshot: true } : {}),
   }
 }
 
@@ -1549,6 +1561,15 @@ async function handleOpen(
     )
     if (verdict.kind === 'skip') return { skipReason: verdict.reason }
     if (verdict.kind === 'add') {
+      // СКРИН ПОЗИЦИИ НЕ ДОЛИВАЕТ. Текстовый приказ («ещё раз с текущих») однозначен — автор
+      // входит ПРЯМО СЕЙЧАС. Картинка без подписи однозначной не бывает: один и тот же скрин
+      // «BTCUSDT Long 1.0 @ 81 773.3» значит и «только что зашёл заново», и «показываю позицию,
+      // которую вы и так зеркалите». Первое — доливка, второе — ничего; различить их может только
+      // человек, а ошибка стоит ещё одного плеча на счёте. Поэтому зовём оператора: действие
+      // видно в UI как Needs review, рядом — саммари модели (messages.ai_summary) с тем, что
+      // было на скрине, включая среднюю автора.
+      if (intent.fromSnapshot === true) return { skipReason: 'snapshot_position_exists' }
+
       // Автор ставит НОВЫЙ вход по символу, где его позиция уже открыта, — это ступень добора,
       // а не повторный сигнал. Действие переклеиваем в 'add', чтобы в UI и в журнале оно
       // называлось тем, чем является.

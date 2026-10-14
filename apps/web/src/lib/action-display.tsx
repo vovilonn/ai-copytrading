@@ -58,6 +58,11 @@ const NEEDS_REVIEW_REASONS: ReadonlySet<string> = new Set([
   'low_confidence',
   'symbol_unknown_needs_vision',
   'ai_unresolved_marker',
+  // Вход со скрина позиции на уже открытом символе: бот не доливает вслепую, решает оператор
+  // (pipeline.ts::handleOpen). Рядом — картинка без подписи, на которой модель увидела действие
+  // над открытой позицией (normalize-output.ts).
+  'snapshot_position_exists',
+  'snapshot_needs_review',
 ])
 
 /** true, если skipReason — один из "требует ручной проверки" исходов реконсилера (needs_review):

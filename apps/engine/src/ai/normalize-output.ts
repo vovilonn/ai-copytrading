@@ -24,6 +24,13 @@ import type { DeltaOp, ParsedIntent, ParsedResult, Route, Side } from 'shared/do
  *  Опционален: чистые тесты нормализации могут не заботиться о листинге вовсе. */
 export interface NormalizeAiOutputContext {
   isListed?: (symbol: string) => boolean
+  /**
+   * У сообщения НЕТ текста — весь разбор построен на картинке (скрин позиции/графика). Признак
+   * детерминированный (длина текста), а не доверие к `evidence_source` модели, и нужен ровно для
+   * одного: пометить полученные входы `fromSnapshot` (см. shared/domain.ts) — скрин позиции
+   * сообщает СОСТОЯНИЕ счёта автора, а не приказ войти, и доливать по нему вслепую нельзя.
+   */
+  mediaOnly?: boolean
 }
 
 const NOISE_MESSAGE_TYPES = new Set<ExtractSignalOutput['message_type']>(['commentary', 'noise'])
@@ -50,6 +57,21 @@ export function normalizeAiOutput(output: ExtractSignalOutput, ctx: NormalizeAiO
     return { route: 'noise', confidence: output.confidence, intents: [] }
   }
 
+  // КАРТИНКА БЕЗ ПОДПИСИ МОЖЕТ ТОЛЬКО ОТКРЫТЬ. Скрин — это отчёт о состоянии счёта, и отличить
+  // «только что сделал» от «показываю, что уже сделано» по нему нельзя. Для входа это безопасно:
+  // на свободном символе открываемся, на занятом зовём оператора (fromSnapshot ниже). Для всего
+  // остального — нет: любое действие над УЖЕ открытой позицией (фикс доли, перенос стопа, снятие
+  // целей) по картинке рискует исполниться ВТОРОЙ раз поверх текстового приказа, который бот уже
+  // отработал. Живой пример из прогона истории: msg 222008 (11.10.2026) — скрин с результатом
+  // «+17.85%» через две минуты после текстового «Sol Eth половину фикс», уже исполненного ботом;
+  // модель честно прочитала его как «закрыть половину SOL и ETH», и это закрыло бы ВТОРУЮ половину.
+  // Поэтому такое сообщение целиком уходит оператору — с саммари модели и ноль ордеров.
+  if (ctx.mediaOnly === true && output.actions.some((a) => a.type !== 'open')) {
+    const result: ParsedResult = { route: 'ai', confidence: output.confidence, intents: [], reason: 'snapshot_needs_review' }
+    if (output.image_used) result.needsVision = true
+    return result
+  }
+
   const isListed = ctx.isListed ?? (() => true)
 
   const intents: ParsedIntent[] = []
@@ -66,7 +88,7 @@ export function normalizeAiOutput(output: ExtractSignalOutput, ctx: NormalizeAiO
 
     if (action.type === 'open' || action.type === 'add') {
       if (action.symbol !== 'UNKNOWN' && !isListed(action.symbol)) anyNotListed = true
-      const mapped = action.type === 'open' ? mapOpenAction(action) : mapAddAction(action)
+      const mapped = action.type === 'open' ? mapOpenAction(action, ctx.mediaOnly === true) : mapAddAction(action)
       if (mapped === null) {
         anyUnresolvedMapping = true
         continue
@@ -173,8 +195,9 @@ function toSide(side: ExtractedSide): Side | null {
   return side === 'unknown' ? null : side
 }
 
-/** null — action не резолвился в валидный intent (недостаточно числовых полей/сторона неясна). */
-function mapOpenAction(action: ExtractSignalAction): ParsedIntent | null {
+/** null — action не резолвился в валидный intent (недостаточно числовых полей/сторона неясна).
+ *  `mediaOnly` — вход прочитан со скрина сообщения без подписи, см. NormalizeAiOutputContext. */
+function mapOpenAction(action: ExtractSignalAction, mediaOnly: boolean): ParsedIntent | null {
   const side = toSide(action.side)
   if (side === null) return null
   if (action.symbol === 'UNKNOWN') return null // route уже помечен anyUnknownSymbol выше
@@ -216,15 +239,19 @@ function mapOpenAction(action: ExtractSignalAction): ParsedIntent | null {
     ...(authorRisk !== undefined && authorRisk !== null ? { riskPct: authorRisk } : {}),
   }
 
+  // Скрин позиции — вход, вычитанный из состояния счёта автора, а не из приказа: ниже по течению
+  // (handleOpen) он не доливает в уже открытую позицию, а зовёт оператора.
+  const snapshot = mediaOnly ? ({ fromSnapshot: true } as const) : {}
+
   if (orderType === 'limit') {
     const price = action.entry?.mode === 'price' ? (action.entry.price ?? null) : null
     if (price === null) return null
-    return { kind: 'limit_entry', symbol: action.symbol, side, price, ...optional }
+    return { kind: 'limit_entry', symbol: action.symbol, side, price, ...optional, ...snapshot }
   }
 
   // 'market' или 'na' (в т.ч. entry.mode='marker'/current_price, "с текущих") — безопасный
   // дефолт: market_entry не требует ни одного числа (research §2 C: "Sol long с текущих").
-  return { kind: 'market_entry', symbol: action.symbol, side, ...optional }
+  return { kind: 'market_entry', symbol: action.symbol, side, ...optional, ...snapshot }
 }
 
 // ---------------------------------------------------------------------------

@@ -71,12 +71,28 @@ export type ParsedIntent =
       sl: number
       riskPct?: number
     } // R1 / A
+  // `fromSnapshot` — вход вычитан С КАРТИНКИ сообщения без подписи (скрин позиции на бирже), а не
+  // из текста приказа. Разница принципиальная: текст «беру биток с текущих» — это ПРИКАЗ войти,
+  // а скрин позиции — СОСТОЯНИЕ счёта автора, и по нему нельзя отличить «только что вошёл» от
+  // «показываю то, в чём сижу вторую неделю». Поэтому такой вход исполняется, только пока символ
+  // свободен; на уже открытой позиции он не доливает вслепую, а уходит оператору на решение
+  // (pipeline.ts::handleOpen, skip_reason 'snapshot_position_exists').
+  //
   // B / C. sl/tps/riskPct ОПЦИОНАЛЬНЫ и появились не «на всякий случай»: автор свободного текста
   // вполне может дать стоп или цели, не давая диапазон входа («беру соль с текущих, стоп 72»).
   // Раньше эти поля выбрасывались на этапе маппинга AI-выхода, и бот терял авторский стоп, подставляя
   // вместо него свой синтетический. Теперь: стоп автора — приоритетнее нашего защитного (risk/protective-sl.ts).
-  | { kind: 'limit_entry'; symbol: string; side: Side; price: number; sl?: number; tps?: number[]; riskPct?: number } // B
-  | { kind: 'market_entry'; symbol: string; side: Side; sl?: number; tps?: number[]; riskPct?: number } // C
+  | {
+      kind: 'limit_entry'
+      symbol: string
+      side: Side
+      price: number
+      sl?: number
+      tps?: number[]
+      riskPct?: number
+      fromSnapshot?: true
+    } // B
+  | { kind: 'market_entry'; symbol: string; side: Side; sl?: number; tps?: number[]; riskPct?: number; fromSnapshot?: true } // C
   // Доливка (реш. #6). side/atMarket нужны не самой доливке (сторона известна из позиции, цена —
   // из рынка), а случаю, когда позиции по символу НЕТ: тогда это вход, и его надо чем-то выставить.
   // atMarket — автор входит по рынку ПРЯМО СЕЙЧАС («ещё раз с текущих»), а не «где-то долил».

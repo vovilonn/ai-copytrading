@@ -63,6 +63,12 @@ const SKIP_REASON_LABELS: Readonly<Record<string, string>> = {
   symbol_unknown_needs_vision: 'AI could not identify the symbol',
   ai_unresolved_marker: 'AI could not resolve the symbol marker',
   unknown_format: 'unfamiliar message format',
+  // Скрин позиции автора по символу, который канал уже зеркалит. «Вошёл заново» и «показываю
+  // открытую позицию» на картинке выглядят одинаково — доливку по такому входу решает оператор.
+  snapshot_position_exists: 'position screenshot — this symbol already has an open trade',
+  // Картинка без подписи, на которой модель увидела не вход, а действие над открытой позицией
+  // (фикс доли, стоп, цели). Исполнять нельзя: тот же приказ бот мог уже отработать по тексту.
+  snapshot_needs_review: 'caption-less screenshot asks for more than an entry — operator decides',
 }
 
 /**
