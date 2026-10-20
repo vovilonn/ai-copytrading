@@ -230,6 +230,45 @@ describe('ch2.adapter — точечные проверки (task-3-brief.md)', 
     }
   })
 
+  // СТУПЕНЬ ЛЕСЕНКИ БЕЗ МОНЕТЫ (живой случай 20.10.2026). Автор ведёт цели лесенкой и шлёт каждую
+  // следующую отдельным постом: «Второй 0.0818», «Вторая 2500», «Третий финальный 0.0834»,
+  // «Третий и последний 1.367». Ни монеты, ни торгового маркера — все четыре уходили в noise, при
+  // том что соседнее «Тоже Тэйк Второй будет 1.34» проходило только из-за слова «тейк».
+  // Длина — часть правила, а не украшение: на истории канала порядковое с числом в ≤8 значимых
+  // словах всегда ступень, с 10 слов — всегда болтовня.
+  describe('ступень лесенки без монеты', () => {
+    const parse = (text: string, media: string | null = null) =>
+      parseCh2({
+        ...makeContext(fixture[0]!),
+        message: { id: 1, text, date: '2026-10-20T14:03:51Z', replyToMsgId: null, groupedId: null, media, mediaFile: null },
+      })
+
+    it('«Второй 0.0818» со скрином цели → route ai + needsVision', () => {
+      const result = parse('Второй 0.0818', 'MessageMediaPhoto')
+      expect(result.route).toBe('ai')
+      expect(result.needsVision).toBe(true)
+      expect(result.intents, 'шаблон не должен выдумывать цель без монеты').toEqual([])
+    })
+
+    it('«Третий и последний 1.367» со скрином → route ai', () => {
+      expect(parse('Третий и последний 1.367', 'MessageMediaPhoto').route).toBe('ai')
+    })
+
+    it('«2020 первая» без медиа → route ai (порядковое может стоять и после цены)', () => {
+      const result = parse('2020 первая')
+      expect(result.route).toBe('ai')
+      expect(result.needsVision).toBeUndefined()
+    })
+
+    it('порядковое БЕЗ числа → noise («первый пошел»)', () => {
+      expect(parse('Первый пошел', 'MessageMediaPhoto').route).toBe('noise')
+    })
+
+    it('длинная болтовня с порядковым и числом → noise (заседание ФРС, 10 слов)', () => {
+      expect(parse('Сегодня первое заседание фрс при новом председателе )) в 21 мск').route).toBe('noise')
+    })
+  })
+
   it('пустое сообщение БЕЗ медиа → noise (сервисные посты: звать модель не на что)', () => {
     const empty = parseCh2({
       ...makeContext(fixture[0]!),

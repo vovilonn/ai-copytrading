@@ -149,6 +149,32 @@ function hasCoin(text: string, ctx: ParseContext): boolean {
   return extractCoins(text, ctx.isListed).some((coin) => ctx.resolveSymbol(coin) !== null)
 }
 
+/**
+ * СТУПЕНЬ ЛЕСЕНКИ БЕЗ МОНЕТЫ: «Второй 0.0818», «Третий и последний 1.367», «2020 первая».
+ *
+ * Автор ведёт цели лесенкой и шлёт каждую следующую отдельным коротким постом — порядковое слово
+ * плюс цена, монета остаётся в предыдущем сообщении или на приложенном скрине TP-ордера. Ни монеты,
+ * ни торгового маркера в тексте нет, поэтому бесплатный гейт выше гасил такие посты в noise, и
+ * модель не вызывалась ни разу (живой случай 20.10.2026: «Второй 0.0818», «Вторая 2500», «Третий
+ * финальный 0.0834», «Третий и последний 1.367» — четыре цели подряд ушли в никуда, при том что
+ * соседнее «Тоже Тэйк Второй будет 1.34» прошло только потому, что в нём есть слово «тейк»).
+ *
+ * Почему именно порядковое + число + КОРОТКИЙ текст. Замер на всей истории канала (1760 сообщений
+ * за 15 месяцев): порядковое слово с числом встречается в 18 сообщениях, но длина делит их начисто.
+ * До 8 значимых слов — 9 сообщений, и все девять настоящие ступени лесенки. Начиная с 10 слов идёт
+ * только болтовня («сегодня первое заседание фрс…», «мой первый совместный стрим…», промо WEEX).
+ * Цена правила — 9 вызовов модели за 15 месяцев, меньше одного в месяц; возвращает 9 потерянных
+ * целей из 9.
+ */
+const LADDER_ORDINAL_RE = /(?<![\p{L}\p{N}])(перв|втор|трет|четв[её]рт|пят|финальн|последн)[\p{L}]*(?![\p{L}])/iu
+const PRICE_NUMBER_RE = /(?<![\p{L}\p{N}])\d+[.,]?\d*(?![\p{L}])/u
+const LADDER_MAX_WORDS = 8
+
+function isLadderStep(t: string): boolean {
+  if (!LADDER_ORDINAL_RE.test(t) || !PRICE_NUMBER_RE.test(t)) return false
+  return t.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length <= LADDER_MAX_WORDS
+}
+
 function fallback(text: string, ctx: ParseContext): ParsedResult {
   const noise: ParsedResult = { route: 'noise', confidence: 0, intents: [] }
   const hasMedia = ctx.message.media !== null || ctx.message.mediaFile !== null
@@ -172,7 +198,7 @@ function fallback(text: string, ctx: ParseContext): ParsedResult {
   if (SUGGESTION_MARKER_RE.test(t)) return noise // «можно…», «лучше…» — совет, а не приказ
   if (NOISE_KEYWORDS_RE.test(t)) return noise // обзор/анонс/рефка
 
-  if (hasCoin(text, ctx) || hasTradeMarker(t)) {
+  if (hasCoin(text, ctx) || hasTradeMarker(t) || isLadderStep(t)) {
     return hasMedia ? vision : { route: 'ai', confidence: 0, intents: [], reason: 'unknown_format' }
   }
   return noise // «привет, как дела», «да, согласен полностью» — в модель не тащим
