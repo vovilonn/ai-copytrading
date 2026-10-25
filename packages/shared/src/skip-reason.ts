@@ -50,6 +50,11 @@ const SKIP_REASON_LABELS: Readonly<Record<string, string>> = {
   // полный выход по команде канала при этом не блокируется никогда.
   fix_in_loss: 'author is taking profit, but our position is in loss',
 
+  // Все цели автора оказались по ту сторону НАШЕЙ средней: он считает их от своего входа, а наша
+  // позиция старше и дороже — reduce-only лимитка на таком уровне закрыла бы объём в минус.
+  // Отдельные такие ступени просто отбрасываются, в skip уходит только случай «не осталось ни одной».
+  tp_in_loss: 'every target is beyond our entry — they would close at a loss',
+
   // Свободной маржи на счёте не хватает даже на минимальный ордер: депозит занят открытыми
   // позициями. Не свойство сигнала, а состояние счёта — оператору надо освободить маржу.
   insufficient_margin: 'not enough free margin — the deposit is tied up in open positions',

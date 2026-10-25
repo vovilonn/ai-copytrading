@@ -668,6 +668,34 @@ describe('pipeline — AI-ветка (мок ai-proxy)', () => {
       expect(actions[0]?.skip_reason).toBe('tp_beyond_market')
     })
 
+    // ⚠️ ЖИВОЙ КЛАСС (решение владельца 25.10.2026, продолжение инцидента msg 222501): цены автора
+    // отсчитаны от ЕГО входа. Наша позиция по тому же символу бывает старше и дороже — тогда
+    // «цель» автора стоит НИЖЕ нашей средней, и reduce-only лимитка на ней закрыла бы объём в
+    // минус. Рыночный гейт такую цель пропускает (она выше рынка), наш вход — нет.
+    it('цель НИЖЕ нашей средней не ставится, цель выше — ставится', async () => {
+      const { tradeId } = await seedForLadder('3') // наша средняя 60000
+      mock.queue.push(tpResponse([{ value: 59000 }, { value: 61000 }]))
+      const depsWithMark: PipelineDeps = { ...deps, getMarkPrice: async () => '58000' }
+
+      await processMessage(db, await insertMessage(db, { channelId: CH2_ID, text: 'Следующие цели 59000, 61000' }), depsWithMark)
+
+      const tps = await tpOrdersOf(tradeId)
+      expect(tps.map((o) => new Decimal(o.price ?? '0').toString())).toEqual(['61000'])
+    })
+
+    it('ВСЕ цели ниже нашей средней -> лесенка не тронута, действие уходит оператору', async () => {
+      const { tradeId } = await seedForLadder('3') // наша средняя 60000
+      mock.queue.push(tpResponse([{ value: 59000 }, { value: 59500 }]))
+      const depsWithMark: PipelineDeps = { ...deps, getMarkPrice: async () => '58000' }
+
+      const message = await insertMessage(db, { channelId: CH2_ID, text: 'Следующие цели 59000, 59500' })
+      await processMessage(db, message, depsWithMark)
+
+      expect(await tpOrdersOf(tradeId)).toHaveLength(0)
+      const actions = await actionsFor(db, message.id)
+      expect(actions[0]?.skip_reason).toBe('tp_in_loss')
+    })
+
     it('ступень меньше шага объёма -> лесенка не ставится и СТАРЫЕ цели не снимаются', async () => {
       const { tradeId } = await seedForLadder('0.001') // треть = 0.00033 < шага 0.001
       mock.queue.push(tpResponse([{ value: 62000, index: 1 }]))

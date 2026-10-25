@@ -2435,6 +2435,7 @@ async function handleDelta(
           side: position.side,
           basis: await resolveLadderBasis(trx, position.trade_id, remaining),
           remaining,
+          avgEntry: position.avg_price,
           markPrice: position.mark_price,
           targets: op.targets,
           ...(op.ladderTotal !== undefined ? { ladderTotal: op.ladderTotal } : {}),
@@ -2553,6 +2554,8 @@ async function handleTpSet(
     basis: Decimal
     /** Сколько объёма реально осталось: суммарно лесенка не может его превысить. */
     remaining: Decimal
+    /** НАША средняя цена входа: цели автора отсчитаны от ЕГО входа, см. гейт ниже. */
+    avgEntry: string | null
     markPrice: string | null
     targets: ReadonlyArray<{ value?: number; marker?: 'current_price'; index?: number; fraction?: number; unit?: 'one_unit' }>
     /** Число целей в лесенке, названное автором. */
@@ -2602,13 +2605,39 @@ async function handleTpSet(
   // прямо сейчас. Для лонга цель обязана быть ВЫШЕ рынка, для шорта — ниже.
   const liveMark = base.deps.getMarkPrice ? await base.deps.getMarkPrice(params.symbol) : null
   const guardMark = liveMark !== null ? new Decimal(liveMark) : null
-  const reachable = guardMark === null ? resolved : resolved.filter((t) => (params.side === 'long' ? t.price.gt(guardMark) : t.price.lt(guardMark)))
-  if (reachable.length === 0) {
+  const beyondMarket = guardMark === null ? resolved : resolved.filter((t) => (params.side === 'long' ? t.price.gt(guardMark) : t.price.lt(guardMark)))
+  if (beyondMarket.length === 0) {
     console.warn(
       `[pipeline] ${params.symbol}: все цели ${resolved.map((t) => t.price.toString()).join(', ')} по ту сторону рынка ` +
         `(${guardMark?.toString() ?? '—'}, ${params.side}) — лесенка не тронута`,
     )
     return 'tp_beyond_market'
+  }
+
+  // ⚠️ ДЕНЕЖНЫЙ ГЕЙТ (решение владельца 25.10.2026). Цены автора отсчитаны от ЕГО входа, а наша
+  // позиция по тому же символу бывает старше и дороже — тогда его «цель» стоит НИЖЕ нашей средней,
+  // и reduce-only лимитка на ней закрыла бы объём В МИНУС. Рыночный гейт выше такую цель
+  // пропускает (она честно выше рынка), наш собственный вход — нет. Тот же класс, что и фикс
+  // половины в убыток (см. positionPnlSign): приказ по ЧУЖОМУ состоянию.
+  //
+  // Отсекаем ступени поштучно: план выхода должен оставаться там, где он для нас прибылен.
+  // Если ВСЕ цели ниже средней — лесенку не трогаем вовсе и отдаём решение оператору.
+  const entry = params.avgEntry !== null ? new Decimal(params.avgEntry) : null
+  const reachable =
+    entry === null ? beyondMarket : beyondMarket.filter((t) => (params.side === 'long' ? t.price.gt(entry) : t.price.lt(entry)))
+  if (reachable.length === 0) {
+    console.warn(
+      `[pipeline] ${params.symbol}: все цели ${beyondMarket.map((t) => t.price.toString()).join(', ')} по ту сторону НАШЕЙ средней ` +
+        `(${entry?.toString() ?? '—'}, ${params.side}) — закрыли бы объём в убыток, лесенка не тронута`,
+    )
+    return 'tp_in_loss'
+  }
+  if (reachable.length < beyondMarket.length) {
+    const dropped = beyondMarket.filter((t) => !reachable.includes(t)).map((t) => t.price.toString())
+    console.warn(
+      `[pipeline] ${params.symbol}: цели ${dropped.join(', ')} ниже нашей средней ${entry?.toString() ?? '—'} — пропущены, ` +
+        `лесенка ставится только на прибыльные для нас уровни`,
+    )
   }
 
   // Объём, уже расписанный по целям-легам, из базиса лесенки вычитается: ступени делят ТО, ЧТО
