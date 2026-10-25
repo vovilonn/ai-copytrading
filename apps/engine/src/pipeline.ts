@@ -10,6 +10,7 @@ import { computeLeverage, floorTo, liqPrice } from './risk/leverage.js'
 import { leverageWithoutSl, protectiveSl } from './risk/protective-sl.js'
 import { computeSize } from './risk/sizing.js'
 import { acquireSymbol, addLeg, closeTrade, openTrade, releaseSymbol } from './state/trades.js'
+import { BybitApiError } from './bybit/rest-client.js'
 import type { ExecutionPort, OrderContext } from './execution/port.js'
 import { listInstruments, type InstrumentMap } from './instruments.js'
 import { AI_CONFIDENCE_GATE, classifyIntent, reconcile } from './reconciler.js'
@@ -33,6 +34,18 @@ import type { ExtractSignalOutput } from './ai/schema.js'
  * сделки в БД). NOTIFY по domain_events шлётся СТРОГО после коммита (тот же приём, что и
  * apps/tg-ingest/src/ingest.service.ts — иначе слушатель получит уведомление раньше, чем
  * увидит строку своим собственным SELECT).
+ *
+ * ГРАНИЦА ОТКАТА ПРОХОДИТ ПО БИРЖЕ, А НЕ ПО СООБЩЕНИЮ. Ордер, уже принятый Bybit, откатить
+ * нечем — поэтому отказ биржи ПО СУЩЕСТВУ (BybitApiError с retCode) по одному действию НЕ
+ * выпускается наружу транзакции: он помечает СВОЁ действие 'failed', а всё, что уже ушло на
+ * биржу соседними действиями, коммитится (см. processIntent). Иначе журнал расходится с
+ * реальностью в худшую сторону — деньги в рынке, записи о них нет.
+ *
+ * Живой инцидент 24.10.2026 (msg 222468): «беру Лонги по Xrp и doge, с текущих» — XRP вошёл
+ * (778.2 @ 1.285 со стопом), DOGE биржа отвергла (110007, не хватило свободной маржи),
+ * исключение откатило ВЕСЬ журнал сообщения. На бирже осталась живая позиция на 1010 USDT без
+ * единой строки в trades/orders/actions, и через два дня «по xrp первый тейк 1.307» ушёл в
+ * skip 'no_open_position' — тейк пропущен на реальных деньгах.
  *
  * normalize() здесь считается ОТДЕЛЬНО и пишется в messages.normalized_text (см. ниже) —
  * это ДИАГНОСТИЧЕСКОЕ поле для отладки/UI, а не вход парсера: adapter.parse(ctx) получает
@@ -311,18 +324,25 @@ export async function processMessage(db: Kysely<DB>, message: PipelineMessage, d
     const base: IntentBase = { message, channel, settings, instruments, deps, postCommit }
     // Гейт "Copy trading" сюда уже НЕ доходит: выключенный канал отсекается в самом начале
     // processMessage, до разбора и до вызова AI (см. там же — почему).
+    // Первый отказ биржи по существу: сообщение уйдёт в needs_review, но уже исполненные
+    // действия останутся в журнале (см. шапку файла — граница отката проходит по бирже).
+    let exchangeFailure: ExchangeFailure | null = null
     for (const { actionIndex, intent } of decision.decided) {
-      const emitted = await processIntent(trx, base, actionIndex, intent, method)
-      if (emitted) notifyNeeded = true
+      const outcome = await processIntent(trx, base, actionIndex, intent, method)
+      if (outcome.emitted) notifyNeeded = true
+      if (outcome.failure !== undefined && exchangeFailure === null) exchangeFailure = outcome.failure
     }
 
     await trx
       .updateTable('messages')
       .set({
-        status: 'executed',
+        // Хотя бы одно действие отвергнуто биржей — сообщение требует глаз оператора. Остальные
+        // его действия при этом исполнены и видны в журнале, а текст сохранён (раньше откат
+        // стирал и normalized_text — в UI оставалась пустая строка без единой подсказки).
+        status: exchangeFailure === null ? 'executed' : 'needs_review',
         // Причина видна и у ИСПОЛНЕННОГО сообщения: «исполнили разобранное, часть не смапилась»
         // и «модель была недоступна, отработал шаблон» — это не ошибка, но оператор должен знать.
-        status_reason: decision.reason ?? null,
+        status_reason: exchangeFailure === null ? (decision.reason ?? null) : `exchange_rejected_${exchangeFailure.retCode}`,
         normalized_text: normalizedText,
         method,
         ai_summary: aiSummary,
@@ -798,12 +818,85 @@ function intentParams(intent: ParsedIntent): unknown {
 }
 
 /**
+ * Терминальный исход действия, которое биржа отвергла: строка actions переходит в 'failed' с
+ * текстом отказа в `detail` (оператор видит ПРИЧИНУ в UI, а не пустую ячейку).
+ *
+ * Плюс уборка за несостоявшимся входом: сделка, заведённая этим действием, могла остаться в
+ * 'pending' и ДЕРЖАТЬ СИМВОЛ (handleOpen создаёт trades/symbol_ownership ДО похода на биржу).
+ * Отменяем её — но ТОЛЬКО если на бирже под ней нет ни одного ордера: строка `orders` пишется
+ * строго ПОСЛЕ успешного ответа биржи (bybit.adapter.ts::placeEntry), поэтому её наличие
+ * означает живую экспозицию. Такую сделку не трогаем — её поднимет реконсиляция по
+ * orderLinkId (bybit/reconcile.ts::reopenTrade), для того этот путь и существует.
+ */
+async function failAction(
+  trx: Kysely<DB>,
+  base: IntentBase,
+  actionId: string,
+  symbol: string | null,
+  err: BybitApiError,
+): Promise<void> {
+  const now = new Date()
+  await trx
+    .updateTable('actions')
+    .set({
+      status: 'failed',
+      detail: `биржа отвергла: retCode=${err.retCode} ${err.retMsg}`,
+      updated_at: now,
+    })
+    .where('id', '=', actionId)
+    .execute()
+
+  const stranded = await trx
+    .selectFrom('trades')
+    .select('id')
+    .where('opened_action_id', '=', actionId)
+    .where('status', '=', 'pending')
+    .execute()
+  for (const trade of stranded) {
+    const placed = await trx.selectFrom('orders').select('id').where('trade_id', '=', trade.id).executeTakeFirst()
+    if (placed) continue
+    await closeTrade(trx, { tradeId: trade.id, status: 'cancelled', closedAt: now })
+  }
+
+  await trx
+    .insertInto('domain_events')
+    .values({
+      // Тот же event, что и у skipped/needs_review: фронт (apps/web/src/lib/ws.ts) читает
+      // 'action.skipped' как «строка в терминальном состоянии без исполнения, перечитай список»
+      // безотносительно конкретного статуса (см. ensureWholeMessageAction).
+      type: 'action.skipped',
+      aggregate: 'action',
+      aggregate_id: actionId,
+      payload: JSON.stringify({
+        channelId: base.message.channelId,
+        actionId,
+        messageId: base.message.id,
+        pair: symbol,
+        reason: `exchange_rejected_${err.retCode}`,
+      }),
+    })
+    .execute()
+}
+
+/** Отказ биржи ПО СУЩЕСТВУ (retCode) на одном действии — см. шапку файла и processIntent. */
+interface ExchangeFailure {
+  retCode: number
+  retMsg: string
+}
+
+interface IntentOutcome {
+  /** Был опубликован хотя бы один domain_events (нужно ли слать pg_notify). */
+  emitted: boolean
+  /** Биржа отвергла это действие по существу — сообщение уйдёт в needs_review. */
+  failure?: ExchangeFailure
+}
+
+/**
  * Обрабатывает один канонический intent (actionIndex уже назначен reconciler'ом). Идемпотентно:
  * если actions-строка для (message_id, actionIndex) уже существует — предыдущий прогон уже
  * довёл её до терминального состояния, повторно ничего не делаем (не плодим вторую trade/order).
  * @param method Method итоговой Decision ('auto' — детерминированный путь, 'ai' — AI-путь) —
  *   пишется в actions.method (design spec §6 / research §12 UI-поле "Method").
- * @returns true, если был опубликован хотя бы один domain_events (нужно ли слать pg_notify).
  */
 async function processIntent(
   trx: Kysely<DB>,
@@ -811,7 +904,7 @@ async function processIntent(
   actionIndex: number,
   intent: ParsedIntent,
   method: 'auto' | 'ai',
-): Promise<boolean> {
+): Promise<IntentOutcome> {
   const info = classifyIntent(intent)
 
   // ИДЕМПОТЕНТНОСТЬ ПО СМЫСЛУ, А НЕ ПО ПОРЯДКУ. Раньше ключом был (сообщение, индекс действия),
@@ -847,7 +940,7 @@ async function processIntent(
       ]),
     )
     .executeTakeFirst()
-  if (existing) return false
+  if (existing) return { emitted: false }
   const inserted = await trx
     .insertInto('actions')
     .values({
@@ -867,28 +960,45 @@ async function processIntent(
   const actionId = inserted.id
 
   let result: HandlerResult
-  switch (intent.kind) {
-    case 'entry_signal':
-      result = await handleOpen(trx, base, actionIndex, actionId, specFromEntrySignal(intent))
-      break
-    // «Long BTC, с текущих» — вход по рынку. Цены и стопа в сигнале нет: цену берём с рынка,
-    // стоп синтезируем защитный (см. handleOpen). Самый частый способ дать сигнал в свободном
-    // тексте — до этого он молча уходил в skip и НЕ торговался вовсе.
-    case 'market_entry': {
-      const spec = await specFromMarketEntry(base, intent)
-      result = 'skipReason' in spec ? spec : await handleOpen(trx, base, actionIndex, actionId, spec)
-      break
+  try {
+    switch (intent.kind) {
+      case 'entry_signal':
+        result = await handleOpen(trx, base, actionIndex, actionId, specFromEntrySignal(intent))
+        break
+      // «Long BTC, с текущих» — вход по рынку. Цены и стопа в сигнале нет: цену берём с рынка,
+      // стоп синтезируем защитный (см. handleOpen). Самый частый способ дать сигнал в свободном
+      // тексте — до этого он молча уходил в skip и НЕ торговался вовсе.
+      case 'market_entry': {
+        const spec = await specFromMarketEntry(base, intent)
+        result = 'skipReason' in spec ? spec : await handleOpen(trx, base, actionIndex, actionId, spec)
+        break
+      }
+      // «зайду от 76.3» — лимитный вход по названной цене.
+      case 'limit_entry':
+        result = await handleOpen(trx, base, actionIndex, actionId, specFromLimitEntry(intent))
+        break
+      case 'add':
+        result = await handleAdd(trx, base, actionIndex, actionId, intent)
+        break
+      case 'delta':
+        result = await handleDelta(trx, base, actionIndex, actionId, intent)
+        break
     }
-    // «зайду от 76.3» — лимитный вход по названной цене.
-    case 'limit_entry':
-      result = await handleOpen(trx, base, actionIndex, actionId, specFromLimitEntry(intent))
-      break
-    case 'add':
-      result = await handleAdd(trx, base, actionIndex, actionId, intent)
-      break
-    case 'delta':
-      result = await handleDelta(trx, base, actionIndex, actionId, intent)
-      break
+  } catch (err) {
+    // ОТКАЗ БИРЖИ ПО СУЩЕСТВУ — терминальный исход ЭТОГО действия, а не всего сообщения.
+    // Ретраить его бессмысленно (цена стопа невалидна, не хватило маржи, ордера не существует),
+    // а дать исключению выйти наружу — значит откатить транзакцию вместе с соседними действиями,
+    // ордера которых биржа УЖЕ приняла (живой инцидент 24.10.2026, см. шапку файла).
+    //
+    // Сеть/БД сюда не попадают (не BybitApiError) — такие пробрасываются наружу, транзакция
+    // откатывается целиком, сообщение остаётся 'received' и следующий тик повторит его.
+    if (!(err instanceof BybitApiError)) throw err
+    console.error(
+      `[pipeline] msg ${base.message.tgMessageId} (канал ${base.message.channelId}) ОТКАЗ БИРЖИ ` +
+        `${info.type} ${info.symbol ?? '—'} ${info.side ?? ''} → retCode=${err.retCode} ${err.retMsg}`,
+    )
+    await failAction(trx, base, actionId, info.symbol, err)
+    return { emitted: true, failure: { retCode: err.retCode, retMsg: err.retMsg } }
   }
 
   const now = new Date()
@@ -925,7 +1035,7 @@ async function processIntent(
         }),
       })
       .execute()
-    return true
+    return { emitted: true }
   }
 
   const finalSide = result.side ?? info.side
@@ -960,7 +1070,7 @@ async function processIntent(
     .execute()
 
   if (result.symbol) await emitPositionUpsert(trx, base.message.channelId, result.symbol)
-  return true
+  return { emitted: true }
 }
 
 /**

@@ -7,6 +7,7 @@ import { migrateToLatest } from 'api/db/migrate.js'
 import { createExecutionPort, type ExecutionPort } from '../src/execution/port.js'
 import { floorTo } from '../src/risk/leverage.js'
 import { DryRunAdapter } from '../src/execution/dry-run.adapter.js'
+import { BybitApiError } from '../src/bybit/rest-client.js'
 import { processMessage, type PipelineDeps, type PipelineMessage } from '../src/pipeline.js'
 import { createMarkPriceGetter, type MarkPriceRestClient } from '../src/main.js'
 
@@ -1570,5 +1571,139 @@ describe('pipeline — trades.protective_sl: чей стоп стоит на с�
 
     const trade = await db.selectFrom('trades').select('protective_sl').where('channel_id', '=', channelId).executeTakeFirstOrThrow()
     expect(trade.protective_sl).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ОТКАЗ БИРЖИ ПОСРЕДИ СООБЩЕНИЯ. Живой инцидент 24.10.2026 (msg 222468, канал AACADEMY):
+// «С хай риском беру Лонги по Xrp и doge / С текущих» — два рыночных входа в одном сообщении.
+// XRP ушёл на биржу и исполнился (778.2 @ 1.285, со стопом), DOGE биржа отвергла (110007,
+// свободной маржи не хватило). Исключение вылетело из колбэка db.transaction() — Postgres
+// откатил ВЕСЬ журнал сообщения: ни trades, ни orders, ни actions, ни даже normalized_text.
+// Позиция на бирже осталась жить без единой строки в журнале, и через два дня «по xrp первый
+// тейк 1.307» ушёл в skip 'no_open_position' — тейк пропущен на реальных деньгах.
+//
+// Инвариант, который чинится: ордер, уже ушедший на биржу, НЕ откатывается. Отказ по одному
+// действию не стирает соседние — он помечает своё действие failed и уводит сообщение в
+// needs_review.
+// ---------------------------------------------------------------------------
+describe('pipeline — отказ биржи по одному действию не откатывает остальные', () => {
+  /** Порт, который отвергает вход по ОДНОМУ символу — ровно как биржа отвергла DOGE кодом 110007. */
+  function createRejectingPort(rejectSymbol: string, retCode: number): ExecutionPort {
+    const inner = new DryRunAdapter()
+    return {
+      cancelAllForSymbol: (symbol) => inner.cancelAllForSymbol(symbol),
+      placeEntry: (tx, order) => {
+        if (order.symbol === rejectSymbol) {
+          throw new BybitApiError(`order/create ${retCode}`, retCode, 'ab not enough for new order')
+        }
+        return inner.placeEntry(tx, order)
+      },
+      placeTpLadder: (tx, params) => inner.placeTpLadder(tx, params),
+      setStopLoss: (tx, params) => inner.setStopLoss(tx, params),
+      closePosition: (tx, params) => inner.closePosition(tx, params),
+      cancelOrder: (tx, params) => inner.cancelOrder(tx, params),
+    }
+  }
+
+  it('«Лонги по Xrp и doge, с текущих», биржа отвергла DOGE -> вход по XRP остаётся в журнале', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'XRPUSDT', adapterId: 'ch2-freeform', maxLeverage: '10', defaultLeverage: '10' })
+    await db
+      .insertInto('instruments')
+      .values({
+        symbol: 'DOGEUSDT', network: 'testnet', base_coin: 'DOGE', status: 'Trading',
+        qty_step: '1', min_qty: '1', tick_size: '0.0001', min_notional: '5',
+        max_leverage: '50', leverage_step: '0.01', mmr: '0.005', refreshed_at: new Date(),
+      })
+      .execute()
+
+    const localDeps: PipelineDeps = {
+      executionPort: createRejectingPort('DOGEUSDT', 110007),
+      network: 'testnet',
+      equity: '10000',
+      getMarkPrice: async () => '1.285',
+      aiEnabled: false,
+    }
+
+    const message = await insertMessage(channelId, 222468, 'С хай риском беру Лонги по Xrp и doge\nС текущих')
+    // Сообщение НЕ должно уронить обработку: отказ биржи — штатный исход одного действия.
+    await processMessage(db, message, localDeps)
+
+    // 1. Вход по XRP реально ушёл на биржу — значит он ОБЯЗАН остаться в журнале. Сделка по
+    //    DOGE на биржу не дошла вовсе (ни одного ордера) — она отменена и не держит символ.
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades.map((t) => `${t.symbol}:${t.status}`).sort()).toEqual(['DOGEUSDT:cancelled', 'XRPUSDT:open'])
+
+    const owned = await db
+      .selectFrom('symbol_ownership')
+      .select('symbol')
+      .where('channel_id', '=', channelId)
+      .where('released_at', 'is', null)
+      .execute()
+    expect(owned.map((o) => o.symbol)).toEqual(['XRPUSDT'])
+
+    const entries = await db
+      .selectFrom('orders')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .where('purpose', '=', 'entry')
+      .execute()
+    expect(entries.map((o) => o.symbol)).toEqual(['XRPUSDT'])
+
+    // 2. Оба действия видны оператору: исполненное и провалившееся (а не пустая строка в UI).
+    const actions = await db
+      .selectFrom('actions')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .orderBy('action_index')
+      .execute()
+    expect(actions.map((a) => `${a.symbol}:${a.status}`)).toEqual(['XRPUSDT:executed', 'DOGEUSDT:failed'])
+    expect(actions[1]!.detail).toContain('110007')
+
+    // 3. Сообщение уходит на ручной разбор — но с сохранённым текстом, а не пустым.
+    const msgRow = await db
+      .selectFrom('messages')
+      .select(['status', 'status_reason', 'normalized_text'])
+      .where('id', '=', message.id)
+      .executeTakeFirstOrThrow()
+    expect(msgRow.status).toBe('needs_review')
+    expect(msgRow.status_reason).toBe('exchange_rejected_110007')
+    expect(msgRow.normalized_text).not.toBeNull()
+  })
+
+  it('отказ на ПЕРВОМ действии не мешает исполнить второе', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'XRPUSDT', adapterId: 'ch2-freeform', maxLeverage: '10', defaultLeverage: '10' })
+    await db
+      .insertInto('instruments')
+      .values({
+        symbol: 'DOGEUSDT', network: 'testnet', base_coin: 'DOGE', status: 'Trading',
+        qty_step: '1', min_qty: '1', tick_size: '0.0001', min_notional: '5',
+        max_leverage: '50', leverage_step: '0.01', mmr: '0.005', refreshed_at: new Date(),
+      })
+      .execute()
+
+    const localDeps: PipelineDeps = {
+      executionPort: createRejectingPort('XRPUSDT', 110007),
+      network: 'testnet',
+      equity: '10000',
+      getMarkPrice: async () => '1.285',
+      aiEnabled: false,
+    }
+
+    const message = await insertMessage(channelId, 222469, 'С хай риском беру Лонги по Xrp и doge\nС текущих')
+    await processMessage(db, message, localDeps)
+
+    const trades = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).execute()
+    expect(trades.map((t) => `${t.symbol}:${t.status}`).sort()).toEqual(['DOGEUSDT:open', 'XRPUSDT:cancelled'])
+
+    const actions = await db
+      .selectFrom('actions')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .orderBy('action_index')
+      .execute()
+    expect(actions.map((a) => `${a.symbol}:${a.status}`)).toEqual(['XRPUSDT:failed', 'DOGEUSDT:executed'])
   })
 })
