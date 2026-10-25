@@ -2311,14 +2311,11 @@ async function handleDelta(
         // Гейт здравого смысла: «цель взята» при позиции В УБЫТКЕ — противоречие. Так выглядит
         // ошибка разбора («64200 первый таргет» модель приняла за достигнутую цель, хотя цена до
         // неё не доходила). Закрыть треть в минус по ошибке дороже, чем показать оператору вопрос.
-        if (position.mark_price !== null && position.avg_price !== null) {
-          const mark = new Decimal(position.mark_price)
-          const entry = new Decimal(position.avg_price)
-          const inProfit = position.side === 'long' ? mark.gt(entry) : mark.lt(entry)
-          if (!inProfit) {
-            gateSkip = 'tp_not_reached'
-            break
-          }
+        // Цель должна быть ВЗЯТА: 'flat' (цена ровно на входе) целью тоже не считается.
+        const tpPnl = positionPnlSign(position)
+        if (tpPnl === 'loss' || tpPnl === 'flat') {
+          gateSkip = 'tp_not_reached'
+          break
         }
 
         // Базис — ВЕСЬ вложенный объём (вход + доливки): лесенка из трёх целей делит на равные
@@ -2361,6 +2358,23 @@ async function handleDelta(
           console.warn(
             `[pipeline] ${intent.symbol}: 'partial_close' подавлен — в сообщении есть tp_hit, а на бирже стоит наш TP-ордер (он закроет объём сам)`,
           )
+          break
+        }
+
+        // ⚠️ ДЕНЕЖНЫЙ ГЕЙТ. «Фикс половину» — это фиксация ПРИБЫЛИ, и автор меряет её по СВОЕМУ
+        // входу. Наша позиция по тому же символу бывает старше и дороже: живой инцидент 24.10.2026
+        // (msg 222501) — карточка автора «SOLUSDT +18.18%, цена открытия 100.66», наша средняя
+        // 107.02, бот продал 3.1 SOL по 102.53 и реализовал −13.92 USDT. Пока мы в минусе,
+        // фиксировать нечего: это не копирование прибыли, а материализация чужого расхождения.
+        // Полный выход (close_remainder) гейтом НЕ закрыт — вывести оператора из убытка канал
+        // может всегда; спорна именно ЧАСТИЧНАЯ фиксация, и её решает оператор.
+        if (positionPnlSign(position) === 'loss') {
+          console.warn(
+            `[pipeline] ${intent.symbol}: 'partial_close' пропущен — позиция в убытке ` +
+              `(вход ${position.avg_price}, рынок ${position.mark_price}, ${position.side}): ` +
+              `автор фиксирует прибыль своего входа, у нас фикс части реализовал бы минус`,
+          )
+          gateSkip = 'fix_in_loss'
           break
         }
 
@@ -2455,6 +2469,27 @@ async function handleDelta(
   if (gateSkip !== null && executedOps === 0) return { skipReason: gateSkip }
 
   return { tradeId: position.trade_id, side: position.side, symbol: intent.symbol }
+}
+
+/**
+ * Знак нереализованного PnL открытой позиции по зеркалу биржи. `null` — живой цены нет, и гейт,
+ * который им пользуется, не судит (в dry-run/тестах без фида это норма).
+ *
+ * Один источник правды для ДВУХ денежных гейтов ветки delta: «цель взята при позиции в убытке»
+ * (tp_hit — противоречие, так выглядит ошибка разбора) и «фикс части в убыток» (partial_close —
+ * автор фиксирует прибыль СВОЕГО входа, а наша средняя по тому же символу выше). Цену держит
+ * живой тикер: tickers-feed::applyMarkPriceTick пишет positions.mark_price на каждом тике.
+ */
+function positionPnlSign(position: {
+  side: Side | null
+  avg_price: string | null
+  mark_price: string | null
+}): 'profit' | 'loss' | 'flat' | null {
+  if (position.side === null || position.avg_price === null || position.mark_price === null) return null
+  const entry = new Decimal(position.avg_price)
+  const mark = new Decimal(position.mark_price)
+  if (mark.eq(entry)) return 'flat'
+  return (position.side === 'long' ? mark.gt(entry) : mark.lt(entry)) ? 'profit' : 'loss'
 }
 
 /**

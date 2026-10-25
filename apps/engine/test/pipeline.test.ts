@@ -1028,6 +1028,34 @@ describe('pipeline — «фиксирую половину» реально за
     const trade = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).executeTakeFirstOrThrow()
     expect(trade.status).toBe('open') // позиция не тронута
   })
+
+  // ⚠️ ЖИВОЙ ИНЦИДЕНТ 24.10.2026 (msg 222501, TR-1136). «Половину фикс сол» + карточка результата
+  // автора: «SOLUSDT Лонг 10X, +18.18%, цена открытия 100.66». Наша позиция по SOL была СТАРОЙ,
+  // со средней 107.02 — то есть в МИНУСЕ, пока автор фиксировал прибыль по своему входу 100.66.
+  // Бот закрыл 3.1 SOL по 102.53 и реализовал −13.92 USDT. Гейт здравого смысла «фиксация при
+  // позиции в убытке» стоял ТОЛЬКО на ветке tp_hit — та же по смыслу команда, пришедшая от модели
+  // как partial_close, исполнялась вслепую.
+  it('«фиксирую половину» при позиции В МИНУСЕ -> не закрываем: автор фиксирует СВОЮ прибыль, у нас убыток', async () => {
+    const channelId = nextChannelId++
+    await seedChannel({ channelId, symbol: 'ATOMUSDT' })
+    const { port, calls } = createRecordingExecutionPort()
+    const localDeps: PipelineDeps = { executionPort: port, network: 'testnet', equity: '10000', getMarkPrice: async () => '100' , aiEnabled: false }
+
+    await openPosition(channelId, localDeps)
+    // Цена ушла НИЖЕ входа: «фикс половины» здесь реализовал бы убыток.
+    await db.updateTable('positions').set({ mark_price: '95' }).where('channel_id', '=', channelId).execute()
+    calls.length = 0
+
+    await processMessage(db, await insertMessage(channelId, 2, '#ATOM фиксирую половину'), localDeps)
+
+    expect(calls).not.toContain('closePosition')
+    const action = await actionFor(channelId, 2)
+    expect(action.status).toBe('skipped')
+    expect(action.skip_reason).toBe('fix_in_loss')
+
+    const trade = await db.selectFrom('trades').selectAll().where('channel_id', '=', channelId).executeTakeFirstOrThrow()
+    expect(trade.status).toBe('open') // объём не тронут — решение за оператором
+  })
 })
 
 // Три денежных дефекта, найденных адверсариальным разбором СОБСТВЕННОЙ реализации partial_close.
